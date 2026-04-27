@@ -10,8 +10,11 @@ __pycache__/
 htmlcov/
 
 # Virtual environments
+.venv
 .venv/
+venv
 venv/
+env
 env/
 
 # Local/editor noise
@@ -22,8 +25,16 @@ __MACOSX/
 *.swp
 *.swo
 
-# Generated runtime data and model outputs
-data/runtime/
+# Generated weather data and model outputs
+data/*
+tools/*/data/*
+experiments/*/data/*
+
+# Keep intentionally committed regression fixtures available.
+!tools/hrrr/data/fixtures/
+!tools/hrrr/data/fixtures/**
+
+# Tool runtime directories can contain large downloaded archives and parquet outputs.
 **/data/runtime/
 
 # Local browser/test artifacts
