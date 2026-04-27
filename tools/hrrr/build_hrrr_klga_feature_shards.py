@@ -8,6 +8,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import json
+import os
 import statistics
 import queue
 import re
@@ -40,12 +41,14 @@ from fetch_hrrr_records import (
     manifest_inventory_lines,
 )
 from tools.weather.location_context import (
+    CropBounds,
     REGIONAL_CROP_BOUNDS,
     SETTLEMENT_LOCATION,
     crop_context_metrics,
     crop_metadata,
     find_nearest_grid_cell,
     infer_north_is_first,
+    infer_west_is_first,
     local_context_metrics,
     longitude_360_to_180,
     settlement_longitude_360,
@@ -67,6 +70,12 @@ DEFAULT_CFGRIB_INDEX_STRATEGY = "temp_dir_per_task"
 DEFAULT_SELECTION_MODE = "all"
 SELECTION_MODES = (DEFAULT_SELECTION_MODE, "overnight_0005")
 BATCH_REDUCE_MODES = ("off", "cycle")
+CROP_METHODS = ("auto", "small_grib", "ijsmall_grib")
+EXTRACT_METHODS = ("cfgrib", "eccodes")
+SUMMARY_PROFILES = ("full", "overnight")
+DEFAULT_CROP_METHOD = "small_grib"
+DEFAULT_CROP_GRIB_TYPE = "same"
+DEFAULT_EXTRACT_METHOD = "cfgrib"
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_SOURCE_MODEL = "HRRR"
 DEFAULT_SOURCE_PRODUCT = "wrfsfcf"
@@ -82,6 +91,11 @@ OVERNIGHT_VALIDATION_REVISION_CYCLE_COUNT = max(0, OVERNIGHT_VALIDATION_CYCLE_CO
 OVERNIGHT_AVAILABILITY_CUTOFF_MINUTE_LOCAL = 5
 FULL_LENGTH_CYCLE_HOURS_UTC = {0, 6, 12, 18}
 WGRIB2_CANDIDATES = ["wgrib2", str(Path.home() / ".local/bin/wgrib2")]
+GRID_SHAPE_PATTERNS = (
+    re.compile(r"(?:grid:)?\((?P<nx>\d+)\s+x\s+(?P<ny>\d+)\)", re.IGNORECASE),
+    re.compile(r"\bnx\s*[=:]\s*(?P<nx>\d+)\b.*?\bny\s*[=:]\s*(?P<ny>\d+)\b", re.IGNORECASE),
+    re.compile(r"\b(?P<nx>\d+)\s+by\s+(?P<ny>\d+)\b", re.IGNORECASE),
+)
 SPATIAL_DIM_NAMES = {"latitude", "longitude", "lat", "lon", "x", "y"}
 NY_TZ = ZoneInfo(DEFAULT_TIMEZONE)
 INVENTORY_RE = re.compile(
@@ -120,6 +134,24 @@ INVENTORY_SELECTION_PATTERN_SPECS = (
     ("spfh_upper_direct", r":SPFH:(1000 mb|925 mb|850 mb|700 mb):"),
 )
 COMPILED_INVENTORY_SELECTION_PATTERNS = tuple((name, re.compile(pattern)) for name, pattern in INVENTORY_SELECTION_PATTERN_SPECS)
+REVISION_FIELD_PREFIXES = (
+    "tmp_2m_k",
+    "tcdc_entire_pct",
+    "dswrf_surface_w_m2",
+    "pwat_entire_atmosphere_kg_m2",
+    "hpbl_m",
+    "mslma_pa",
+)
+REVISION_INVENTORY_SELECTION_PATTERN_SPECS = tuple(
+    (name, pattern)
+    for name, pattern in INVENTORY_SELECTION_PATTERN_SPECS
+    if name in REVISION_FIELD_PREFIXES
+)
+COMPILED_REVISION_INVENTORY_SELECTION_PATTERNS = tuple(
+    (name, re.compile(pattern)) for name, pattern in REVISION_INVENTORY_SELECTION_PATTERN_SPECS
+)
+CROP_GRID_CACHE_LOCKS: dict[Path, threading.Lock] = {}
+CROP_GRID_CACHE_LOCKS_GUARD = threading.Lock()
 CANONICAL_WIDE_COLUMNS = {
     "source_model",
     "source_product",
@@ -231,6 +263,71 @@ class PhaseConcurrencyLimits:
     download_semaphore: threading.Semaphore
     reduce_semaphore: threading.Semaphore
     extract_semaphore: threading.Semaphore
+
+
+@dataclass(frozen=True)
+class CropIjBox:
+    i0: int
+    i1: int
+    j0: int
+    j1: int
+
+    @property
+    def nx(self) -> int:
+        return self.i1 - self.i0 + 1
+
+    @property
+    def ny(self) -> int:
+        return self.j1 - self.j0 + 1
+
+    def format_i(self) -> str:
+        return f"{self.i0}:{self.i1}"
+
+    def format_j(self) -> str:
+        return f"{self.j0}:{self.j1}"
+
+    def as_text(self) -> str:
+        return f"{self.format_i()} {self.format_j()}"
+
+
+@dataclass(frozen=True)
+class CropGridCacheEntry:
+    signature: str
+    grid_shape: tuple[int, int]
+    north_is_first: bool
+    west_is_first: bool
+    crop_bounds: CropBounds
+    ij_box: CropIjBox
+
+
+@dataclass(frozen=True)
+class CropExecutionResult:
+    selected_lines: list[str]
+    matched_names: set[str]
+    inventory_seconds: float
+    reduce_seconds: float
+    command: str
+    method_used: str
+    crop_grid_cache_key: str | None
+    crop_grid_cache_hit: bool
+    crop_ij_box: str | None
+    crop_wgrib2_threads: int
+    crop_fallback_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class HrrrRuntimeOptions:
+    crop_method: str = DEFAULT_CROP_METHOD
+    crop_grib_type: str = DEFAULT_CROP_GRIB_TYPE
+    wgrib2_threads: int | None = None
+    max_workers: int = DEFAULT_MAX_WORKERS
+    reduce_workers: int | None = None
+    extract_method: str = DEFAULT_EXTRACT_METHOD
+    summary_profile: str = "full"
+    skip_provenance: bool = False
+
+
+RUNTIME_OPTIONS = HrrrRuntimeOptions()
 
 
 GROUP_SPECS = [
@@ -468,6 +565,39 @@ def parse_args() -> argparse.Namespace:
         choices=SELECTION_MODES,
         default=DEFAULT_SELECTION_MODE,
         help="Task-planning mode. Use overnight_0005 to keep only the anchor overnight cycle plus the latest revision cycle.",
+    )
+    parser.add_argument(
+        "--crop-method",
+        choices=CROP_METHODS,
+        default=DEFAULT_CROP_METHOD,
+        help="Crop primitive. Use auto to prefer cached -ijsmall_grib and fall back to -small_grib when needed.",
+    )
+    parser.add_argument(
+        "--crop-grib-type",
+        default=DEFAULT_CROP_GRIB_TYPE,
+        help="Value passed to wgrib2 -set_grib_type before crop. Use same to preserve current encoding.",
+    )
+    parser.add_argument(
+        "--wgrib2-threads",
+        type=int,
+        help="OMP thread count for wgrib2 crop operations. Defaults to 1 under parallel reduce, otherwise 2.",
+    )
+    parser.add_argument(
+        "--extract-method",
+        choices=EXTRACT_METHODS,
+        default=DEFAULT_EXTRACT_METHOD,
+        help="GRIB extraction backend. cfgrib is the reference path; eccodes is an opt-in direct message-iterator prototype.",
+    )
+    parser.add_argument(
+        "--summary-profile",
+        choices=SUMMARY_PROFILES,
+        default="full",
+        help="Summary extraction profile. full preserves current behavior; overnight records production intent for optimized overnight runs.",
+    )
+    parser.add_argument(
+        "--skip-provenance",
+        action="store_true",
+        help="Do not construct or write provenance rows. Intended for production overnight backfills where provenance is unused.",
     )
     parser.add_argument("--keep-reduced", action="store_true", help="Keep reduced GRIB2 files after successful extraction.")
     parser.add_argument("--keep-downloads", action="store_true", help="Keep downloaded full GRIB2 files after successful extraction.")
@@ -798,11 +928,42 @@ def inventory_selection_patterns() -> list[tuple[str, str]]:
     return list(INVENTORY_SELECTION_PATTERN_SPECS)
 
 
-def select_inventory_lines(inventory_lines: list[str]) -> tuple[list[str], set[str]]:
+def task_field_profile(task: TaskSpec | None) -> str:
+    if (
+        task is not None
+        and RUNTIME_OPTIONS.summary_profile == "overnight"
+        and not bool(task.anchor_cycle_candidate)
+    ):
+        return "revision"
+    return "full"
+
+
+def inventory_selection_patterns_for_task(task: TaskSpec | None) -> list[tuple[str, str]]:
+    if task_field_profile(task) == "revision":
+        return list(REVISION_INVENTORY_SELECTION_PATTERN_SPECS)
+    return inventory_selection_patterns()
+
+
+def requested_field_prefixes_for_task(task: TaskSpec | None) -> list[str]:
+    if task_field_profile(task) == "revision":
+        return list(REVISION_FIELD_PREFIXES)
+    return list(REQUESTED_FIELD_PREFIXES)
+
+
+def compiled_inventory_selection_patterns_for_task(
+    task: TaskSpec | None,
+) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    if task_field_profile(task) == "revision":
+        return COMPILED_REVISION_INVENTORY_SELECTION_PATTERNS
+    return COMPILED_INVENTORY_SELECTION_PATTERNS
+
+
+def select_inventory_lines(inventory_lines: list[str], *, task: TaskSpec | None = None) -> tuple[list[str], set[str]]:
     selected: list[str] = []
     matched_names: set[str] = set()
+    compiled_patterns = compiled_inventory_selection_patterns_for_task(task)
     for line in inventory_lines:
-        for name, pattern in COMPILED_INVENTORY_SELECTION_PATTERNS:
+        for name, pattern in compiled_patterns:
             if pattern.search(line):
                 selected.append(line)
                 matched_names.add(name)
@@ -810,8 +971,13 @@ def select_inventory_lines(inventory_lines: list[str]) -> tuple[list[str], set[s
     return selected, matched_names
 
 
-def run_command(args: list[str], *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, input=input_text, text=True, capture_output=True)
+def run_command(
+    args: list[str],
+    *,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, input=input_text, text=True, capture_output=True, env=env)
 
 
 def inventory_for_grib(wgrib2_path: str, grib_path: Path) -> list[str]:
@@ -821,38 +987,454 @@ def inventory_for_grib(wgrib2_path: str, grib_path: Path) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
+def crop_grid_cache_root(reduced_path: Path) -> Path:
+    return reduced_path.parent / ".crop_grid"
+
+
+def first_cached_crop_grid_entry(reduced_path: Path) -> CropGridCacheEntry | None:
+    cache_root = crop_grid_cache_root(reduced_path)
+    if not cache_root.exists():
+        return None
+    for cache_path in sorted(cache_root.glob("*.json")):
+        if cache_path.name.startswith("raw_identity_") or cache_path.name.endswith(".unsupported.json"):
+            continue
+        cached = load_crop_grid_cache_entry(cache_path)
+        if cached is not None:
+            return cached
+    return None
+
+
+def crop_grid_cache_lock(cache_path: Path) -> threading.Lock:
+    with CROP_GRID_CACHE_LOCKS_GUARD:
+        lock = CROP_GRID_CACHE_LOCKS.get(cache_path)
+        if lock is None:
+            lock = threading.Lock()
+            CROP_GRID_CACHE_LOCKS[cache_path] = lock
+        return lock
+
+
+def normalize_crop_longitudes_for_grid(bounds: CropBounds, lon_grid: np.ndarray) -> tuple[float, float]:
+    if float(np.nanmax(lon_grid)) > 180:
+        return float(bounds.left), float(bounds.right)
+    return float(longitude_360_to_180(bounds.left)), float(longitude_360_to_180(bounds.right))
+
+
+def grid_signature_payload(
+    *,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    north_is_first: bool,
+    west_is_first: bool,
+) -> dict[str, object]:
+    lat_flat = lat_grid.reshape(-1)
+    lon_flat = lon_grid.reshape(-1)
+    mid_index = int(lat_flat.size // 2) if lat_flat.size else 0
+    return {
+        "grid_shape": [int(lat_grid.shape[0]), int(lat_grid.shape[1])],
+        "north_is_first": bool(north_is_first),
+        "west_is_first": bool(west_is_first),
+        "lat_sample": [float(lat_flat[0]), float(lat_flat[mid_index]), float(lat_flat[-1])],
+        "lon_sample": [float(lon_flat[0]), float(lon_flat[mid_index]), float(lon_flat[-1])],
+        "lat_min": float(np.nanmin(lat_grid)),
+        "lat_max": float(np.nanmax(lat_grid)),
+        "lon_min": float(np.nanmin(lon_grid)),
+        "lon_max": float(np.nanmax(lon_grid)),
+    }
+
+
+def build_crop_grid_cache_key(
+    *,
+    bounds: CropBounds,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    north_is_first: bool,
+    west_is_first: bool,
+) -> str:
+    payload = {
+        "source_model": DEFAULT_SOURCE_MODEL,
+        "source_product": DEFAULT_SOURCE_PRODUCT,
+        "source_version": DEFAULT_SOURCE_VERSION,
+        "crop_bounds": {
+            "top": float(bounds.top),
+            "bottom": float(bounds.bottom),
+            "left": float(bounds.left),
+            "right": float(bounds.right),
+        },
+        **grid_signature_payload(
+            lat_grid=lat_grid,
+            lon_grid=lon_grid,
+            north_is_first=north_is_first,
+            west_is_first=west_is_first,
+        ),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def serialize_crop_grid_cache_entry(entry: CropGridCacheEntry) -> str:
+    payload = {
+        "signature": entry.signature,
+        "grid_shape": [int(entry.grid_shape[0]), int(entry.grid_shape[1])],
+        "north_is_first": bool(entry.north_is_first),
+        "west_is_first": bool(entry.west_is_first),
+        "ij_box": {
+            "i0": int(entry.ij_box.i0),
+            "i1": int(entry.ij_box.i1),
+            "j0": int(entry.ij_box.j0),
+            "j1": int(entry.ij_box.j1),
+        },
+        "crop_bounds": {
+            "top": float(entry.crop_bounds.top),
+            "bottom": float(entry.crop_bounds.bottom),
+            "left": float(entry.crop_bounds.left),
+            "right": float(entry.crop_bounds.right),
+        },
+        "created_by": DEFAULT_SOURCE_VERSION,
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def parse_crop_grid_cache_entry(text: str) -> CropGridCacheEntry:
+    payload = json.loads(text)
+    ij_box = payload["ij_box"]
+    grid_shape = payload["grid_shape"]
+    crop_bounds = payload["crop_bounds"]
+    return CropGridCacheEntry(
+        signature=str(payload["signature"]),
+        grid_shape=(int(grid_shape[0]), int(grid_shape[1])),
+        north_is_first=bool(payload["north_is_first"]),
+        west_is_first=bool(payload["west_is_first"]),
+        crop_bounds=CropBounds(
+            top=float(crop_bounds["top"]),
+            bottom=float(crop_bounds["bottom"]),
+            left=float(crop_bounds["left"]),
+            right=float(crop_bounds["right"]),
+        ),
+        ij_box=CropIjBox(
+            i0=int(ij_box["i0"]),
+            i1=int(ij_box["i1"]),
+            j0=int(ij_box["j0"]),
+            j1=int(ij_box["j1"]),
+        ),
+    )
+
+
+def load_crop_grid_cache_entry(cache_path: Path) -> CropGridCacheEntry | None:
+    if not cache_path.exists():
+        return None
+    try:
+        return parse_crop_grid_cache_entry(cache_path.read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def write_crop_grid_cache_entry(cache_path: Path, entry: CropGridCacheEntry) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+    tmp_path.write_text(serialize_crop_grid_cache_entry(entry))
+    tmp_path.replace(cache_path)
+
+
+def load_crop_grid_negative_cache(cache_path: Path) -> str | None:
+    if not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "unreadable_negative_cache"
+    reason = payload.get("reason")
+    return str(reason) if reason else "ijsmall_grib_disabled"
+
+
+def write_crop_grid_negative_cache(cache_path: Path, *, reason: str) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+    tmp_path.write_text(json.dumps({"reason": str(reason), "created_by": DEFAULT_SOURCE_VERSION}, sort_keys=True))
+    tmp_path.replace(cache_path)
+
+
+def crop_ij_box_from_grid(
+    *,
+    lat_grid: np.ndarray,
+    lon_grid: np.ndarray,
+    bounds: CropBounds,
+    north_is_first: bool,
+    west_is_first: bool,
+) -> CropIjBox:
+    left, right = normalize_crop_longitudes_for_grid(bounds, lon_grid)
+    mask = (
+        np.isfinite(lat_grid)
+        & np.isfinite(lon_grid)
+        & (lat_grid >= float(bounds.bottom))
+        & (lat_grid <= float(bounds.top))
+        & (lon_grid >= left)
+        & (lon_grid <= right)
+    )
+    rows, cols = np.where(mask)
+    if rows.size == 0 or cols.size == 0:
+        raise ValueError("Crop bounds do not include any grid points for ijsmall_grib")
+    row_min = int(rows.min())
+    row_max = int(rows.max())
+    col_min = int(cols.min())
+    col_max = int(cols.max())
+    nrows, ncols = lat_grid.shape
+    i0, i1 = (col_min + 1, col_max + 1) if west_is_first else (ncols - col_max, ncols - col_min)
+    j0, j1 = (nrows - row_max, nrows - row_min) if north_is_first else (row_min + 1, row_max + 1)
+    return CropIjBox(i0=int(i0), i1=int(i1), j0=int(j0), j1=int(j1))
+
+
+def representative_grid_context_for_path(
+    grib_path: Path,
+    grib_inventory: list[str],
+    *,
+    cfgrib_index_dir: Path,
+) -> tuple[np.ndarray, np.ndarray, bool, bool]:
+    group_datasets = open_reduced_grib_group_datasets(
+        grib_path,
+        grib_inventory,
+        cfgrib_index_dir=cfgrib_index_dir,
+    )
+    try:
+        if not group_datasets:
+            raise ValueError(f"No datasets available to infer crop grid for {grib_path}")
+        for _, dataset in group_datasets:
+            if not dataset.data_vars:
+                continue
+            first_data_array = next(iter(dataset.data_vars.values()))
+            lat_grid, lon_grid = extract_lat_lon(first_data_array)
+            return lat_grid, lon_grid, infer_north_is_first(lat_grid), infer_west_is_first(lon_grid)
+        raise ValueError(f"No data variables available to infer crop grid for {grib_path}")
+    finally:
+        close_group_datasets(group_datasets)
+
+
+def resolve_crop_grid_cache_entry(
+    *,
+    full_path: Path,
+    reduced_path: Path,
+    selected_inventory_lines: list[str],
+    bounds: CropBounds,
+) -> tuple[CropGridCacheEntry, bool]:
+    cache_root = crop_grid_cache_root(reduced_path)
+    cache_root.mkdir(parents=True, exist_ok=True)
+    probe_index_dir = cache_root / ".cfgrib_index" / f"probe_{reduced_path.stem}"
+    probe_index_dir.mkdir(parents=True, exist_ok=True)
+    lat_grid, lon_grid, north_is_first, west_is_first = representative_grid_context_for_path(
+        full_path,
+        selected_inventory_lines,
+        cfgrib_index_dir=probe_index_dir,
+    )
+    cache_key = build_crop_grid_cache_key(
+        bounds=bounds,
+        lat_grid=lat_grid,
+        lon_grid=lon_grid,
+        north_is_first=north_is_first,
+        west_is_first=west_is_first,
+    )
+    cache_path = cache_root / f"{cache_key}.json"
+    with crop_grid_cache_lock(cache_path):
+        cached = load_crop_grid_cache_entry(cache_path)
+        if cached is not None and cached.signature == cache_key:
+            return cached, True
+        ij_box = crop_ij_box_from_grid(
+            lat_grid=lat_grid,
+            lon_grid=lon_grid,
+            bounds=bounds,
+            north_is_first=north_is_first,
+            west_is_first=west_is_first,
+        )
+        entry = CropGridCacheEntry(
+            signature=cache_key,
+            grid_shape=(int(lat_grid.shape[0]), int(lat_grid.shape[1])),
+            north_is_first=bool(north_is_first),
+            west_is_first=bool(west_is_first),
+            crop_bounds=bounds,
+            ij_box=ij_box,
+        )
+        write_crop_grid_cache_entry(cache_path, entry)
+        return entry, False
+
+
+def active_runtime_options(options: HrrrRuntimeOptions | None = None) -> HrrrRuntimeOptions:
+    return RUNTIME_OPTIONS if options is None else options
+
+
+def crop_wgrib2_thread_count(options: HrrrRuntimeOptions | None = None) -> int:
+    options = active_runtime_options(options)
+    if options.wgrib2_threads is not None:
+        return max(1, int(options.wgrib2_threads))
+    outer_parallelism = max(1, int(options.max_workers))
+    reduce_parallelism = max(1, int(options.reduce_workers or 1))
+    return 1 if (outer_parallelism > 1 or reduce_parallelism > 1) else 2
+
+
+def crop_wgrib2_env(options: HrrrRuntimeOptions | None = None) -> dict[str, str]:
+    options = active_runtime_options(options)
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(crop_wgrib2_thread_count(options))
+    env["OMP_WAIT_POLICY"] = "PASSIVE"
+    return env
+
+
+def read_wgrib2_grid_shape(wgrib2_path: str, path: Path, *, env: dict[str, str] | None = None) -> tuple[int, int]:
+    result = run_command([wgrib2_path, str(path), "-grid"], env=env)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"wgrib2 -grid failed for {path}")
+    normalized_output = result.stdout.replace("\n", " ")
+    for pattern in GRID_SHAPE_PATTERNS:
+        match = pattern.search(normalized_output)
+        if match is not None:
+            return int(match.group("nx")), int(match.group("ny"))
+    excerpt = normalized_output[:500].strip()
+    raise ValueError(f"Unable to parse wgrib2 -grid output for {path}: {excerpt}")
+
+
 def reduce_grib2(
     wgrib2_path: str,
     full_path: Path,
     reduced_path: Path,
     *,
     selected_inventory_lines: list[str] | None = None,
-) -> tuple[list[str], set[str], float, float]:
+    task: TaskSpec | None = None,
+    options: HrrrRuntimeOptions | None = None,
+) -> CropExecutionResult:
+    options = active_runtime_options(options)
     if selected_inventory_lines is None:
         inventory_started_at = time.perf_counter()
         inventory_lines = inventory_for_grib(wgrib2_path, full_path)
         inventory_seconds = time.perf_counter() - inventory_started_at
-        selected_lines, matched_names = select_inventory_lines(inventory_lines)
+        selected_lines, matched_names = select_inventory_lines(inventory_lines, task=task)
     else:
         inventory_seconds = 0.0
         selected_lines = [line for line in selected_inventory_lines if line.strip()]
-        _, matched_names = select_inventory_lines(selected_lines)
+        _, matched_names = select_inventory_lines(selected_lines, task=task)
     if not selected_lines:
         raise RuntimeError(f"No requested records found in {full_path.name}")
 
     reduced_path.parent.mkdir(parents=True, exist_ok=True)
     lon_spec, lat_spec = crop_spec()
-    reduce_started_at = time.perf_counter()
-    result = run_command(
-        [wgrib2_path, "-i", str(full_path), "-small_grib", lon_spec, lat_spec, str(reduced_path)],
-        input_text="\n".join(selected_lines) + "\n",
-    )
-    reduce_seconds = time.perf_counter() - reduce_started_at
-    if result.returncode != 0 or not reduced_path.exists():
-        raise RuntimeError(result.stderr.strip() or f"wgrib2 subsetting failed for {full_path.name}")
-    if reduced_path.stat().st_size <= 0:
-        raise RuntimeError(f"Reduced GRIB2 is empty for {full_path.name}")
-    return selected_lines, matched_names, inventory_seconds, reduce_seconds
+    crop_env = crop_wgrib2_env(options)
+    wgrib2_threads = crop_wgrib2_thread_count(options)
+
+    def _run_crop(command: list[str], *, method: str, **extra: object) -> CropExecutionResult:
+        reduce_started_at = time.perf_counter()
+        result = run_command(command, input_text="\n".join(selected_lines) + "\n", env=crop_env)
+        reduce_seconds = time.perf_counter() - reduce_started_at
+        if result.returncode != 0 or not reduced_path.exists():
+            raise RuntimeError(result.stderr.strip() or f"wgrib2 subsetting failed for {full_path.name}")
+        if reduced_path.stat().st_size <= 0:
+            raise RuntimeError(f"Reduced GRIB2 is empty for {full_path.name}")
+        return CropExecutionResult(
+            selected_lines=selected_lines,
+            matched_names=matched_names,
+            inventory_seconds=inventory_seconds,
+            reduce_seconds=reduce_seconds,
+            command=" ".join(command),
+            method_used=method,
+            crop_grid_cache_key=extra.get("crop_grid_cache_key") if isinstance(extra.get("crop_grid_cache_key"), str) else None,
+            crop_grid_cache_hit=bool(extra.get("crop_grid_cache_hit")),
+            crop_ij_box=extra.get("crop_ij_box") if isinstance(extra.get("crop_ij_box"), str) else None,
+            crop_wgrib2_threads=wgrib2_threads,
+            crop_fallback_reason=extra.get("crop_fallback_reason") if isinstance(extra.get("crop_fallback_reason"), str) else None,
+        )
+
+    def _small_grib(*, fallback_reason: str | None = None) -> CropExecutionResult:
+        command = [
+            wgrib2_path,
+            "-i",
+            str(full_path),
+            "-set_grib_type",
+            str(options.crop_grib_type),
+            "-small_grib",
+            lon_spec,
+            lat_spec,
+            str(reduced_path),
+        ]
+        return _run_crop(command, method="small_grib", crop_fallback_reason=fallback_reason)
+
+    if options.crop_method == "small_grib":
+        return _small_grib()
+
+    cached_entry = first_cached_crop_grid_entry(reduced_path)
+    if cached_entry is not None:
+        negative_cache_path = crop_grid_cache_root(reduced_path) / f"{cached_entry.signature}.unsupported.json"
+        negative_cache_reason = load_crop_grid_negative_cache(negative_cache_path)
+        if options.crop_method == "ijsmall_grib" or negative_cache_reason is None:
+            try:
+                command = [
+                    wgrib2_path,
+                    "-i",
+                    str(full_path),
+                    "-set_grib_type",
+                    str(options.crop_grib_type),
+                    "-ijsmall_grib",
+                    cached_entry.ij_box.format_i(),
+                    cached_entry.ij_box.format_j(),
+                    str(reduced_path),
+                ]
+                result = _run_crop(
+                    command,
+                    method="ijsmall_grib",
+                    crop_grid_cache_key=cached_entry.signature,
+                    crop_grid_cache_hit=True,
+                    crop_ij_box=cached_entry.ij_box.as_text(),
+                )
+                actual_grid_shape = read_wgrib2_grid_shape(wgrib2_path, reduced_path, env=crop_env)
+                expected_grid_shape = (cached_entry.ij_box.nx, cached_entry.ij_box.ny)
+                if actual_grid_shape != expected_grid_shape:
+                    raise ValueError(f"ijsmall_grib crop produced grid {actual_grid_shape} but expected {expected_grid_shape}")
+                return result
+            except Exception as exc:
+                if options.crop_method == "ijsmall_grib":
+                    raise
+                write_crop_grid_negative_cache(negative_cache_path, reason="ijsmall_grib_crop_or_validation_failed")
+                reduced_path.unlink(missing_ok=True)
+                return _small_grib(fallback_reason=str(exc)[:300])
+
+    try:
+        cache_entry, cache_hit = resolve_crop_grid_cache_entry(
+            full_path=full_path,
+            reduced_path=reduced_path,
+            selected_inventory_lines=selected_lines,
+            bounds=REGIONAL_CROP_BOUNDS,
+        )
+        negative_cache_path = crop_grid_cache_root(reduced_path) / f"{cache_entry.signature}.unsupported.json"
+        negative_cache_reason = load_crop_grid_negative_cache(negative_cache_path)
+        if options.crop_method == "auto" and negative_cache_reason is not None:
+            return _small_grib(fallback_reason=negative_cache_reason)
+        command = [
+            wgrib2_path,
+            "-i",
+            str(full_path),
+            "-set_grib_type",
+            str(options.crop_grib_type),
+            "-ijsmall_grib",
+            cache_entry.ij_box.format_i(),
+            cache_entry.ij_box.format_j(),
+            str(reduced_path),
+        ]
+        result = _run_crop(
+            command,
+            method="ijsmall_grib",
+            crop_grid_cache_key=cache_entry.signature,
+            crop_grid_cache_hit=cache_hit,
+            crop_ij_box=cache_entry.ij_box.as_text(),
+        )
+        actual_grid_shape = read_wgrib2_grid_shape(wgrib2_path, reduced_path, env=crop_env)
+        expected_grid_shape = (cache_entry.ij_box.nx, cache_entry.ij_box.ny)
+        if actual_grid_shape != expected_grid_shape:
+            raise ValueError(f"ijsmall_grib crop produced grid {actual_grid_shape} but expected {expected_grid_shape}")
+        return result
+    except Exception as exc:
+        if options.crop_method == "ijsmall_grib":
+            raise
+        try:
+            if "cache_entry" in locals():
+                negative_cache_path = crop_grid_cache_root(reduced_path) / f"{cache_entry.signature}.unsupported.json"
+                write_crop_grid_negative_cache(negative_cache_path, reason="ijsmall_grib_crop_or_validation_failed")
+        except Exception:
+            pass
+        reduced_path.unlink(missing_ok=True)
+        return _small_grib(fallback_reason=str(exc)[:300])
 
 
 def path_for_raw(download_dir: Path, task: TaskSpec) -> Path:
@@ -1153,6 +1735,22 @@ def find_inventory_line(prefix: str, inventory_lines: list[str]) -> str | None:
     return candidates[0]
 
 
+def direct_prefix_for_inventory_line(line: str) -> str | None:
+    metadata = parse_inventory_line(line)
+    if metadata is not None and metadata["short"] == "DPT" and metadata["level"].endswith(" mb"):
+        level_text = metadata["level"].split()[0]
+        try:
+            level = int(level_text)
+        except ValueError:
+            return None
+        if level in ISOBARIC_LEVELS:
+            return f"dpt_{level}mb_k_support"
+    for prefix, pattern in DIRECT_INVENTORY_PATTERNS.items():
+        if pattern.search(line):
+            return prefix
+    return None
+
+
 def inventory_line_forecast_hour(line: str) -> int | None:
     metadata = parse_inventory_line(line)
     if metadata is None:
@@ -1259,6 +1857,38 @@ def direct_provenance_row(
         fallback_used=False,
         fallback_source_description=None,
         notes=(inventory_meta or {}).get("extra") or None,
+    )
+
+
+def direct_eccodes_provenance_row(
+    *,
+    task_key: str,
+    row_identity: dict[str, object],
+    feature_name: str,
+    inventory_line: str | None,
+    units: str | None,
+) -> dict[str, object]:
+    inventory_meta = parse_inventory_line(inventory_line or "")
+    return provenance_row(
+        task_key=task_key,
+        row_identity=row_identity,
+        feature_name=feature_name,
+        output_column_base=feature_name,
+        grib_short_name=(inventory_meta or {}).get("short"),
+        grib_level_text=(inventory_meta or {}).get("level"),
+        grib_type_of_level=None,
+        grib_step_type=None,
+        grib_step_text=(inventory_meta or {}).get("step"),
+        source_inventory_line=inventory_line,
+        units=units,
+        present_directly=True,
+        derived=False,
+        derivation_method=None,
+        source_feature_names=[],
+        missing_optional=False,
+        fallback_used=False,
+        fallback_source_description=None,
+        notes=(inventory_meta or {}).get("extra") or "extracted with direct ecCodes prototype",
     )
 
 
@@ -1425,8 +2055,8 @@ def add_wind_derivatives(
             )
 
 
-def missing_prefixes_from_row(row: dict[str, object]) -> list[str]:
-    return [prefix for prefix in REQUESTED_FIELD_PREFIXES if row.get(prefix) is None]
+def missing_prefixes_from_row(row: dict[str, object], *, task: TaskSpec | None = None) -> list[str]:
+    return [prefix for prefix in requested_field_prefixes_for_task(task) if row.get(prefix) is None]
 
 
 def isobaric_specs() -> list[GroupSpec]:
@@ -1499,6 +2129,208 @@ def close_group_datasets(group_datasets: Iterable[tuple[GroupSpec, xr.Dataset]])
             ds.close()
 
 
+def eccodes_grid_arrays(gid: object) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    import eccodes
+
+    nx = int(eccodes.codes_get(gid, "Nx"))
+    ny = int(eccodes.codes_get(gid, "Ny"))
+    values = np.asarray(eccodes.codes_get_values(gid), dtype=float).reshape(ny, nx)
+    lat_grid = np.asarray(eccodes.codes_get_array(gid, "latitudes"), dtype=float).reshape(ny, nx)
+    lon_grid = np.asarray(eccodes.codes_get_array(gid, "longitudes"), dtype=float).reshape(ny, nx)
+    return values, lat_grid, lon_grid
+
+
+def build_task_result_with_eccodes(
+    reduced_path: Path,
+    reduced_inventory: list[str],
+    task: TaskSpec,
+    grib_url: str,
+    *,
+    diagnostics: dict[str, object] | None = None,
+    include_legacy_aliases: bool = False,
+    filter_inventory_to_task_step: bool = False,
+    write_provenance: bool = True,
+) -> TaskResult:
+    import eccodes
+
+    diagnostics = dict(diagnostics or default_task_diagnostics(task))
+    diagnostics["extract_method"] = "eccodes"
+    diagnostics.setdefault("timing_cfgrib_open_seconds", 0.0)
+    row: dict[str, object] = {
+        "task_key": task.key,
+        "source_model": DEFAULT_SOURCE_MODEL,
+        "source_product": DEFAULT_SOURCE_PRODUCT,
+        "source_version": DEFAULT_SOURCE_VERSION,
+        "fallback_used_any": False,
+        "station_id": SETTLEMENT_LOCATION.station_id,
+        "grib_url": grib_url,
+        **settlement_metadata(),
+        **crop_metadata(),
+        "target_lat": SETTLEMENT_LOCATION.lat,
+        "target_lon": settlement_longitude_360(),
+    }
+    populate_task_metadata(row, task)
+
+    task_inventory = inventory_lines_for_task(reduced_inventory, task) if filter_inventory_to_task_step else reduced_inventory
+    task_inventory_set = set(task_inventory)
+    latitude: np.ndarray | None = None
+    longitude: np.ndarray | None = None
+    grid_row: int | None = None
+    grid_col: int | None = None
+    north_is_first: bool | None = None
+    support_arrays: dict[str, np.ndarray] = {}
+    provenance_rows: dict[str, dict[str, object]] = {}
+    message_count = 0
+    used_message_count = 0
+    started_at = time.perf_counter()
+
+    try:
+        with reduced_path.open("rb") as handle:
+            while True:
+                gid = eccodes.codes_grib_new_from_file(handle)
+                if gid is None:
+                    break
+                try:
+                    inventory_line = reduced_inventory[message_count] if message_count < len(reduced_inventory) else None
+                    message_count += 1
+                    if inventory_line is None:
+                        continue
+                    if filter_inventory_to_task_step and inventory_line not in task_inventory_set:
+                        continue
+                    prefix = direct_prefix_for_inventory_line(inventory_line)
+                    if prefix is None:
+                        continue
+                    values, lat_grid, lon_grid = eccodes_grid_arrays(gid)
+                    used_message_count += 1
+                    if latitude is None or longitude is None:
+                        latitude = lat_grid
+                        longitude = lon_grid
+                        nearest = find_nearest_grid_cell(
+                            latitude,
+                            longitude,
+                            station_lat=SETTLEMENT_LOCATION.lat,
+                            station_lon=SETTLEMENT_LOCATION.lon,
+                        )
+                        grid_row = int(nearest["grid_row"])
+                        grid_col = int(nearest["grid_col"])
+                        north_is_first = infer_north_is_first(latitude)
+                        row["grid_row"] = grid_row
+                        row["grid_col"] = grid_col
+                        row["nearest_grid_lat"] = float(nearest["grid_lat"])
+                        row["nearest_grid_lon"] = float(longitude_360_to_180(nearest["grid_lon"]))
+                        row["grid_lat"] = float(nearest["grid_lat"])
+                        row["grid_lon"] = float(nearest["grid_lon"])
+
+                    units: str | None
+                    try:
+                        units = str(eccodes.codes_get(gid, "units"))
+                    except Exception:
+                        units = None
+                    support_arrays[prefix] = values
+                    if prefix.endswith("_support"):
+                        continue
+                    assert grid_row is not None and grid_col is not None and north_is_first is not None
+                    row.update(
+                        feature_metrics(
+                            prefix,
+                            values,
+                            grid_row=grid_row,
+                            grid_col=grid_col,
+                            north_is_first=north_is_first,
+                            include_legacy_aliases=include_legacy_aliases,
+                        )
+                    )
+                    if write_provenance:
+                        provenance_rows[prefix] = direct_eccodes_provenance_row(
+                            task_key=task.key,
+                            row_identity=provenance_identity(row),
+                            feature_name=prefix,
+                            inventory_line=inventory_line,
+                            units=units,
+                        )
+                finally:
+                    eccodes.codes_release(gid)
+    except Exception as exc:
+        diagnostics["timing_direct_extract_seconds"] = time.perf_counter() - started_at
+        return TaskResult(False, task.key, None, [], [], f"ecCodes direct extraction failed: {exc}", diagnostics)
+
+    diagnostics["timing_direct_extract_seconds"] = time.perf_counter() - started_at
+    diagnostics["direct_message_count"] = message_count
+    diagnostics["direct_used_message_count"] = used_message_count
+
+    if latitude is None or longitude is None or grid_row is None or grid_col is None or north_is_first is None:
+        return TaskResult(False, task.key, None, [], [], "Unable to locate KLGA grid cell in reduced GRIB2", diagnostics)
+    if "init_time_utc" not in row or "valid_time_utc" not in row or "init_time_local" not in row:
+        return TaskResult(False, task.key, None, [], [], "Reduced GRIB2 did not expose init/valid timestamps", diagnostics)
+
+    row_build_started_at = time.perf_counter()
+    for level in ISOBARIC_LEVELS:
+        rh_prefix = f"rh_{level}mb_pct"
+        if row.get(rh_prefix) is None:
+            temp = support_arrays.get(f"tmp_{level}mb_k")
+            dewpoint = support_arrays.get(f"dpt_{level}mb_k_support")
+            if temp is not None and dewpoint is not None:
+                rh = rh_from_temp_and_dewpoint_k(temp, dewpoint)
+                row.update(
+                    feature_metrics(
+                        rh_prefix,
+                        rh,
+                        grid_row=grid_row,
+                        grid_col=grid_col,
+                        north_is_first=north_is_first,
+                        include_legacy_aliases=include_legacy_aliases,
+                    )
+                )
+                if write_provenance:
+                    provenance_rows[rh_prefix] = derived_provenance_row(
+                        task_key=task.key,
+                        row_identity=provenance_identity(row),
+                        feature_name=rh_prefix,
+                        units="%",
+                        derivation_method="relative_humidity_from_temperature_and_dewpoint",
+                        source_feature_names=[f"tmp_{level}mb_k", f"dpt_{level}mb_k_support"],
+                        notes=f"Derived because direct {rh_prefix} was not present.",
+                    )
+
+    add_temperature_conversions(row, provenance_rows if write_provenance else {})
+    add_wind_derivatives(
+        row,
+        provenance_rows if write_provenance else {},
+        support_arrays,
+        grid_row=grid_row,
+        grid_col=grid_col,
+        north_is_first=north_is_first,
+    )
+    diagnostics["timing_row_build_seconds"] = float(diagnostics.get("timing_row_build_seconds", 0.0)) + (
+        time.perf_counter() - row_build_started_at
+    )
+
+    missing_fields = missing_prefixes_from_row(row, task=task)
+    row["missing_optional_any"] = bool(missing_fields)
+    row["missing_optional_fields_count"] = len(missing_fields)
+    for prefix in missing_fields:
+        if write_provenance:
+            provenance_rows.setdefault(
+                prefix,
+                missing_provenance_row(
+                    task_key=task.key,
+                    row_identity=provenance_identity(row),
+                    feature_name=prefix,
+                ),
+            )
+
+    validate_required_columns(row, CANONICAL_WIDE_COLUMNS, label=f"HRRR wide row {task.key}")
+    return TaskResult(
+        True,
+        task.key,
+        row,
+        sorted(provenance_rows.values(), key=lambda item: item["feature_name"]) if write_provenance else [],
+        missing_fields,
+        None,
+        diagnostics,
+    )
+
+
 def build_task_result_from_open_datasets(
     group_datasets: list[tuple[GroupSpec, xr.Dataset]],
     reduced_inventory: list[str],
@@ -1508,6 +2340,7 @@ def build_task_result_from_open_datasets(
     diagnostics: dict[str, object] | None = None,
     include_legacy_aliases: bool = False,
     filter_inventory_to_task_step: bool = False,
+    write_provenance: bool = True,
 ) -> TaskResult:
     diagnostics = dict(diagnostics or default_task_diagnostics(task))
     row: dict[str, object] = {
@@ -1584,7 +2417,7 @@ def build_task_result_from_open_datasets(
                 )
                 support_arrays[prefix] = values
                 inventory_line = find_inventory_line(prefix, task_inventory)
-                if "init_time_utc" in row and "valid_time_utc" in row:
+                if write_provenance and "init_time_utc" in row and "valid_time_utc" in row:
                     provenance_rows[prefix] = direct_provenance_row(
                         task_key=task.key,
                         row_identity=provenance_identity(row),
@@ -1621,39 +2454,41 @@ def build_task_result_from_open_datasets(
                         include_legacy_aliases=include_legacy_aliases,
                     )
                 )
-                provenance_rows[rh_prefix] = derived_provenance_row(
-                    task_key=task.key,
-                    row_identity=provenance_identity(row),
-                    feature_name=rh_prefix,
-                    units="%",
-                    derivation_method="relative_humidity_from_temperature_and_dewpoint",
-                    source_feature_names=[f"tmp_{level}mb_k", f"dpt_{level}mb_k_support"],
-                    notes=f"Derived because direct {rh_prefix} was not present.",
-                )
+                if write_provenance:
+                    provenance_rows[rh_prefix] = derived_provenance_row(
+                        task_key=task.key,
+                        row_identity=provenance_identity(row),
+                        feature_name=rh_prefix,
+                        units="%",
+                        derivation_method="relative_humidity_from_temperature_and_dewpoint",
+                        source_feature_names=[f"tmp_{level}mb_k", f"dpt_{level}mb_k_support"],
+                        notes=f"Derived because direct {rh_prefix} was not present.",
+                    )
 
-    add_temperature_conversions(row, provenance_rows)
+    add_temperature_conversions(row, provenance_rows if write_provenance else {})
     add_wind_derivatives(
         row,
-        provenance_rows,
+        provenance_rows if write_provenance else {},
         support_arrays,
         grid_row=grid_row,
         grid_col=grid_col,
         north_is_first=north_is_first,
     )
 
-    missing_fields = missing_prefixes_from_row(row)
+    missing_fields = missing_prefixes_from_row(row, task=task)
     row["missing_optional_any"] = bool(missing_fields)
     row["missing_optional_fields_count"] = len(missing_fields)
 
     for prefix in missing_fields:
-        provenance_rows.setdefault(
-            prefix,
-            missing_provenance_row(
-                task_key=task.key,
-                row_identity=provenance_identity(row),
-                feature_name=prefix,
-            ),
-        )
+        if write_provenance:
+            provenance_rows.setdefault(
+                prefix,
+                missing_provenance_row(
+                    task_key=task.key,
+                    row_identity=provenance_identity(row),
+                    feature_name=prefix,
+                ),
+            )
 
     validate_required_columns(row, CANONICAL_WIDE_COLUMNS, label=f"HRRR wide row {task.key}")
 
@@ -1661,7 +2496,7 @@ def build_task_result_from_open_datasets(
         True,
         task.key,
         row,
-        sorted(provenance_rows.values(), key=lambda item: item["feature_name"]),
+        sorted(provenance_rows.values(), key=lambda item: item["feature_name"]) if write_provenance else [],
         missing_fields,
         None,
         diagnostics,
@@ -1678,8 +2513,21 @@ def process_reduced_grib(
     diagnostics: dict[str, object] | None = None,
     include_legacy_aliases: bool = False,
     filter_inventory_to_task_step: bool = False,
+    write_provenance: bool = True,
 ) -> TaskResult:
     diagnostics = dict(diagnostics or default_task_diagnostics(task))
+    if RUNTIME_OPTIONS.extract_method == "eccodes":
+        return build_task_result_with_eccodes(
+            reduced_path,
+            reduced_inventory,
+            task,
+            grib_url,
+            diagnostics=diagnostics,
+            include_legacy_aliases=include_legacy_aliases,
+            filter_inventory_to_task_step=filter_inventory_to_task_step,
+            write_provenance=write_provenance,
+        )
+    diagnostics["extract_method"] = "cfgrib"
     local_index_dir = cfgrib_index_dir
     created_index_dir = False
     if local_index_dir is None:
@@ -1704,6 +2552,7 @@ def process_reduced_grib(
             diagnostics=diagnostics,
             include_legacy_aliases=include_legacy_aliases,
             filter_inventory_to_task_step=filter_inventory_to_task_step,
+            write_provenance=write_provenance,
         )
     finally:
         close_group_datasets(group_datasets)
@@ -1720,6 +2569,8 @@ def task_remote_url(task: TaskSpec, source: str = "google") -> str:
 def default_task_diagnostics(task: TaskSpec) -> dict[str, object]:
     return {
         "task_key": task.key,
+        "field_profile": task_field_profile(task),
+        "extract_method": RUNTIME_OPTIONS.extract_method,
         "head_used": False,
         "remote_file_size": None,
         "selected_record_count": 0,
@@ -1731,6 +2582,13 @@ def default_task_diagnostics(task: TaskSpec) -> dict[str, object]:
         "timing_range_download_seconds": 0.0,
         "timing_wgrib_inventory_seconds": 0.0,
         "timing_reduce_seconds": 0.0,
+        "crop_method": None,
+        "crop_command": None,
+        "crop_grid_cache_key": None,
+        "crop_grid_cache_hit": False,
+        "crop_ij_box": None,
+        "crop_wgrib2_threads": None,
+        "crop_fallback_reason": None,
         "timing_cfgrib_open_seconds": 0.0,
         "timing_row_build_seconds": 0.0,
         "timing_cleanup_seconds": 0.0,
@@ -1751,6 +2609,8 @@ def default_task_diagnostics(task: TaskSpec) -> dict[str, object]:
         "reduced_file_path": None,
         "reduced_file_size": None,
         "grib_url": None,
+        "summary_profile": RUNTIME_OPTIONS.summary_profile,
+        "provenance_written": not RUNTIME_OPTIONS.skip_provenance,
     }
 
 
@@ -1852,9 +2712,9 @@ def reduce_grib2_for_task(
     *,
     task: TaskSpec,
     raw_manifest_path: Path,
-) -> tuple[list[str], set[str], float, float]:
-    del task, raw_manifest_path
-    return reduce_grib2(wgrib2_path, raw_path, reduced_path)
+) -> CropExecutionResult:
+    del raw_manifest_path
+    return reduce_grib2(wgrib2_path, raw_path, reduced_path, task=task)
 
 
 def cycle_key_for_task(task: TaskSpec) -> tuple[str, int]:
@@ -1884,14 +2744,24 @@ def reduce_grib2_for_batch(
     raw_paths: list[Path],
     batch_raw_path: Path,
     batch_reduced_path: Path,
-) -> tuple[list[str], set[str], float, float, float]:
+    *,
+    task: TaskSpec,
+) -> tuple[list[str], set[str], float, float, float, CropExecutionResult]:
     concat_seconds = concatenate_files(raw_paths, batch_raw_path)
-    reduced_inventory, matched_names, inventory_seconds, reduce_seconds = reduce_grib2(
+    crop_result = reduce_grib2(
         wgrib2_path,
         batch_raw_path,
         batch_reduced_path,
+        task=task,
     )
-    return reduced_inventory, matched_names, inventory_seconds, reduce_seconds, concat_seconds
+    return (
+        crop_result.selected_lines,
+        crop_result.matched_names,
+        crop_result.inventory_seconds,
+        crop_result.reduce_seconds,
+        concat_seconds,
+        crop_result,
+    )
 
 
 def download_task_subset(
@@ -1911,7 +2781,7 @@ def download_task_subset(
         "product": "surface",
         "forecast_hour": task.forecast_hour,
         "source": "google",
-        "patterns": [pattern for _, pattern in inventory_selection_patterns()],
+        "patterns": [pattern for _, pattern in inventory_selection_patterns_for_task(task)],
         "subset_path": raw_path,
         "manifest_path": raw_manifest_path,
         "selection_manifest_path": raw_selection_manifest_path,
@@ -1995,7 +2865,7 @@ def _process_task_once(
             "product": "surface",
             "forecast_hour": task.forecast_hour,
             "source": "google",
-            "patterns": [pattern for _, pattern in inventory_selection_patterns()],
+            "patterns": [pattern for _, pattern in inventory_selection_patterns_for_task(task)],
             "subset_path": raw_path,
             "manifest_path": raw_manifest_path,
             "selection_manifest_path": raw_selection_manifest_path,
@@ -2091,19 +2961,27 @@ def _process_task_once(
                 active_phase="reduce",
                 details="reduce_grib2",
             ):
-                reduced_result = reduce_grib2_for_task(
+                crop_result = reduce_grib2_for_task(
                     wgrib2_path,
                     raw_path,
                     reduced_path,
                     task=task,
                     raw_manifest_path=raw_manifest_path,
                 )
-                if len(reduced_result) == 4:
-                    reduced_inventory, _, inventory_seconds, reduce_seconds = reduced_result
-                else:
-                    reduced_inventory, _ = reduced_result
-                    inventory_seconds = 0.0
-                    reduce_seconds = 0.0
+                reduced_inventory = crop_result.selected_lines
+                inventory_seconds = crop_result.inventory_seconds
+                reduce_seconds = crop_result.reduce_seconds
+                diagnostics.update(
+                    {
+                        "crop_method": crop_result.method_used,
+                        "crop_command": crop_result.command,
+                        "crop_grid_cache_key": crop_result.crop_grid_cache_key,
+                        "crop_grid_cache_hit": crop_result.crop_grid_cache_hit,
+                        "crop_ij_box": crop_result.crop_ij_box,
+                        "crop_wgrib2_threads": crop_result.crop_wgrib2_threads,
+                        "crop_fallback_reason": crop_result.crop_fallback_reason,
+                    }
+                )
                 if keep_reduced and reuse_signature is not None:
                     write_reduced_reuse_signature(reduced_path, reuse_signature)
                     write_reduced_inventory(reduced_path, reuse_signature, reduced_inventory)
@@ -2136,6 +3014,7 @@ def _process_task_once(
                     cfgrib_index_dir=cfgrib_index_dir,
                     diagnostics=diagnostics,
                     include_legacy_aliases=include_legacy_aliases,
+                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
                 )
             except TypeError as exc:
                 if "cfgrib_index_dir" not in str(exc) and "diagnostics" not in str(exc):
@@ -2146,6 +3025,7 @@ def _process_task_once(
                     task,
                     grib_url,
                     include_legacy_aliases=include_legacy_aliases,
+                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
                 )
     except Exception as exc:
         diagnostics["last_error_type"] = type(exc).__name__
@@ -2327,17 +3207,7 @@ def summary_parquet_path(output_dir: Path, month_id: str) -> Path:
     return output_dir / f"{month_id}.parquet"
 
 
-def load_manifest(path: Path, month_id: str, expected_task_keys: list[str], *, keep_downloads: bool, keep_reduced: bool) -> dict[str, object]:
-    if path.exists():
-        manifest = json.loads(path.read_text())
-        manifest.setdefault("source_model", DEFAULT_SOURCE_MODEL)
-        manifest.setdefault("source_product", DEFAULT_SOURCE_PRODUCT)
-        manifest.setdefault("source_version", DEFAULT_SOURCE_VERSION)
-        manifest.setdefault("summary_parquet_path", None)
-        manifest.setdefault("manifest_parquet_path", str(manifest_parquet_path(path.parent, month_id)))
-        manifest.setdefault("manifest_json_path", str(path))
-        manifest.setdefault("task_diagnostics", {})
-        return manifest
+def new_manifest(path: Path, month_id: str, expected_task_keys: list[str], *, keep_downloads: bool, keep_reduced: bool) -> dict[str, object]:
     return {
         "month": month_id,
         "expected_task_count": len(expected_task_keys),
@@ -2351,6 +3221,9 @@ def load_manifest(path: Path, month_id: str, expected_task_keys: list[str], *, k
         "wide_parquet_path": str(parquet_path(path.parent, month_id)),
         "provenance_path": str(provenance_path(path.parent, month_id)),
         "summary_parquet_path": None,
+        "provenance_written": not RUNTIME_OPTIONS.skip_provenance,
+        "extract_method": RUNTIME_OPTIONS.extract_method,
+        "summary_profile": RUNTIME_OPTIONS.summary_profile,
         "manifest_parquet_path": str(manifest_parquet_path(path.parent, month_id)),
         "manifest_json_path": str(path),
         "row_buffer_path": str(row_buffer_path(path.parent, month_id)),
@@ -2360,6 +3233,41 @@ def load_manifest(path: Path, month_id: str, expected_task_keys: list[str], *, k
         "task_diagnostics": {},
         "complete": False,
     }
+
+
+def manifest_matches_current_run(manifest: dict[str, object], expected_task_keys: list[str]) -> bool:
+    return (
+        list(manifest.get("expected_task_keys", [])) == list(expected_task_keys)
+        and str(manifest.get("extract_method", DEFAULT_EXTRACT_METHOD)) == RUNTIME_OPTIONS.extract_method
+        and str(manifest.get("summary_profile", "full")) == RUNTIME_OPTIONS.summary_profile
+        and bool(manifest.get("provenance_written", True)) == (not RUNTIME_OPTIONS.skip_provenance)
+    )
+
+
+def load_manifest(path: Path, month_id: str, expected_task_keys: list[str], *, keep_downloads: bool, keep_reduced: bool) -> dict[str, object]:
+    if path.exists():
+        manifest = json.loads(path.read_text())
+        manifest.setdefault("source_model", DEFAULT_SOURCE_MODEL)
+        manifest.setdefault("source_product", DEFAULT_SOURCE_PRODUCT)
+        manifest.setdefault("source_version", DEFAULT_SOURCE_VERSION)
+        manifest.setdefault("summary_parquet_path", None)
+        manifest.setdefault("provenance_written", True)
+        manifest.setdefault("extract_method", DEFAULT_EXTRACT_METHOD)
+        manifest.setdefault("summary_profile", "full")
+        manifest.setdefault("manifest_parquet_path", str(manifest_parquet_path(path.parent, month_id)))
+        manifest.setdefault("manifest_json_path", str(path))
+        manifest.setdefault("task_diagnostics", {})
+        if manifest_matches_current_run(manifest, expected_task_keys):
+            return manifest
+        row_buffer_path(path.parent, month_id).unlink(missing_ok=True)
+        provenance_buffer_path(path.parent, month_id).unlink(missing_ok=True)
+    return new_manifest(
+        path,
+        month_id,
+        expected_task_keys,
+        keep_downloads=keep_downloads,
+        keep_reduced=keep_reduced,
+    )
 
 
 def save_manifest(path: Path, manifest: dict[str, object]) -> None:
@@ -2751,18 +3659,27 @@ def finalize_month(
     row_buffer: dict[str, dict[str, object]],
     provenance_buffer: dict[str, dict[str, object]],
     manifest: dict[str, object],
+    write_provenance: bool = True,
 ) -> None:
     wide_df = pd.DataFrame(sorted(row_buffer.values(), key=lambda row: row["task_key"]))
-    provenance_df = pd.DataFrame(
-        sorted(
-            provenance_buffer.values(),
-            key=lambda row: (row["task_key"], row["feature_name"]),
-        )
-    )
     wide_df.to_parquet(parquet_path(output_dir, month_id), index=False)
-    provenance_df.to_parquet(provenance_path(output_dir, month_id), index=False)
+    if write_provenance:
+        provenance_df = pd.DataFrame(
+            sorted(
+                provenance_buffer.values(),
+                key=lambda row: (row["task_key"], row["feature_name"]),
+            )
+        )
+        provenance_df.to_parquet(provenance_path(output_dir, month_id), index=False)
+        manifest["provenance_path"] = str(provenance_path(output_dir, month_id))
+    else:
+        provenance_path(output_dir, month_id).unlink(missing_ok=True)
+        manifest["provenance_path"] = None
     write_summary_month(summary_output_dir, month_id, row_buffer)
     manifest["summary_parquet_path"] = str(summary_parquet_path(summary_output_dir, month_id))
+    manifest["provenance_written"] = bool(write_provenance)
+    manifest["extract_method"] = RUNTIME_OPTIONS.extract_method
+    manifest["summary_profile"] = RUNTIME_OPTIONS.summary_profile
     manifest["complete"] = True
     manifest["failure_reasons"] = {}
     save_manifest(manifest_path(output_dir, month_id), manifest)
@@ -2771,11 +3688,16 @@ def finalize_month(
     provenance_buffer_path(output_dir, month_id).unlink(missing_ok=True)
 
 
-def month_is_complete(output_dir: Path, month_id: str, manifest: dict[str, object]) -> bool:
+def month_is_complete(output_dir: Path, month_id: str, manifest: dict[str, object], expected_task_keys: list[str]) -> bool:
+    provenance_ok = (
+        not bool(manifest.get("provenance_written", True))
+        or provenance_path(output_dir, month_id).exists()
+    )
     return (
         bool(manifest.get("complete"))
+        and manifest_matches_current_run(manifest, expected_task_keys)
         and parquet_path(output_dir, month_id).exists()
-        and provenance_path(output_dir, month_id).exists()
+        and provenance_ok
         and manifest.get("summary_parquet_path")
         and Path(str(manifest["summary_parquet_path"])).exists()
         and manifest_parquet_path(output_dir, month_id).exists()
@@ -2824,7 +3746,7 @@ def _run_month_legacy(
         keep_reduced=keep_reduced,
     )
 
-    if month_is_complete(output_dir, month_id, manifest):
+    if month_is_complete(output_dir, month_id, manifest, expected_task_keys):
         print(f"[skip-month] {month_id} already complete")
         return 0, 0
 
@@ -2922,9 +3844,10 @@ def _run_month_legacy(
                     if result.ok and result.row is not None:
                         append_jsonl_batch(row_buffer_file, [result.row])
                         row_buffer[result.task_key] = result.row
-                        append_jsonl_batch(provenance_buffer_file, result.provenance_rows)
-                        for provenance_entry in result.provenance_rows:
-                            provenance_buffer[f"{provenance_entry['task_key']}|{provenance_entry['feature_name']}"] = provenance_entry
+                        if result.provenance_rows:
+                            append_jsonl_batch(provenance_buffer_file, result.provenance_rows)
+                            for provenance_entry in result.provenance_rows:
+                                provenance_buffer[f"{provenance_entry['task_key']}|{provenance_entry['feature_name']}"] = provenance_entry
                         completed.add(result.task_key)
                         failures.pop(result.task_key, None)
                         missing_fields[result.task_key] = result.missing_fields
@@ -2997,10 +3920,19 @@ def _run_month_legacy(
         manifest["failure_reasons"] = {}
         manifest["missing_fields"] = missing_fields
         manifest["task_diagnostics"] = task_diagnostics
-        finalize_month(output_dir, summary_output_dir, month_id, row_buffer, provenance_buffer, manifest)
+        finalize_month(
+            output_dir,
+            summary_output_dir,
+            month_id,
+            row_buffer,
+            provenance_buffer,
+            manifest,
+            write_provenance=not RUNTIME_OPTIONS.skip_provenance,
+        )
+        provenance_label = manifest.get("provenance_path") or "skipped"
         print(
             f"[month-done] {month_id} rows={len(row_buffer)} parquet={parquet_path(output_dir, month_id)} "
-            f"provenance={provenance_path(output_dir, month_id)} summary={summary_parquet_path(summary_output_dir, month_id)}"
+            f"provenance={provenance_label} summary={summary_parquet_path(summary_output_dir, month_id)}"
         )
     else:
         manifest["complete"] = False
@@ -3062,7 +3994,7 @@ def _run_month_batch_cycle(
         keep_reduced=keep_reduced,
     )
     manifest["batch_reduce_mode"] = "cycle"
-    if month_is_complete(output_dir, month_id, manifest):
+    if month_is_complete(output_dir, month_id, manifest, expected_task_keys):
         print(f"[skip-month] {month_id} already complete")
         return 0, 0
 
@@ -3266,11 +4198,12 @@ def _run_month_batch_cycle(
                 if reporter is not None:
                     reporter.set_worker_attempt(reduce_worker_id, attempt=reduce_attempt, max_attempts=retry_policy.max_attempts)
                 try:
-                    reduced_inventory, _, inventory_seconds, reduce_seconds, concat_seconds = reduce_grib2_for_batch(
+                    reduced_inventory, _, inventory_seconds, reduce_seconds, concat_seconds, crop_result = reduce_grib2_for_batch(
                         wgrib2_path,
                         [item.raw_path for item in ok_items if item.raw_path is not None],
                         batch_raw_path,
                         batch_reduced_path,
+                        task=first_task,
                     )
                     break
                 except Exception as exc:
@@ -3282,6 +4215,7 @@ def _run_month_batch_cycle(
                         continue
                     raise
             batch_reduce_seconds = time.perf_counter() - reduce_started_at
+            task_count = max(1, len(ok_items))
             for item in ok_items:
                 item.batch_reduced_path = batch_reduced_path
                 item.batch_reduced_inventory = reduced_inventory
@@ -3290,8 +4224,18 @@ def _run_month_batch_cycle(
                 item.diagnostics["batch_lead_count"] = len(ok_items)
                 item.diagnostics["batch_concat_seconds"] = concat_seconds
                 item.diagnostics["batch_reduce_seconds"] = batch_reduce_seconds
-                item.diagnostics["timing_wgrib_inventory_seconds"] = inventory_seconds
-                item.diagnostics["timing_reduce_seconds"] = reduce_seconds
+                item.diagnostics["batch_cycle_reduce_seconds"] = reduce_seconds
+                item.diagnostics["batch_cycle_inventory_seconds"] = inventory_seconds
+                item.diagnostics["batch_timing_policy"] = "cycle_total_plus_apportioned_task"
+                item.diagnostics["timing_wgrib_inventory_seconds"] = round(inventory_seconds / task_count, 6)
+                item.diagnostics["timing_reduce_seconds"] = round(reduce_seconds / task_count, 6)
+                item.diagnostics["crop_method"] = crop_result.method_used
+                item.diagnostics["crop_command"] = crop_result.command
+                item.diagnostics["crop_grid_cache_key"] = crop_result.crop_grid_cache_key
+                item.diagnostics["crop_grid_cache_hit"] = crop_result.crop_grid_cache_hit
+                item.diagnostics["crop_ij_box"] = crop_result.crop_ij_box
+                item.diagnostics["crop_wgrib2_threads"] = crop_result.crop_wgrib2_threads
+                item.diagnostics["crop_fallback_reason"] = crop_result.crop_fallback_reason
                 item.diagnostics["retry_recovered"] = bool(item.diagnostics.get("retry_recovered")) or reduce_attempt > 1
                 item.diagnostics["reduced_file_path"] = str(batch_reduced_path)
                 item.diagnostics["reduced_file_size"] = batch_reduced_path.stat().st_size if batch_reduced_path.exists() else None
@@ -3333,6 +4277,37 @@ def _run_month_batch_cycle(
         group_datasets: list[tuple[GroupSpec, xr.Dataset]] = []
         results: list[TaskResult] = []
         try:
+            if RUNTIME_OPTIONS.extract_method == "eccodes":
+                for item in ok_items:
+                    extract_attempt = 1
+                    item_extract_worker_id = f"batch_extract_{cycle_key[0]}T{cycle_key[1]:02d}_f{item.task.forecast_hour:02d}"
+                    while True:
+                        item.attempt_count = max(item.attempt_count, extract_attempt)
+                        item.diagnostics["attempt_count"] = max(int(item.diagnostics.get("attempt_count") or 1), extract_attempt)
+                        item.diagnostics["retried"] = bool(item.diagnostics.get("retried")) or extract_attempt > 1
+                        try:
+                            result = process_reduced_grib(
+                                batch_reduced_path,
+                                reduced_inventory,
+                                item.task,
+                                item.grib_url or task_remote_url(item.task, "google"),
+                                diagnostics=item.diagnostics,
+                                include_legacy_aliases=include_legacy_aliases,
+                                filter_inventory_to_task_step=True,
+                                write_provenance=not RUNTIME_OPTIONS.skip_provenance,
+                            )
+                            result.diagnostics["retry_recovered"] = bool(result.diagnostics.get("retry_recovered")) or extract_attempt > 1
+                            results.append(result)
+                            break
+                        except Exception as exc:
+                            item.diagnostics["last_error_type"] = type(exc).__name__
+                            item.diagnostics["last_error_message"] = str(exc)
+                            if sleep_for_retry(worker_id=item_extract_worker_id, attempt=extract_attempt, phase="extract", exc=exc):
+                                extract_attempt += 1
+                                continue
+                            raise
+                return cycle_key, results
+
             shared_open_ok = False
             extract_attempt = 1
             while True:
@@ -3351,8 +4326,11 @@ def _run_month_batch_cycle(
                         cfgrib_index_dir=cfgrib_index_dir,
                     )
                     shared_open_seconds = float(open_diagnostics["timing_cfgrib_open_seconds"])
+                    task_open_seconds = round(shared_open_seconds / max(1, len(ok_items)), 6)
                     for item in ok_items:
-                        item.diagnostics["timing_cfgrib_open_seconds"] = shared_open_seconds
+                        item.diagnostics["batch_cycle_cfgrib_open_seconds"] = shared_open_seconds
+                        item.diagnostics["batch_timing_policy"] = "cycle_total_plus_apportioned_task"
+                        item.diagnostics["timing_cfgrib_open_seconds"] = task_open_seconds
                         item.diagnostics["retry_recovered"] = bool(item.diagnostics.get("retry_recovered")) or extract_attempt > 1
                     shared_open_ok = True
                     break
@@ -3386,6 +4364,7 @@ def _run_month_batch_cycle(
                                 diagnostics=item.diagnostics,
                                 include_legacy_aliases=include_legacy_aliases,
                                 filter_inventory_to_task_step=True,
+                                write_provenance=not RUNTIME_OPTIONS.skip_provenance,
                             )
                             result.diagnostics["retry_recovered"] = bool(result.diagnostics.get("retry_recovered")) or extract_attempt > 1
                             results.append(result)
@@ -3537,9 +4516,10 @@ def _run_month_batch_cycle(
                             if result.ok and result.row is not None:
                                 append_jsonl_batch(row_buffer_file, [result.row])
                                 row_buffer[result.task_key] = result.row
-                                append_jsonl_batch(provenance_buffer_file, result.provenance_rows)
-                                for provenance_entry in result.provenance_rows:
-                                    provenance_buffer[f"{provenance_entry['task_key']}|{provenance_entry['feature_name']}"] = provenance_entry
+                                if result.provenance_rows:
+                                    append_jsonl_batch(provenance_buffer_file, result.provenance_rows)
+                                    for provenance_entry in result.provenance_rows:
+                                        provenance_buffer[f"{provenance_entry['task_key']}|{provenance_entry['feature_name']}"] = provenance_entry
                                 completed.add(result.task_key)
                                 failures.pop(result.task_key, None)
                                 missing_fields[result.task_key] = result.missing_fields
@@ -3588,10 +4568,19 @@ def _run_month_batch_cycle(
         manifest["failure_reasons"] = {}
         manifest["missing_fields"] = missing_fields
         manifest["task_diagnostics"] = task_diagnostics
-        finalize_month(output_dir, summary_output_dir, month_id, row_buffer, provenance_buffer, manifest)
+        finalize_month(
+            output_dir,
+            summary_output_dir,
+            month_id,
+            row_buffer,
+            provenance_buffer,
+            manifest,
+            write_provenance=not RUNTIME_OPTIONS.skip_provenance,
+        )
+        provenance_label = manifest.get("provenance_path") or "skipped"
         print(
             f"[month-done] {month_id} rows={len(row_buffer)} parquet={parquet_path(output_dir, month_id)} "
-            f"provenance={provenance_path(output_dir, month_id)} summary={summary_parquet_path(summary_output_dir, month_id)}"
+            f"provenance={provenance_label} summary={summary_parquet_path(summary_output_dir, month_id)}"
         )
     else:
         manifest["complete"] = False
@@ -3708,7 +4697,7 @@ def run_month(
         keep_downloads=keep_downloads,
         keep_reduced=keep_reduced,
     )
-    if month_is_complete(output_dir, month_id, manifest):
+    if month_is_complete(output_dir, month_id, manifest, expected_task_keys):
         print(f"[skip-month] {month_id} already complete")
         return 0, 0
 
@@ -3887,7 +4876,7 @@ def run_month(
             "product": "surface",
             "forecast_hour": task.forecast_hour,
             "source": "google",
-            "patterns": [pattern for _, pattern in inventory_selection_patterns()],
+            "patterns": [pattern for _, pattern in inventory_selection_patterns_for_task(task)],
             "subset_path": item.raw_path,
             "manifest_path": item.raw_manifest_path,
             "selection_manifest_path": item.raw_selection_manifest_path,
@@ -3960,19 +4949,16 @@ def run_month(
             item.reduced_inventory = inventory
             item.diagnostics["timing_reduce_seconds"] = 0.0
             return item
-        reduced_result = reduce_grib2_for_task(
+        crop_result = reduce_grib2_for_task(
             wgrib2_path,
             item.raw_path,
             item.reduced_path,
             task=task,
             raw_manifest_path=item.raw_manifest_path,
         )
-        if len(reduced_result) == 4:
-            reduced_inventory, _, inventory_seconds, reduce_seconds = reduced_result
-        else:
-            reduced_inventory, _ = reduced_result
-            inventory_seconds = 0.0
-            reduce_seconds = 0.0
+        reduced_inventory = crop_result.selected_lines
+        inventory_seconds = crop_result.inventory_seconds
+        reduce_seconds = crop_result.reduce_seconds
         if keep_reduced and reuse_signature is not None:
             write_reduced_reuse_signature(item.reduced_path, reuse_signature)
             write_reduced_inventory(item.reduced_path, reuse_signature, reduced_inventory)
@@ -3980,6 +4966,13 @@ def run_month(
         item.diagnostics["reduced_file_size"] = item.reduced_path.stat().st_size if item.reduced_path.exists() else None
         item.diagnostics["timing_wgrib_inventory_seconds"] = inventory_seconds
         item.diagnostics["timing_reduce_seconds"] = reduce_seconds
+        item.diagnostics["crop_method"] = crop_result.method_used
+        item.diagnostics["crop_command"] = crop_result.command
+        item.diagnostics["crop_grid_cache_key"] = crop_result.crop_grid_cache_key
+        item.diagnostics["crop_grid_cache_hit"] = crop_result.crop_grid_cache_hit
+        item.diagnostics["crop_ij_box"] = crop_result.crop_ij_box
+        item.diagnostics["crop_wgrib2_threads"] = crop_result.crop_wgrib2_threads
+        item.diagnostics["crop_fallback_reason"] = crop_result.crop_fallback_reason
         return item
 
     def run_extract_stage(item: HrrrPipelineItem, *, worker_id: str) -> TaskResult:
@@ -4001,6 +4994,7 @@ def run_month(
                     cfgrib_index_dir=cfgrib_index_dir,
                     diagnostics=item.diagnostics,
                     include_legacy_aliases=include_legacy_aliases,
+                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
                 )
             except TypeError as exc:
                 if "cfgrib_index_dir" not in str(exc) and "diagnostics" not in str(exc):
@@ -4011,6 +5005,7 @@ def run_month(
                     task,
                     item.grib_url,
                     include_legacy_aliases=include_legacy_aliases,
+                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
                 )
         finally:
             shutil.rmtree(cfgrib_index_dir, ignore_errors=True)
@@ -4168,9 +5163,10 @@ def run_month(
             if result.ok and result.row is not None:
                 append_jsonl_batch(row_buffer_file, [result.row])
                 row_buffer[result.task_key] = result.row
-                append_jsonl_batch(provenance_buffer_file, result.provenance_rows)
-                for provenance_entry in result.provenance_rows:
-                    provenance_buffer[f"{provenance_entry['task_key']}|{provenance_entry['feature_name']}"] = provenance_entry
+                if result.provenance_rows:
+                    append_jsonl_batch(provenance_buffer_file, result.provenance_rows)
+                    for provenance_entry in result.provenance_rows:
+                        provenance_buffer[f"{provenance_entry['task_key']}|{provenance_entry['feature_name']}"] = provenance_entry
                 completed.add(result.task_key)
                 failures.pop(result.task_key, None)
                 missing_fields[result.task_key] = result.missing_fields
@@ -4223,10 +5219,19 @@ def run_month(
         manifest["failure_reasons"] = {}
         manifest["missing_fields"] = missing_fields
         manifest["task_diagnostics"] = task_diagnostics
-        finalize_month(output_dir, summary_output_dir, month_id, row_buffer, provenance_buffer, manifest)
+        finalize_month(
+            output_dir,
+            summary_output_dir,
+            month_id,
+            row_buffer,
+            provenance_buffer,
+            manifest,
+            write_provenance=not RUNTIME_OPTIONS.skip_provenance,
+        )
+        provenance_label = manifest.get("provenance_path") or "skipped"
         print(
             f"[month-done] {month_id} rows={len(row_buffer)} parquet={parquet_path(output_dir, month_id)} "
-            f"provenance={provenance_path(output_dir, month_id)} summary={summary_parquet_path(summary_output_dir, month_id)}"
+            f"provenance={provenance_label} summary={summary_parquet_path(summary_output_dir, month_id)}"
         )
     else:
         manifest["complete"] = False
@@ -4249,7 +5254,18 @@ def run_month(
 
 
 def main() -> int:
+    global RUNTIME_OPTIONS
     args = parse_args()
+    RUNTIME_OPTIONS = HrrrRuntimeOptions(
+        crop_method=str(args.crop_method),
+        crop_grib_type=str(args.crop_grib_type),
+        wgrib2_threads=args.wgrib2_threads,
+        max_workers=max(1, int(args.max_workers)),
+        reduce_workers=args.reduce_workers,
+        extract_method=str(args.extract_method),
+        summary_profile=str(args.summary_profile),
+        skip_provenance=bool(args.skip_provenance),
+    )
     wgrib2_path = ensure_tooling()
     scratch_dir = args.scratch_dir
     download_dir = (scratch_dir / "downloads") if scratch_dir is not None else args.download_dir
