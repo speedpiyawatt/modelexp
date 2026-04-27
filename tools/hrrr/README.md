@@ -113,6 +113,38 @@ python tools/hrrr/summarize_hrrr_diagnostics.py \
 
 This summarizes medians and p95 values for download, inventory, reduce, open/extract, and row-build timings, plus reduced-to-raw size ratios when those diagnostics are available in manifest parquet outputs.
 
+HRRR-Zarr Phase 4 probe:
+
+```bash
+source .venv/bin/activate
+python tools/hrrr/probe_hrrr_zarr.py \
+  --start-date 2023-02-04 \
+  --end-date 2023-02-04 \
+  --selection-mode overnight_0005 \
+  --summary-profile overnight \
+  --output-json tools/hrrr/data/runtime/zarr_probes/2023-02-04_overnight_0005.json
+```
+
+This metadata-only probe checks public HRRR-Zarr coverage against the current KLGA overnight feature contract. Early probes show HRRR-Zarr is not a drop-in replacement for the GRIB path; see `tools/hrrr/ZARR.md`.
+
+HRRR Kerchunk Phase 4 probe:
+
+```bash
+source .venv/bin/activate
+python tools/hrrr/probe_hrrr_kerchunk.py \
+  --start-date 2023-02-04 \
+  --end-date 2023-02-04 \
+  --selection-mode overnight_0005 \
+  --summary-profile overnight \
+  --max-tasks 1 \
+  --skip-messages 20 \
+  --output-json tools/hrrr/data/runtime/kerchunk_probes/2023-02-04_overnight_0005_smoke.json
+```
+
+Kerchunk is a prototype-only evaluation path for reusable references over the same remote GRIB files used by the production pipeline. Keep `--skip-messages 20` for a quick smoke run; use `--skip-messages 0` only when measuring a full-file reference scan. Do not treat this as a replacement for the current GRIB/eccodes path until extraction parity and end-to-end speed are proven.
+
+Initial 2026-04-27 measurement: for `2023-02-04__2023-02-04_t05_f00`, a full-file Kerchunk scan took 90.51s for 170 message references. The current `.idx` path selected 6 records in 6 merged byte ranges and fetched/parsed the index in about 0.11s before range download, so Kerchunk is only worth further work if references are cached and reused enough to repay that upfront scan.
+
 Server-owned selected-raw relay queue:
 
 - `tools/hrrr/relay_server.py`

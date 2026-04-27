@@ -86,10 +86,12 @@ Make the HRRR overnight backfill materially faster without changing the settleme
   - Verify required variables, levels, forecast hours, and archive coverage.
   - Confirm KLGA point extraction and local-day summaries match the current GRIB path.
   - Keep GRIB path as fallback for gaps.
+  - Status: started with `tools/hrrr/probe_hrrr_zarr.py`, a metadata-only public S3 probe that maps the current HRRR feature contract to `hrrrzarr` paths and checks retained forecast-hour coverage. Initial probes for `2023-02-04` and `2026-04-11` found recurring gaps: missing upper-level direct `RH`, missing upper-level direct `SPFH`, missing `925mb/HGT`, and missing `f18` coverage on the latest non-full overnight cycle. See `tools/hrrr/ZARR.md`.
 
 - [ ] Evaluate Kerchunk only if HRRR-Zarr is insufficient.
   - Use Kerchunk to avoid repeated GRIB scans while preserving cloud/range access.
   - Promote only if it is simpler or faster than the direct extractor for this station-summary workload.
+  - Status: started with `tools/hrrr/probe_hrrr_kerchunk.py`, which uses the canonical overnight task planner, records existing `.idx` selected-record byte-range footprint, and times Kerchunk reference generation for the corresponding remote GRIB files. Kerchunk is now a development/prototype dependency, but it is not a production extraction backend. On 2026-04-27, a one-task `2023-02-04` full-file scan took 90.51s for 170 message references, while the same task's current `.idx` path selected 6 records in 6 merged byte ranges with `.idx` fetch/parse around 0.11s before range download. This is not promising unless durable reference reuse pays back the scan cost.
 
 ## Definition Of Done
 
