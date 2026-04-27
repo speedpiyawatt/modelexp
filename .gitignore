@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local/editor noise
+.DS_Store
+__MACOSX/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Generated runtime data and model outputs
+data/runtime/
+**/data/runtime/
+
+# Local browser/test artifacts
+wunderground/.playwright-cli/

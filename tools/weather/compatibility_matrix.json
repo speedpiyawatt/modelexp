@@ -1,0 +1,226 @@
+[
+  {
+    "area": "raw_runtime_contract",
+    "classification": "synced",
+    "hrrr_status": "shared",
+    "item": "shared_location_context",
+    "nbm_status": "shared",
+    "notes": "Both pipelines should resolve spatial helpers from tools/weather/location_context.py."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "runtime_identity_columns",
+    "nbm_status": "present",
+    "notes": "Both live raw pipelines must carry the shared runtime row-identity columns, including source_version."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "allowed_difference",
+    "hrrr_status": "HRRR/wrfsfcf",
+    "item": "source_model_product_values",
+    "nbm_status": "NBM/grib2-core",
+    "notes": "Model/product identifiers are expected to differ by source."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "source_version_field",
+    "nbm_status": "present",
+    "notes": "Both live raw pipelines now expose source_version on the wide rows."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "allowed_difference",
+    "hrrr_status": "missing",
+    "item": "source_specific_mode_metadata",
+    "nbm_status": "present",
+    "notes": "NBM exposes premarket/intraday mode as optional metadata; HRRR intentionally keeps it out of raw runtime identity."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "runtime_spatial_metadata",
+    "nbm_status": "present",
+    "notes": "Spatial join metadata should be present on both wide outputs."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "raw_spatial_suffix_contract",
+    "nbm_status": "present",
+    "notes": "Raw outputs keep source-specific base names but share the unsuffixed nearest plus crop, nb3, and nb7 spatial suffix pattern."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "missing_optional_summary_columns",
+    "nbm_status": "present",
+    "notes": "Both raw pipelines now expose row-level missing-optional summaries."
+  },
+  {
+    "area": "raw_runtime_contract",
+    "classification": "allowed_difference",
+    "hrrr_status": "tmp_2m_k/explicit-level",
+    "item": "raw_namespace_is_source_aware",
+    "nbm_status": "tmp/tmp-like",
+    "notes": "Raw NBM and raw HRRR remain source-aware; the model-facing standard now lives in the canonical training schema instead of in the raw wide tables."
+  },
+  {
+    "area": "canonical_training_schema",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "schema_module_present",
+    "nbm_status": "present",
+    "notes": "Canonical training wide columns are defined centrally in tools/weather/canonical_feature_schema.py."
+  },
+  {
+    "area": "canonical_training_schema",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "wide_column_compatibility",
+    "nbm_status": "present",
+    "notes": "The NBM and HRRR adapters now emit one stable canonical wide column layout with nullable passthrough metadata such as mode."
+  },
+  {
+    "area": "canonical_training_schema",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "provenance_column_compatibility",
+    "nbm_status": "present",
+    "notes": "The provenance adapters now emit one stable canonical lineage schema for downstream debugging and feature-traceability."
+  },
+  {
+    "area": "canonical_training_schema",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "shared_feature_mapping_examples",
+    "nbm_status": "present",
+    "notes": "Shared physical features such as temperature and 10 m wind now normalize into the same explicit-unit namespace."
+  },
+  {
+    "area": "provenance_minimum_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "core_provenance_identity",
+    "nbm_status": "present",
+    "notes": "Both provenance outputs should expose feature identity, timestamps, and units."
+  },
+  {
+    "area": "provenance_minimum_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "grib_source_metadata",
+    "nbm_status": "present",
+    "notes": "Both provenance tables expose GRIB short-name/level/step metadata, though field names differ slightly."
+  },
+  {
+    "area": "provenance_minimum_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "direct_derived_missing_semantics",
+    "nbm_status": "present",
+    "notes": "Both raw provenance outputs now expose direct, derived, and missing-optional semantics."
+  },
+  {
+    "area": "provenance_minimum_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "derivation_lineage_fields",
+    "nbm_status": "present",
+    "notes": "Both pipelines now expose derivation lineage and fallback descriptions through the raw provenance layer."
+  },
+  {
+    "area": "provenance_minimum_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "inventory_line_reference",
+    "nbm_status": "present",
+    "notes": "Both pipelines retain a source inventory line reference for direct fields."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "manifest_parquet_artifact",
+    "nbm_status": "present",
+    "notes": "Both live pipelines write a Parquet manifest artifact; HRRR also retains an auxiliary JSON sidecar for month-level recovery state."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "tracks_failure_state",
+    "nbm_status": "present",
+    "notes": "Both manifests should expose failure/error state."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "tracks_missing_fields",
+    "nbm_status": "present",
+    "notes": "Both manifests should expose missing/partial extraction information."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "tracks_output_paths",
+    "nbm_status": "present",
+    "notes": "Both manifests should expose output artifact paths."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "tracks_cleanup_state",
+    "nbm_status": "present",
+    "notes": "Both manifests should record or imply cleanup/retention policy."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "allowed_difference",
+    "hrrr_status": "present",
+    "item": "expected_completed_state",
+    "nbm_status": "present",
+    "notes": "HRRR manifest JSON tracks month-level expected/completed task state; NBM manifest rows remain per-unit operational records."
+  },
+  {
+    "area": "operational_manifest_contract",
+    "classification": "allowed_difference",
+    "hrrr_status": "present",
+    "item": "manifest_json_sidecar",
+    "nbm_status": "absent",
+    "notes": "HRRR keeps an auxiliary JSON manifest sidecar for resumable month builds; NBM does not need the same recovery artifact."
+  },
+  {
+    "area": "artifact_policy",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "parquet_first_persistent_outputs",
+    "nbm_status": "present",
+    "notes": "Both production paths persist tabular outputs and treat GRIB as processing artifacts by default."
+  },
+  {
+    "area": "artifact_policy",
+    "classification": "synced",
+    "hrrr_status": "present",
+    "item": "keep_flags_debug_only",
+    "nbm_status": "present",
+    "notes": "Both pipelines expose keep flags for raw/reduced artifacts while defaulting to cleanup."
+  },
+  {
+    "area": "artifact_policy",
+    "classification": "allowed_difference",
+    "hrrr_status": "absent",
+    "item": "nbm_long_output",
+    "nbm_status": "present",
+    "notes": "NBM supports optional long-format output; HRRR intentionally keeps long output out of scope."
+  }
+]

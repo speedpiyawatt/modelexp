@@ -1,0 +1,470 @@
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from zoneinfo import ZoneInfo
+
+from .polymarket_event import weather_event_slug_for_date
+
+
+NY_TZ = ZoneInfo("America/New_York")
+DEFAULT_RUNTIME_ROOT = pathlib.Path("experiments/no_hrrr_model/data/runtime/online_inference")
+CANDIDATE_LAMP_CYCLES = ("0230", "0330", "0430")
+AUTO_POLYMARKET_EVENT_SLUG = "__auto__"
+LAMP_NOMADS_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/lmp/prod"
+LAMP_ARCHIVE_BASE = "https://lamp.mdl.nws.noaa.gov/lamp/Data/archives"
+IEM_AFOS_BASE = "https://mesonet.agron.iastate.edu/p.php"
+AFOS_PRE_RE = re.compile(r"<pre[^>]*class=[\"']afos-pre[\"'][^>]*>(?P<text>.*?)</pre>", re.IGNORECASE | re.DOTALL)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch online no-HRRR source inputs and run one target-date inference.")
+    parser.add_argument("--target-date-local", required=True, help="KLGA local target date in YYYY-MM-DD.")
+    parser.add_argument("--station-id", default="KLGA")
+    parser.add_argument("--runtime-root", type=pathlib.Path, default=DEFAULT_RUNTIME_ROOT)
+    parser.add_argument("--prediction-output-dir", type=pathlib.Path, default=pathlib.Path("experiments/no_hrrr_model/data/runtime/predictions"))
+    parser.add_argument("--lamp-source", choices=("auto", "live", "archive", "iem"), default="auto")
+    parser.add_argument("--event-bin", action="append", default=[])
+    parser.add_argument("--event-bins-path", type=pathlib.Path)
+    parser.add_argument(
+        "--polymarket-event-slug",
+        nargs="?",
+        const=AUTO_POLYMARKET_EVENT_SLUG,
+        help="Fetch event metadata from Polymarket Gamma API and use its temperature bins. Omit the value to derive the standard weather-event slug from --target-date-local.",
+    )
+    parser.add_argument("--max-so-far-f", type=float)
+    parser.add_argument("--skip-wunderground", action="store_true")
+    parser.add_argument("--skip-lamp", action="store_true")
+    parser.add_argument("--skip-nbm", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--continue-on-lamp-fetch-error", action="store_true")
+    return parser.parse_args()
+
+
+def parse_local_date(value: str) -> dt.date:
+    return dt.date.fromisoformat(value)
+
+
+def target_date_token(target_date: dt.date) -> str:
+    return f"target_date_local={target_date.isoformat()}"
+
+
+def cutoff_utc_date(target_date: dt.date) -> dt.date:
+    cutoff_local = dt.datetime.combine(target_date, dt.time(0, 5), tzinfo=NY_TZ)
+    return cutoff_local.astimezone(dt.timezone.utc).date()
+
+
+def lamp_live_url(utc_date: dt.date, cycle: str) -> str:
+    daily_dir = utc_date.strftime("%Y%m%d")
+    return f"{LAMP_NOMADS_BASE}/lmp.{daily_dir}/lmp.t{cycle}z.lavtxt.ascii"
+
+
+def lamp_archive_monthly_url(utc_date: dt.date, cycle: str) -> str:
+    year_month = utc_date.strftime("%Y%m")
+    return f"{LAMP_ARCHIVE_BASE}/lmp_lavtxt.{year_month}.{cycle}z.gz"
+
+
+def lamp_archive_yearly_url(utc_date: dt.date) -> str:
+    return f"{LAMP_ARCHIVE_BASE}/lmp_lavtxt.{utc_date.year}.tar"
+
+
+def iem_lav_pil(station_id: str) -> str:
+    station = station_id.upper()
+    if len(station) == 4 and station.startswith("K"):
+        station = station[1:]
+    return f"LAV{station}"
+
+
+def iem_lamp_pid(*, station_id: str, utc_date: dt.date, cycle: str) -> str:
+    issue_hour = cycle[:2]
+    return f"{utc_date.strftime('%Y%m%d')}{issue_hour}00-KWNO-FOUS11-{iem_lav_pil(station_id)}"
+
+
+def iem_lamp_url(*, station_id: str, utc_date: dt.date, cycle: str) -> str:
+    return f"{IEM_AFOS_BASE}?pid={iem_lamp_pid(station_id=station_id, utc_date=utc_date, cycle=cycle)}"
+
+
+def remote_url_exists(url: str) -> bool:
+    request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "no-hrrr-online-inference/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return 200 <= response.status < 400
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise
+    except urllib.error.URLError:
+        return False
+
+
+def iem_lamp_product_exists(url: str) -> bool:
+    request = urllib.request.Request(url, headers={"User-Agent": "no-hrrr-online-inference/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            page = response.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError:
+        return False
+    match = AFOS_PRE_RE.search(page)
+    return bool(match and "GFS LAMP GUIDANCE" in html.unescape(match.group("text")))
+
+
+def lamp_live_available(utc_date: dt.date, *, url_exists=remote_url_exists) -> bool:
+    return any(url_exists(lamp_live_url(utc_date, cycle)) for cycle in CANDIDATE_LAMP_CYCLES)
+
+
+def lamp_archive_available(utc_date: dt.date, *, url_exists=remote_url_exists) -> bool:
+    if any(url_exists(lamp_archive_monthly_url(utc_date, cycle)) for cycle in CANDIDATE_LAMP_CYCLES):
+        return True
+    return url_exists(lamp_archive_yearly_url(utc_date))
+
+
+def iem_lamp_available(utc_date: dt.date, station_id: str, *, product_exists=iem_lamp_product_exists) -> bool:
+    return any(product_exists(iem_lamp_url(station_id=station_id, utc_date=utc_date, cycle=cycle)) for cycle in CANDIDATE_LAMP_CYCLES)
+
+
+def resolve_lamp_source(
+    lamp_source: str,
+    target_date: dt.date,
+    *,
+    station_id: str = "KLGA",
+    url_exists=remote_url_exists,
+    iem_product_exists=iem_lamp_product_exists,
+) -> str:
+    if lamp_source != "auto":
+        return lamp_source
+    utc_date = cutoff_utc_date(target_date)
+    if lamp_live_available(utc_date, url_exists=url_exists):
+        return "live"
+    if lamp_archive_available(utc_date, url_exists=url_exists):
+        return "archive"
+    if iem_lamp_available(utc_date, station_id, product_exists=iem_product_exists):
+        return "iem"
+    raise SystemExit(
+        "LAMP unavailable for "
+        f"target_date_local={target_date.isoformat()} cutoff_utc_date={utc_date.isoformat()}: "
+        "not found on live NOMADS, not found in the public LAMP archive, and not found in the IEM AFOS archive. "
+        "This can happen for recent past dates after NOMADS live retention expires but before the archive is published. "
+        "Try a current live date, a date with archived LAMP, or provide local LAMP artifacts and rerun with --skip-lamp."
+    )
+
+
+def run(command: list[str], *, continue_on_error: bool = False) -> None:
+    print("+ " + " ".join(command), flush=True)
+    result = subprocess.run(command)
+    if result.returncode != 0 and not continue_on_error:
+        raise SystemExit(result.returncode)
+
+
+def write_run_manifest(
+    *,
+    runtime_root: pathlib.Path,
+    target_date: dt.date,
+    station_id: str,
+    status: str,
+    message: str | None,
+    paths: dict[str, str],
+) -> pathlib.Path:
+    root = runtime_root / "status" / target_date_token(target_date)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / "online_inference.manifest.json"
+    payload = {
+        "built_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "target_date_local": target_date.isoformat(),
+        "station_id": station_id,
+        "status": status,
+        "message": message,
+        "paths": paths,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(path, flush=True)
+    return path
+
+
+def fetch_iem_lamp_cycle(*, station_id: str, utc_date: dt.date, cycle: str, output_dir: pathlib.Path, overwrite: bool) -> pathlib.Path:
+    destination = output_dir / "source=iem" / f"date_utc={utc_date.isoformat()}" / f"cycle={cycle}" / f"iem.{iem_lav_pil(station_id)}.{utc_date.strftime('%Y%m%d')}.{cycle}z.ascii"
+    if destination.exists() and not overwrite:
+        print(f"[skip] {destination}", flush=True)
+        return destination
+    url = iem_lamp_url(station_id=station_id, utc_date=utc_date, cycle=cycle)
+    request = urllib.request.Request(url, headers={"User-Agent": "no-hrrr-online-inference/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        page = response.read().decode("utf-8", errors="replace")
+    match = AFOS_PRE_RE.search(page)
+    if not match:
+        raise SystemExit(f"IEM LAMP product not found: {url}")
+    text = html.unescape(match.group("text")).strip() + "\n"
+    if "GFS LAMP GUIDANCE" not in text:
+        raise SystemExit(f"IEM LAMP response did not contain LAMP guidance: {url}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text)
+    print(f"[ok] {destination}", flush=True)
+    return destination
+
+
+def fetch_wunderground(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
+    date_token = target_date_token(target_date)
+    history_dir = args.runtime_root / "wunderground_history" / date_token
+    tables_dir = args.runtime_root / "wunderground_tables" / date_token
+    start_date = target_date - dt.timedelta(days=1)
+    command = [
+        sys.executable,
+        "wunderground/fetch_daily_history.py",
+        "--start-date",
+        start_date.isoformat(),
+        "--end-date",
+        target_date.isoformat(),
+        "--output-dir",
+        str(history_dir),
+    ]
+    if args.overwrite:
+        command.append("--force")
+    run(command)
+    run(
+        [
+            sys.executable,
+            "-m",
+            "experiments.no_hrrr_model.no_hrrr_model.build_wu_tables",
+            "--history-dir",
+            str(history_dir),
+            "--output-dir",
+            str(tables_dir),
+        ]
+    )
+    return tables_dir
+
+
+def fetch_lamp(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
+    date_token = target_date_token(target_date)
+    raw_dir = args.runtime_root / "lamp_raw" / date_token
+    features_dir = args.runtime_root / "lamp_features" / date_token
+    overnight_dir = args.runtime_root / "lamp_overnight"
+    utc_date = cutoff_utc_date(target_date)
+    lamp_source = resolve_lamp_source(args.lamp_source, target_date, station_id=args.station_id)
+    print(f"[info] lamp_source={lamp_source} target_date_local={target_date.isoformat()} cutoff_utc_date={utc_date.isoformat()}", flush=True)
+    if lamp_source == "live":
+        for cycle in CANDIDATE_LAMP_CYCLES:
+            command = [
+                sys.executable,
+                "tools/lamp/fetch_lamp.py",
+                "live",
+                "--date-utc",
+                utc_date.isoformat(),
+                "--cycle",
+                cycle,
+                "--output-dir",
+                str(raw_dir),
+            ]
+            if args.overwrite:
+                command.append("--overwrite")
+            run(command, continue_on_error=args.continue_on_lamp_fetch_error)
+    elif lamp_source == "archive":
+        command = [
+            sys.executable,
+            "tools/lamp/fetch_lamp.py",
+            "archive",
+            "--start-utc-date",
+            utc_date.isoformat(),
+            "--end-utc-date",
+            utc_date.isoformat(),
+            "--output-dir",
+            str(raw_dir),
+        ]
+        for cycle in CANDIDATE_LAMP_CYCLES:
+            command.extend(["--cycle", cycle])
+        if args.overwrite:
+            command.append("--overwrite")
+        run(command)
+    elif lamp_source == "iem":
+        for cycle in CANDIDATE_LAMP_CYCLES:
+            fetch_iem_lamp_cycle(station_id=args.station_id, utc_date=utc_date, cycle=cycle, output_dir=raw_dir, overwrite=args.overwrite)
+    else:
+        raise ValueError(f"Unsupported LAMP source: {lamp_source}")
+
+    run(
+        [
+            sys.executable,
+            "tools/lamp/build_lamp_klga_features.py",
+            str(raw_dir),
+            "--output-dir",
+            str(features_dir),
+        ]
+    )
+    run(
+        [
+            sys.executable,
+            "-m",
+            "experiments.no_hrrr_model.no_hrrr_model.build_lamp_overnight",
+            "--features-root",
+            str(features_dir / "station_id=KLGA"),
+            "--output-dir",
+            str(overnight_dir),
+            "--start-local-date",
+            target_date.isoformat(),
+            "--end-local-date",
+            target_date.isoformat(),
+        ]
+    )
+    return overnight_dir
+
+
+def fetch_nbm(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
+    run_root = args.runtime_root / "nbm"
+    command = [
+        sys.executable,
+        "tools/nbm/run_nbm_monthly_backfill.py",
+        "--start-local-date",
+        target_date.isoformat(),
+        "--end-local-date",
+        target_date.isoformat(),
+        "--run-root",
+        str(run_root),
+        "--selection-mode",
+        "overnight_0005",
+        "--day-workers",
+        "1",
+        "--download-workers",
+        "4",
+        "--reduce-workers",
+        "1",
+        "--extract-workers",
+        "1",
+        "--reduce-queue-size",
+        "2",
+        "--extract-queue-size",
+        "2",
+        "--wgrib2-threads",
+        "1",
+        "--batch-reduce-mode",
+        "cycle",
+        "--progress-mode",
+        "log",
+    ]
+    if args.overwrite:
+        command.append("--overwrite")
+    run(command)
+    return run_root / "nbm_overnight"
+
+
+def main() -> int:
+    args = parse_args()
+    target_date = parse_local_date(args.target_date_local)
+    args.runtime_root.mkdir(parents=True, exist_ok=True)
+
+    paths: dict[str, str] = {}
+    date_token = target_date_token(target_date)
+    wu_tables_dir = args.runtime_root / "wunderground_tables" / date_token
+    lamp_overnight_dir = args.runtime_root / "lamp_overnight"
+    nbm_overnight_dir = args.runtime_root / "nbm" / "nbm_overnight"
+    paths.update(
+        {
+            "wunderground_history_dir": str(args.runtime_root / "wunderground_history" / date_token),
+            "wunderground_tables_dir": str(wu_tables_dir),
+            "wunderground_labels_path": str(wu_tables_dir / "labels_daily.parquet"),
+            "wunderground_obs_path": str(wu_tables_dir / "wu_obs_intraday.parquet"),
+            "lamp_raw_dir": str(args.runtime_root / "lamp_raw" / date_token),
+            "lamp_features_dir": str(args.runtime_root / "lamp_features" / date_token),
+            "lamp_overnight_dir": str(lamp_overnight_dir),
+            "nbm_overnight_dir": str(nbm_overnight_dir),
+        }
+    )
+
+    try:
+        if not args.skip_wunderground:
+            wu_tables_dir = fetch_wunderground(args, target_date)
+            paths["wunderground_tables_dir"] = str(wu_tables_dir)
+            paths["wunderground_labels_path"] = str(wu_tables_dir / "labels_daily.parquet")
+            paths["wunderground_obs_path"] = str(wu_tables_dir / "wu_obs_intraday.parquet")
+        if not args.skip_lamp:
+            lamp_overnight_dir = fetch_lamp(args, target_date)
+            paths["lamp_overnight_dir"] = str(lamp_overnight_dir)
+        if not args.skip_nbm:
+            nbm_overnight_dir = fetch_nbm(args, target_date)
+            paths["nbm_overnight_dir"] = str(nbm_overnight_dir)
+
+        event_bins_path = args.event_bins_path
+        if args.polymarket_event_slug:
+            polymarket_event_slug = args.polymarket_event_slug
+            if polymarket_event_slug == AUTO_POLYMARKET_EVENT_SLUG:
+                polymarket_event_slug = weather_event_slug_for_date(target_date)
+            polymarket_dir = args.runtime_root / "polymarket"
+            run(
+                [
+                    sys.executable,
+                    "-m",
+                    "experiments.no_hrrr_model.no_hrrr_model.polymarket_event",
+                    "--event-slug",
+                    polymarket_event_slug,
+                    "--output-dir",
+                    str(polymarket_dir),
+                ]
+            )
+            event_bins_path = polymarket_dir / f"event_slug={polymarket_event_slug}" / "event_bins.json"
+            paths["event_bins_path"] = str(event_bins_path)
+
+        features_dir = args.runtime_root / "prediction_features"
+        run(
+            [
+                sys.executable,
+                "-m",
+                "experiments.no_hrrr_model.no_hrrr_model.build_inference_features",
+                "--target-date-local",
+                target_date.isoformat(),
+                "--station-id",
+                args.station_id,
+                "--label-history-path",
+                str(wu_tables_dir / "labels_daily.parquet"),
+                "--obs-path",
+                str(wu_tables_dir / "wu_obs_intraday.parquet"),
+                "--nbm-root",
+                str(nbm_overnight_dir),
+                "--lamp-root",
+                str(lamp_overnight_dir),
+                "--output-dir",
+                str(features_dir),
+            ]
+        )
+
+        normalized_path = features_dir / f"target_date_local={target_date.isoformat()}" / "no_hrrr.inference_features_normalized.parquet"
+        paths["prediction_features_path"] = str(normalized_path)
+        predict_command = [
+            sys.executable,
+            "-m",
+            "experiments.no_hrrr_model.no_hrrr_model.predict",
+            "--features-path",
+            str(normalized_path),
+            "--output-dir",
+            str(args.prediction_output_dir),
+            "--target-date-local",
+            target_date.isoformat(),
+            "--station-id",
+            args.station_id,
+        ]
+        for label in args.event_bin:
+            predict_command.extend(["--event-bin", label])
+        if event_bins_path is not None:
+            predict_command.extend(["--event-bins-path", str(event_bins_path)])
+        if args.max_so_far_f is not None:
+            predict_command.extend(["--max-so-far-f", str(args.max_so_far_f)])
+        run(predict_command)
+        prediction_path = args.prediction_output_dir / f"prediction_{args.station_id}_{target_date.isoformat()}.json"
+        paths["prediction_path"] = str(prediction_path)
+        write_run_manifest(runtime_root=args.runtime_root, target_date=target_date, station_id=args.station_id, status="ok", message=None, paths=paths)
+        return 0
+    except SystemExit as exc:
+        message = str(exc)
+        if message:
+            print(message, file=sys.stderr, flush=True)
+        write_run_manifest(runtime_root=args.runtime_root, target_date=target_date, station_id=args.station_id, status="failed", message=message or None, paths=paths)
+        return int(exc.code) if isinstance(exc.code, int) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

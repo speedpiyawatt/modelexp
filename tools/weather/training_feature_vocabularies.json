@@ -1,0 +1,36 @@
+{
+  "version": "overnight-v1",
+  "cloud_cover": {
+    "__MISSING__": 0,
+    "__UNK__": 1,
+    "CLR": 2,
+    "SKC": 3,
+    "FEW": 4,
+    "SCT": 5,
+    "BKN": 6,
+    "OVC": 7,
+    "VV": 8
+  },
+  "weather_family": {
+    "__MISSING__": 0,
+    "__UNK__": 1,
+    "NONE": 2,
+    "HAZE": 3,
+    "MIST": 4,
+    "FOG": 5,
+    "RAIN": 6,
+    "SNOW": 7,
+    "FREEZING": 8,
+    "THUNDER": 9
+  },
+  "precip_type": {
+    "__MISSING__": 0,
+    "__UNK__": 1,
+    "NONE": 2,
+    "R": 3,
+    "S": 4,
+    "ZR": 5,
+    "IP": 6,
+    "T": 7
+  }
+}

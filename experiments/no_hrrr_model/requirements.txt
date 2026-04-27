@@ -1,0 +1,6 @@
+lightgbm
+numpy
+pandas
+pyarrow
+pytest
+textual
