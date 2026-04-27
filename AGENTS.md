@@ -207,6 +207,10 @@ Optimization guidance:
 - for LAMP overnight backfills, treat `0230`, `0330`, and `0430` UTC as the full-guidance candidate cycles. Do not backfill temperature features from `0345`, `0400`, `0445`, or `0500` UTC archive files; observed 2023-2025 archive files for those cycles were 3-hour `CIG/VIS/OBV`-only products with no `TMP`.
 - known public LAMP archive gaps after the `HH30` rebuild: `2023-04-09`, `2023-04-12`, `2023-06-13`, `2024-11-04`, `2024-11-05`, and `2024-11-06` are absent from the `0230/0330/0430` monthly archive caches. Treat LAMP as unavailable for those target dates rather than as a local extraction failure.
 - treat HRRR merged byte-range downloads and deferred month-manifest flushing as general throughput optimizations that apply beyond short-window runs
+- for HRRR production overnight backfills, prefer the completed throughput options unless debugging requires the legacy path: `--batch-reduce-mode cycle --summary-profile overnight --crop-method auto --crop-grib-type same --range-merge-gap-bytes 65536 --wgrib2-threads 1`
+- use HRRR `--skip-provenance` when the run only needs overnight summary features and provenance parquet output is not needed; manifests should then record `provenance_written=false`
+- keep HRRR `--extract-method cfgrib` as the conservative reference backend; `--extract-method eccodes` is the faster opt-in direct extractor. A 2026-04-27 cached extraction benchmark on `2023-02-04T05Z` measured ecCodes at 23.72s vs cfgrib at 26.32s with lower max RSS and row parity within small floating-point tolerance after APCP duplicate-message handling was fixed.
+- the HRRR monthly helper forwards the optimized raw-builder flags, including `--batch-reduce-mode`, `--range-merge-gap-bytes`, `--crop-method`, `--crop-grib-type`, `--wgrib2-threads`, `--extract-method`, `--summary-profile`, and `--skip-provenance`
 - do not assume an optimization is short-window-only unless it changes source selection scope rather than execution throughput
 
 ## Weather Tool Layout

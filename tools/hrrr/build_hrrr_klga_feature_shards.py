@@ -2202,6 +2202,8 @@ def build_task_result_with_eccodes(
                         continue
                     values, lat_grid, lon_grid = eccodes_grid_arrays(gid)
                     used_message_count += 1
+                    if prefix == "apcp_surface_kg_m2" and prefix in support_arrays:
+                        continue
                     if latitude is None or longitude is None:
                         latitude = lat_grid
                         longitude = lon_grid

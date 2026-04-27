@@ -86,7 +86,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extract-workers", type=int)
     parser.add_argument("--reduce-queue-size", type=int)
     parser.add_argument("--extract-queue-size", type=int)
+    parser.add_argument("--range-merge-gap-bytes", type=int)
     parser.add_argument("--batch-reduce-mode", choices=("off", "cycle"), default="off")
+    parser.add_argument("--crop-method", choices=("auto", "small_grib", "ijsmall_grib"))
+    parser.add_argument("--crop-grib-type")
+    parser.add_argument("--wgrib2-threads", type=int)
+    parser.add_argument("--extract-method", choices=("cfgrib", "eccodes"))
+    parser.add_argument("--summary-profile", choices=("full", "overnight"))
+    parser.add_argument("--skip-provenance", action="store_true")
     parser.add_argument("--progress-mode", choices=("auto", "dashboard", "log"), default="auto")
     parser.add_argument(
         "--disable-dashboard-hotkeys",
@@ -293,6 +300,20 @@ def build_hrrr_command(
         command.extend(["--reduce-queue-size", str(args.reduce_queue_size)])
     if args.extract_queue_size is not None:
         command.extend(["--extract-queue-size", str(args.extract_queue_size)])
+    if args.range_merge_gap_bytes is not None:
+        command.extend(["--range-merge-gap-bytes", str(args.range_merge_gap_bytes)])
+    if args.crop_method is not None:
+        command.extend(["--crop-method", str(args.crop_method)])
+    if args.crop_grib_type is not None:
+        command.extend(["--crop-grib-type", str(args.crop_grib_type)])
+    if args.wgrib2_threads is not None:
+        command.extend(["--wgrib2-threads", str(args.wgrib2_threads)])
+    if args.extract_method is not None:
+        command.extend(["--extract-method", str(args.extract_method)])
+    if args.summary_profile is not None:
+        command.extend(["--summary-profile", str(args.summary_profile)])
+    if args.skip_provenance:
+        command.append("--skip-provenance")
     if args.max_task_attempts is not None:
         command.extend(["--max-task-attempts", str(args.max_task_attempts)])
     if args.retry_backoff_seconds is not None:

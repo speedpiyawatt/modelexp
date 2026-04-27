@@ -9,11 +9,11 @@ The pipeline is not a generic archive mirror. It is a settlement-centered foreca
 - target use: modeling the finalized local-day high temperature at LaGuardia
 - persistent outputs from the raw builder: monthly wide Parquet, monthly provenance Parquet, monthly manifest Parquet, and an auxiliary JSON month manifest
 
-The main production workflow is still:
+The main production workflow is:
 
-1. download full hourly HRRR surface GRIB2 files
-2. subset and crop them locally with `wgrib2`
-3. extract KLGA-centered features with `xarray` + `cfgrib`
+1. fetch selected records from hourly HRRR surface GRIB2 files
+2. crop them locally with `wgrib2`
+3. extract KLGA-centered features with either the reference `cfgrib` path or the opt-in direct `ecCodes` path
 4. write monthly Parquet outputs
 5. delete raw and reduced GRIB files by default
 
@@ -31,14 +31,49 @@ python tools/hrrr/run_hrrr_monthly_backfill.py \
   --start-local-date 2023-01-01 \
   --end-local-date 2026-03-31 \
   --run-root data/runtime/backfill_overnight_2023_2026 \
+  --selection-mode overnight_0005 \
+  --batch-reduce-mode cycle \
+  --summary-profile overnight \
+  --crop-method auto \
+  --crop-grib-type same \
+  --range-merge-gap-bytes 65536 \
   --day-workers 4 \
   --max-workers 8 \
   --download-workers 8 \
   --reduce-workers 2 \
   --extract-workers 3 \
+  --wgrib2-threads 1 \
   --progress-mode dashboard \
   --pause-control-file data/runtime/backfill_overnight_2023_2026/hrrr.pause
 ```
+
+Faster opt-in extraction profile:
+
+```bash
+source .venv/bin/activate
+python tools/hrrr/run_hrrr_monthly_backfill.py \
+  --start-local-date 2023-01-01 \
+  --end-local-date 2026-03-31 \
+  --run-root data/runtime/backfill_overnight_2023_2026_eccodes \
+  --selection-mode overnight_0005 \
+  --batch-reduce-mode cycle \
+  --summary-profile overnight \
+  --extract-method eccodes \
+  --skip-provenance \
+  --crop-method auto \
+  --crop-grib-type same \
+  --range-merge-gap-bytes 65536 \
+  --day-workers 4 \
+  --max-workers 8 \
+  --download-workers 8 \
+  --reduce-workers 2 \
+  --extract-workers 3 \
+  --wgrib2-threads 1 \
+  --progress-mode dashboard \
+  --pause-control-file data/runtime/backfill_overnight_2023_2026_eccodes/hrrr.pause
+```
+
+Use the cfgrib command when you need the most conservative reference path or provenance output. Use the ecCodes command for production-style overnight summary backfills after validating parity on the current environment; the 2026-04-27 extraction-only benchmark measured a 1.11x wall-time speedup and lower max RSS for ecCodes on a cached `2023-02-04T05Z` reduced GRIB. `--selection-mode overnight_0005` changes retained-cycle scope for overnight validation/replay; pass `--selection-mode all` when you need the full canonical retained-cycle set.
 
 Rerun/debug throughput profile:
 
@@ -76,7 +111,7 @@ python tools/hrrr/summarize_hrrr_diagnostics.py \
   --path data/runtime/backfill_overnight_2023_2026
 ```
 
-This summarizes medians and p95 values for download, inventory, reduce, and cfgrib-open timings, plus reduced-to-raw size ratios when those diagnostics are available in manifest parquet outputs.
+This summarizes medians and p95 values for download, inventory, reduce, open/extract, and row-build timings, plus reduced-to-raw size ratios when those diagnostics are available in manifest parquet outputs.
 
 Server-owned selected-raw relay queue:
 
@@ -526,8 +561,13 @@ Optimization scope:
 
 - `--selection-mode overnight_0005` is an overnight-validation and short-window replay optimization because it reduces the retained cycle set
 - `--range-merge-gap-bytes` is a general fetch-layer optimization and lets HRRR trade a small amount of extra download size for fewer HTTP Range requests
+- `--crop-method auto` prefers cached `-ijsmall_grib` cropping on stable grids and falls back to `-small_grib` when validation fails or a grid is unsupported
+- `--crop-grib-type same` preserves the current GRIB encoding while still making the crop grib-type explicit in the run contract
 - conditional `HEAD` requests avoid one remote metadata call when the selected records do not need the terminal file size
 - deferred month-manifest flushing is a general month-builder optimization and applies beyond short-window runs
+- `--summary-profile overnight` is the production overnight profile: anchor-cycle tasks keep the full feature set, while non-anchor revision-cycle tasks fetch/extract only the fields needed by revision features
+- `--skip-provenance` skips provenance row construction and provenance parquet writes for production runs that only need summary features; manifests record `provenance_written=false`
+- `--extract-method cfgrib` is the reference backend; `--extract-method eccodes` is the opt-in direct message iterator. On the 2026-04-27 cached extraction benchmark, ecCodes was 1.11x faster and used less max RSS after APCP parity handling was fixed.
 
 Execution controls:
 
@@ -559,7 +599,7 @@ The monthly helper has its own day-level orchestration controls:
 - the monthly runner owns pause/drain; `p`, `--pause-control-file`, SIGINT, or SIGTERM stop new day admission and drain already admitted days
 - the monthly runner does not forward its parent pause-control file into child builders during normal monthly operation
 - `hrrr.performance.json` is written beside each per-day manifest under `hrrr_summary_state/target_date_local=YYYY-MM-DD/`
-- The monthly helper forwards `--batch-reduce-mode` to the raw HRRR builder.
+- The monthly helper forwards production optimization flags to the raw HRRR builder, including `--batch-reduce-mode`, `--range-merge-gap-bytes`, `--crop-method`, `--crop-grib-type`, `--wgrib2-threads`, `--extract-method`, `--summary-profile`, and `--skip-provenance`.
 
 Outputs:
 
@@ -638,6 +678,7 @@ Key timing fields currently include:
 - `timing_wgrib_inventory_seconds`
 - `timing_reduce_seconds`
 - `timing_cfgrib_open_seconds`
+- `timing_direct_extract_seconds` when `--extract-method eccodes` is used
 - `timing_row_build_seconds`
 - `timing_cleanup_seconds`
 
@@ -655,12 +696,19 @@ The production entrypoint is:
 python3 build_hrrr_klga_feature_shards.py
 ```
 
-Useful performance tuning flag:
+Useful production performance profile for the raw builder:
 
 ```bash
 python3 build_hrrr_klga_feature_shards.py \
-  --range-merge-gap-bytes 65536
+  --batch-reduce-mode cycle \
+  --summary-profile overnight \
+  --crop-method auto \
+  --crop-grib-type same \
+  --range-merge-gap-bytes 65536 \
+  --wgrib2-threads 1
 ```
+
+Add `--extract-method eccodes --skip-provenance` when running a production summary backfill that does not need provenance rows and you have validated ecCodes parity on the target environment.
 
 Useful execution-control pattern:
 
@@ -682,7 +730,7 @@ For each retained file, the pipeline does:
 3. validate/reuse the cached subset only when its selection manifest matches the current inventory contract
 4. inspect the subset inventory with `wgrib2`
 5. crop to the NYC box
-6. open the reduced GRIB2 with grouped `cfgrib` reads backed by reusable per-file temporary indexes
+6. open/extract the reduced GRIB2 with grouped `cfgrib` reads backed by reusable per-file temporary indexes, or with the opt-in direct `ecCodes` message iterator
 7. compute canonical nearest, crop, `nb3`, and `nb7` metrics
 8. write monthly wide and provenance outputs
 9. build one overnight summary row per local target day

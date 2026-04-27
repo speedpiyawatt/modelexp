@@ -74,10 +74,11 @@ Make the HRRR overnight backfill materially faster without changing the settleme
   - Keep current cfgrib path as the reference implementation until parity is proven.
   - Status: implemented as opt-in `--extract-method eccodes`. It iterates GRIB messages directly with ecCodes, builds the same wide-row metrics, supports batch-cycle extraction, and keeps `--extract-method cfgrib` as the default reference path.
 
-- [ ] Benchmark direct extraction against current cfgrib extraction.
+- [x] Benchmark direct extraction against current cfgrib extraction.
   - Use the same dates, cycles, fields, crop bounds, and worker settings.
   - Compare wall time, CPU time, memory pressure, and output parity.
   - Record results in HRRR diagnostics or a short benchmark note.
+  - Status: extraction-only benchmark on cached reduced GRIB `2023-02-04T05Z`, forecast hours 0-18, found cfgrib total 26.32s vs ecCodes total 23.72s, a 1.11x speedup. Separate-process resource runs measured cfgrib at 25.73s wall, 25.68s CPU, 190 MB max RSS and ecCodes at 23.75s wall, 23.61s CPU, 149 MB max RSS. Row parity matched within small floating-point tolerance after fixing ecCodes APCP duplicate-message handling; max numeric difference was 0.0001202 across 17,328 compared values.
 
 ## Phase 4: Cloud-Native Prototype
 

@@ -536,6 +536,7 @@ This design is intentionally aligned to current repo reality:
 - Wunderground is the canonical settlement-aligned label source
 - LAMP already has an overnight daily summarizer keyed by `target_date_local`
 - HRRR already has an overnight local-day summary design with a `00:05` cutoff and retained-cycle revision logic
+- HRRR operational optimization options are documented in `tools/hrrr/README.md`; they do not change the model target or the overnight summary/revision contract
 - canonical weather normalization already exists under `tools/weather`
 
 This document does not imply that unimplemented datasets or trading datasets already exist.
