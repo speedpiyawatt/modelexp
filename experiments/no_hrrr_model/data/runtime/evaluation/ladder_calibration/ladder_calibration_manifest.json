@@ -1,0 +1,26 @@
+{
+  "bucket_count": 10,
+  "bucket_reliability_path": "experiments/no_hrrr_model/data/runtime/evaluation/ladder_calibration/ladder_calibration_bucket_reliability.csv",
+  "built_at_utc": "2026-04-28T10:03:43.605737+00:00",
+  "calibration_row_count": 364,
+  "calibration_valid_end": "2024-12-31",
+  "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+  "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet",
+  "quantile_calibration_manifest_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json",
+  "selected_by": [
+    "event_bin_nll",
+    "degree_ladder_nll"
+  ],
+  "selected_method_id": "bucket_reliability_s0_50",
+  "shrinkage_grid": [
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "status": "ok",
+  "summary_path": "experiments/no_hrrr_model/data/runtime/evaluation/ladder_calibration/ladder_calibration_summary.csv",
+  "test_ladders_path": "experiments/no_hrrr_model/data/runtime/evaluation/ladder_calibration/ladder_calibration_test_ladders.parquet",
+  "test_row_count": 365,
+  "test_valid_start": "2025-01-01"
+}

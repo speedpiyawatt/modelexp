@@ -1,0 +1,100 @@
+{
+  "built_at_utc": "2026-04-28T09:49:16.480030+00:00",
+  "input_path": "experiments/no_hrrr_model/data/runtime/training/training_features_overnight_no_hrrr_normalized.parquet",
+  "lightgbm_params": {
+    "bagging_fraction": 0.7,
+    "bagging_freq": 1,
+    "feature_fraction": 0.7,
+    "lambda_l1": 0.2,
+    "lambda_l2": 5.0,
+    "learning_rate": 0.025,
+    "max_depth": 3,
+    "min_data_in_leaf": 70,
+    "num_leaves": 7
+  },
+  "metrics": {
+    "q05": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.17291490560796405,
+      "validation_pinball_loss": 0.16309315730104657
+    },
+    "q10": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.2830218030346625,
+      "validation_pinball_loss": 0.2812247841223749
+    },
+    "q25": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.49518361351916895,
+      "validation_pinball_loss": 0.4910709724882659
+    },
+    "q50": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.6081591023080585,
+      "validation_pinball_loss": 0.6531382982541485
+    },
+    "q75": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.46818539424898364,
+      "validation_pinball_loss": 0.5197626433263154
+    },
+    "q90": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.26270118721877955,
+      "validation_pinball_loss": 0.2919349972432467
+    },
+    "q95": {
+      "best_iteration": 350,
+      "train_pinball_loss": 0.1542877470263884,
+      "validation_pinball_loss": 0.1634518261941812
+    }
+  },
+  "model_candidate": {
+    "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+    "description": "Very-regularized baseline with stronger leaf-size regularization.",
+    "num_boost_round": 350,
+    "params": {
+      "bagging_fraction": 0.7,
+      "bagging_freq": 1,
+      "feature_fraction": 0.7,
+      "lambda_l1": 0.2,
+      "lambda_l2": 5.0,
+      "learning_rate": 0.025,
+      "max_depth": 3,
+      "min_data_in_leaf": 70,
+      "num_leaves": 7
+    }
+  },
+  "model_candidate_id": "very_regularized_min_leaf70_lgbm_350",
+  "model_paths": {
+    "q05": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q05.txt",
+    "q10": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q10.txt",
+    "q25": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q25.txt",
+    "q50": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q50.txt",
+    "q75": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q75.txt",
+    "q90": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q90.txt",
+    "q95": "experiments/no_hrrr_model/data/runtime/models/residual_quantile_q95.txt"
+  },
+  "num_boost_round": 350,
+  "output_dir": "experiments/no_hrrr_model/data/runtime/models",
+  "quantiles": [
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    0.9,
+    0.95
+  ],
+  "random_seed": 20260425,
+  "row_count_eligible": 1094,
+  "row_count_total": 1096,
+  "row_count_used": 1094,
+  "status": "ok",
+  "target_column": "target_residual_f",
+  "train_end_date": "2025-05-26",
+  "train_row_count": 875,
+  "training_procedure": "fixed_num_boost_round_no_inner_early_stopping",
+  "validation_row_count": 219,
+  "validation_start_date": "2025-05-27"
+}

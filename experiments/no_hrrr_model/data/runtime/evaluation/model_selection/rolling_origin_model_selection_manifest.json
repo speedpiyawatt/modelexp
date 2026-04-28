@@ -1,0 +1,340 @@
+{
+  "built_at_utc": "2026-04-28T09:49:07.427135+00:00",
+  "candidate_count": 16,
+  "candidates": [
+    {
+      "candidate_id": "current_lgbm_fixed_250_no_inner_es",
+      "description": "Current no-HRRR LightGBM residual quantile parameters scored with fixed 250 rounds and no inner early stopping.",
+      "num_boost_round": 250,
+      "params": {
+        "bagging_fraction": 0.85,
+        "bagging_freq": 1,
+        "feature_fraction": 0.85,
+        "lambda_l2": 1.0,
+        "learning_rate": 0.035,
+        "min_data_in_leaf": 25,
+        "num_leaves": 15
+      }
+    },
+    {
+      "candidate_id": "regularized_shallow_lgbm_300",
+      "description": "Shallower regularized LightGBM with smaller leaves, explicit max depth, L1/L2 penalties, and modest subsampling.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.1,
+        "lambda_l2": 3.0,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "min_data_in_leaf": 35,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "regularized_moderate_lgbm_300",
+      "description": "Moderate-depth regularized LightGBM preserving current leaf count with stronger leaf-size and L2 controls.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "feature_fraction": 0.8,
+        "lambda_l1": 0.05,
+        "lambda_l2": 3.0,
+        "learning_rate": 0.03,
+        "max_depth": 4,
+        "min_data_in_leaf": 35,
+        "num_leaves": 15
+      }
+    },
+    {
+      "candidate_id": "high_min_leaf_lgbm_250",
+      "description": "Current learning-rate scale with higher minimum leaf size and stronger L2 regularization.",
+      "num_boost_round": 250,
+      "params": {
+        "bagging_fraction": 0.85,
+        "bagging_freq": 1,
+        "feature_fraction": 0.85,
+        "lambda_l1": 0.05,
+        "lambda_l2": 4.0,
+        "learning_rate": 0.035,
+        "max_depth": 4,
+        "min_data_in_leaf": 60,
+        "num_leaves": 11
+      }
+    },
+    {
+      "candidate_id": "very_regularized_lgbm_350",
+      "description": "Most conservative candidate with low learning rate, shallow trees, high leaf size, and strong L1/L2 penalties.",
+      "num_boost_round": 350,
+      "params": {
+        "bagging_fraction": 0.7,
+        "bagging_freq": 1,
+        "feature_fraction": 0.7,
+        "lambda_l1": 0.2,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.025,
+        "max_depth": 3,
+        "min_data_in_leaf": 50,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "very_regularized_lr020_lgbm_450",
+      "description": "Very-regularized baseline with lower learning rate and more fixed boosting rounds.",
+      "num_boost_round": 450,
+      "params": {
+        "bagging_fraction": 0.7,
+        "bagging_freq": 1,
+        "feature_fraction": 0.7,
+        "lambda_l1": 0.2,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.02,
+        "max_depth": 3,
+        "min_data_in_leaf": 50,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "very_regularized_lr030_lgbm_300",
+      "description": "Very-regularized baseline with slightly faster learning and fewer boosting rounds.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.7,
+        "bagging_freq": 1,
+        "feature_fraction": 0.7,
+        "lambda_l1": 0.2,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "min_data_in_leaf": 50,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+      "description": "Very-regularized baseline with stronger leaf-size regularization.",
+      "num_boost_round": 350,
+      "params": {
+        "bagging_fraction": 0.7,
+        "bagging_freq": 1,
+        "feature_fraction": 0.7,
+        "lambda_l1": 0.2,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.025,
+        "max_depth": 3,
+        "min_data_in_leaf": 70,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "very_regularized_l2_8_lgbm_350",
+      "description": "Very-regularized baseline with stronger L2 shrinkage.",
+      "num_boost_round": 350,
+      "params": {
+        "bagging_fraction": 0.7,
+        "bagging_freq": 1,
+        "feature_fraction": 0.7,
+        "lambda_l1": 0.2,
+        "lambda_l2": 8.0,
+        "learning_rate": 0.025,
+        "max_depth": 3,
+        "min_data_in_leaf": 50,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "very_regularized_frac075_lgbm_350",
+      "description": "Very-regularized baseline with slightly less feature and row subsampling.",
+      "num_boost_round": 350,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.2,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.025,
+        "max_depth": 3,
+        "min_data_in_leaf": 50,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "regularized_shallow_min_leaf40_lgbm_300",
+      "description": "Shallow regularized baseline with minimum leaf size moved into the structured expansion range.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.1,
+        "lambda_l2": 3.0,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "min_data_in_leaf": 40,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "regularized_shallow_min_leaf50_lgbm_300",
+      "description": "Shallow regularized baseline with higher minimum leaf size.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.1,
+        "lambda_l2": 3.0,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "min_data_in_leaf": 50,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "regularized_shallow_l2_5_lgbm_300",
+      "description": "Shallow regularized baseline with stronger L2 shrinkage.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.1,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.03,
+        "max_depth": 3,
+        "min_data_in_leaf": 35,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "regularized_shallow_lr025_lgbm_350",
+      "description": "Shallow regularized baseline with lower learning rate and more fixed boosting rounds.",
+      "num_boost_round": 350,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.1,
+        "lambda_l2": 3.0,
+        "learning_rate": 0.025,
+        "max_depth": 3,
+        "min_data_in_leaf": 35,
+        "num_leaves": 7
+      }
+    },
+    {
+      "candidate_id": "regularized_shallow_leaves11_depth4_lgbm_300",
+      "description": "Shallow regularized baseline with a small capacity increase while keeping depth and leaves constrained.",
+      "num_boost_round": 300,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.1,
+        "lambda_l2": 3.0,
+        "learning_rate": 0.03,
+        "max_depth": 4,
+        "min_data_in_leaf": 50,
+        "num_leaves": 11
+      }
+    },
+    {
+      "candidate_id": "slower_regularized_lgbm_350",
+      "description": "Lower learning-rate candidate with moderate leaves, max-depth cap, high leaf size, and strong L2 penalty.",
+      "num_boost_round": 350,
+      "params": {
+        "bagging_fraction": 0.75,
+        "bagging_freq": 1,
+        "feature_fraction": 0.75,
+        "lambda_l1": 0.05,
+        "lambda_l2": 5.0,
+        "learning_rate": 0.025,
+        "max_depth": 5,
+        "min_data_in_leaf": 40,
+        "num_leaves": 21
+      }
+    }
+  ],
+  "default_model_candidate_id": "very_regularized_min_leaf70_lgbm_350",
+  "feature_count": 180,
+  "features_path": "experiments/no_hrrr_model/data/runtime/training/training_features_overnight_no_hrrr_normalized.parquet",
+  "fold_metrics_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_fold_metrics.csv",
+  "leakage_check": {
+    "finding_count": 0,
+    "status": "ok"
+  },
+  "output_dir": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection",
+  "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet",
+  "representative_event_bin_labels": [
+    "35F or below",
+    "36-37F",
+    "38-39F",
+    "40-41F",
+    "42-43F",
+    "44-45F",
+    "46-47F",
+    "48-49F",
+    "50-51F",
+    "52-53F",
+    "54-55F",
+    "56-57F",
+    "58-59F",
+    "60-61F",
+    "62-63F",
+    "64-65F",
+    "66-67F",
+    "68-69F",
+    "70-71F",
+    "72-73F",
+    "74-75F",
+    "76-77F",
+    "78-79F",
+    "80-81F",
+    "82-83F",
+    "84-85F",
+    "86-87F",
+    "88-89F",
+    "90-91F",
+    "92-93F",
+    "94F or higher"
+  ],
+  "selected_by": [
+    "weighted_mean_event_bin_nll",
+    "weighted_mean_degree_ladder_nll"
+  ],
+  "selected_candidate": {
+    "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+    "description": "Very-regularized baseline with stronger leaf-size regularization.",
+    "num_boost_round": 350,
+    "params": {
+      "bagging_fraction": 0.7,
+      "bagging_freq": 1,
+      "feature_fraction": 0.7,
+      "lambda_l1": 0.2,
+      "lambda_l2": 5.0,
+      "learning_rate": 0.025,
+      "max_depth": 3,
+      "min_data_in_leaf": 70,
+      "num_leaves": 7
+    }
+  },
+  "selected_candidate_id": "very_regularized_min_leaf70_lgbm_350",
+  "split_count": 2,
+  "splits": [
+    {
+      "train_end": "2023-12-31",
+      "valid_end": "2024-12-31",
+      "valid_start": "2024-01-01"
+    },
+    {
+      "train_end": "2024-12-31",
+      "valid_end": "2025-12-31",
+      "valid_start": "2025-01-01"
+    }
+  ],
+  "stability_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_stability.csv",
+  "status": "ok",
+  "summary_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_summary.csv"
+}
