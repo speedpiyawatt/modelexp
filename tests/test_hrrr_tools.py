@@ -31,7 +31,9 @@ HRRR_PIPELINE_PATH = HRRR_DIR / "build_hrrr_klga_feature_shards.py"
 HRRR_FETCH_PATH = HRRR_DIR / "fetch_hrrr_records.py"
 HRRR_MONTHLY_BACKFILL_PATH = HRRR_DIR / "run_hrrr_monthly_backfill.py"
 HRRR_BENCHMARK_PATH = HRRR_DIR / "benchmark_hrrr_sources.py"
+HRRR_BINARY_BENCHMARK_PATH = HRRR_DIR / "benchmark_hrrr_binary_extractors.py"
 HRRR_SUMMARIZE_DIAGNOSTICS_PATH = HRRR_DIR / "summarize_hrrr_diagnostics.py"
+HRRR_WGRIB2_BIN_PARITY_PATH = HRRR_DIR / "check_hrrr_wgrib2_bin_parity.py"
 LOCATION_CONTEXT_PATH = ROOT / "tools" / "weather" / "location_context.py"
 
 
@@ -49,7 +51,9 @@ hrrr_fetch = load_module("hrrr_fetch_test", HRRR_FETCH_PATH)
 hrrr_pipeline = load_module("hrrr_pipeline_test", HRRR_PIPELINE_PATH)
 hrrr_monthly_backfill = load_module("hrrr_monthly_backfill_test", HRRR_MONTHLY_BACKFILL_PATH)
 hrrr_benchmark = load_module("hrrr_benchmark_test", HRRR_BENCHMARK_PATH)
+hrrr_binary_benchmark = load_module("hrrr_binary_benchmark_test", HRRR_BINARY_BENCHMARK_PATH)
 hrrr_diagnostics_summary = load_module("hrrr_diagnostics_summary_test", HRRR_SUMMARIZE_DIAGNOSTICS_PATH)
+hrrr_wgrib2_bin_parity = load_module("hrrr_wgrib2_bin_parity_test", HRRR_WGRIB2_BIN_PARITY_PATH)
 
 
 def make_lat_lon_grid() -> tuple[np.ndarray, np.ndarray]:
@@ -133,6 +137,147 @@ def test_benchmark_parse_args_accepts_sources_and_runs(monkeypatch):
 
     assert args.sources == ["google", "azure"]
     assert args.runs == 2
+
+
+def test_wgrib2_bin_parity_parse_forecast_hours():
+    assert hrrr_wgrib2_bin_parity.parse_forecast_hours("0-3,6,9") == {0, 1, 2, 3, 6, 9}
+
+
+def test_row_col_slices_from_ij_box_round_trips_crop_box():
+    ij_box = hrrr_pipeline.CropIjBox(i0=1436, i1=1666, j0=612, j1=821)
+    row_slice, col_slice = hrrr_pipeline.row_col_slices_from_ij_box(
+        ij_box=ij_box,
+        grid_shape=(1059, 1799),
+        north_is_first=False,
+        west_is_first=True,
+    )
+
+    assert row_slice == slice(611, 821)
+    assert col_slice == slice(1435, 1666)
+    assert row_slice.stop - row_slice.start == ij_box.ny
+    assert col_slice.stop - col_slice.start == ij_box.nx
+
+
+def test_wgrib2_bin_parity_compare_rows_reports_numeric_failures():
+    comparison = hrrr_wgrib2_bin_parity.compare_rows(
+        {"a": 1.0, "b": 2.0, "same": "x"},
+        {"a": 1.00001, "b": 2.1, "same": "x", "extra": 3.0},
+        tolerance=1e-4,
+    )
+
+    assert comparison["numeric_compared"] == 2
+    assert comparison["max_numeric_column"] == "b"
+    assert comparison["numeric_failures"] == [
+        {"column": "b", "reference": 2.0, "candidate": 2.1, "abs_diff": pytest.approx(0.1)}
+    ]
+    assert comparison["candidate_only_columns"] == ["extra"]
+
+
+def test_wgrib2_bin_parity_compare_rows_reports_nonfinite_mismatch():
+    comparison = hrrr_wgrib2_bin_parity.compare_rows(
+        {"finite": 1.0, "both_nan": float("nan")},
+        {"finite": float("nan"), "both_nan": float("nan")},
+        tolerance=1e-4,
+    )
+
+    assert comparison["numeric_compared"] == 2
+    assert len(comparison["numeric_failures"]) == 1
+    failure = comparison["numeric_failures"][0]
+    assert failure["column"] == "finite"
+    assert failure["reference"] == 1.0
+    assert np.isnan(failure["candidate"])
+    assert failure["abs_diff"] == float("inf")
+
+
+def test_hrrr_monthly_backfill_parse_args_accepts_wgrib2_bin(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_hrrr_monthly_backfill.py",
+            "--start-local-date",
+            "2026-04-11",
+            "--end-local-date",
+            "2026-04-11",
+            "--extract-method",
+            "wgrib2-ijbox-bin",
+        ],
+    )
+
+    args = hrrr_monthly_backfill.parse_args()
+
+    assert args.extract_method == "wgrib2-ijbox-bin"
+
+
+def test_hrrr_binary_benchmark_parse_args_accepts_direct_method(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "benchmark_hrrr_binary_extractors.py",
+            "--reduced-grib",
+            str(tmp_path / "reduced.grib2"),
+            "--direct-grib",
+            str(tmp_path / "direct.grib2"),
+            "--target-date",
+            "2026-04-11",
+            "--run-date-utc",
+            "2026-04-11",
+            "--cycle-hour-utc",
+            "4",
+            "--forecast-hours",
+            "0-2",
+            "--methods",
+            "wgrib2-bin",
+            "wgrib2-ijbox-bin",
+            "--runs",
+            "2",
+        ],
+    )
+
+    args = hrrr_binary_benchmark.parse_args()
+
+    assert args.reduced_grib == tmp_path / "reduced.grib2"
+    assert args.direct_grib == tmp_path / "direct.grib2"
+    assert args.methods == ["wgrib2-bin", "wgrib2-ijbox-bin"]
+    assert args.runs == 2
+
+
+def test_hrrr_binary_benchmark_flattens_run_diagnostics():
+    row = hrrr_binary_benchmark.flatten_run(
+        {
+            "method": "wgrib2-bin",
+            "run_index": 1,
+            "ok": True,
+            "task_count": 1,
+            "ok_task_count": 1,
+            "wall_seconds": 1.2,
+            "cpu_seconds": 0.9,
+            "maxrss_mib_after": 128.0,
+            "maxrss_mib_delta": 4.0,
+            "diagnostic_totals": {
+                "binary_temp_bytes_observed": 100,
+                "binary_cache_hit_count": 1,
+                "binary_cache_miss_count": 1,
+                "timing_binary_dump_seconds": 0.2,
+                "timing_binary_read_seconds": 0.3,
+            },
+            "parity": {
+                "failed_row_count": 0,
+                "max_row_numeric_diff": 1e-5,
+                "max_row_numeric_column": "tmp_2m_f",
+                "summary": {
+                    "max_numeric_diff": 2e-5,
+                    "max_numeric_column": "hrrr_tmp_2m_day_mean_f",
+                },
+            },
+        }
+    )
+
+    assert row["method"] == "wgrib2-bin"
+    assert row["binary_temp_bytes_observed"] == 100
+    assert row["max_row_numeric_diff"] == 1e-5
+    assert row["max_summary_numeric_column"] == "hrrr_tmp_2m_day_mean_f"
 
 
 def test_run_month_legacy_pause_control_stops_additional_task_submission(tmp_path, monkeypatch):
@@ -311,6 +456,81 @@ def make_task(
         selected_for_summary=True,
         anchor_cycle_candidate=anchor_cycle_candidate,
     )
+
+
+def test_reduce_grib2_for_task_does_not_swallow_internal_typeerror(monkeypatch, tmp_path):
+    def fake_reduce_grib2(_wgrib2_path, _raw_path, _reduced_path, *, task):
+        raise TypeError(f"internal task failure for {task.key}")
+
+    monkeypatch.setattr(hrrr_pipeline, "reduce_grib2", fake_reduce_grib2)
+
+    with pytest.raises(TypeError, match="internal task failure"):
+        hrrr_pipeline.reduce_grib2_for_task(
+            "wgrib2",
+            tmp_path / "raw.grib2",
+            tmp_path / "reduced.grib2",
+            task=make_task(),
+            raw_manifest_path=tmp_path / "raw.manifest.csv",
+        )
+
+
+def test_process_reduced_grib_compat_does_not_swallow_internal_typeerror(monkeypatch, tmp_path):
+    calls = 0
+
+    def fake_process_reduced_grib(_reduced_path, _inventory, _task, _url, *, diagnostics=None, write_provenance=True):
+        nonlocal calls
+        calls += 1
+        assert diagnostics == {"source": "test"}
+        assert write_provenance is False
+        raise TypeError("internal diagnostics failure")
+
+    monkeypatch.setattr(hrrr_pipeline, "process_reduced_grib", fake_process_reduced_grib)
+
+    with pytest.raises(TypeError, match="internal diagnostics failure"):
+        hrrr_pipeline.process_reduced_grib_compat(
+            tmp_path / "reduced.grib2",
+            [],
+            make_task(),
+            "https://example.com/hrrr.grib2",
+            cfgrib_index_dir=tmp_path / "idx",
+            diagnostics={"source": "test"},
+            write_provenance=False,
+        )
+    assert calls == 1
+
+
+def test_process_reduced_grib_compat_omits_unsupported_optional_kwargs(monkeypatch, tmp_path):
+    received: dict[str, object] = {}
+
+    def fake_process_reduced_grib(_reduced_path, _inventory, task, _url, *, include_legacy_aliases=False):
+        received["task_key"] = task.key
+        received["include_legacy_aliases"] = include_legacy_aliases
+        return hrrr_pipeline.TaskResult(
+            True,
+            task.key,
+            make_minimal_hrrr_output_row_from_task(task),
+            [],
+            [],
+            None,
+            {},
+        )
+
+    monkeypatch.setattr(hrrr_pipeline, "process_reduced_grib", fake_process_reduced_grib)
+    task = make_task()
+
+    result = hrrr_pipeline.process_reduced_grib_compat(
+        tmp_path / "reduced.grib2",
+        [],
+        task,
+        "https://example.com/hrrr.grib2",
+        cfgrib_index_dir=tmp_path / "idx",
+        diagnostics={"source": "test"},
+        include_legacy_aliases=True,
+        write_provenance=False,
+    )
+
+    assert result.ok is True
+    assert received == {"task_key": task.key, "include_legacy_aliases": True}
 
 
 def make_summary_input_row_from_task(task, *, base_temp: float = 300.0) -> dict[str, object]:
@@ -919,7 +1139,8 @@ def test_run_month_batch_reduce_cycle_crops_once_for_cycle(tmp_path, monkeypatch
     assert manifest["batch_reduce_mode"] == "cycle"
     manifest_df = pd.read_parquet(tmp_path / "2023-01.manifest.parquet")
     assert set(manifest_df["batch_reduce_mode"]) == {"cycle"}
-    assert set(manifest_df["timing_cfgrib_open_seconds"]) == {0.123}
+    assert set(manifest_df["batch_cycle_cfgrib_open_seconds"]) == {0.123}
+    assert set(manifest_df["timing_cfgrib_open_seconds"]) == {0.0615}
     assert manifest_df["timing_cleanup_seconds"].notna().all()
 
 
@@ -3130,6 +3351,61 @@ def test_hrrr_monthly_backfill_rebuilds_day_when_manifest_parquet_is_empty(tmp_p
         tmp_path / "runtime",
         hrrr_monthly_backfill.DayWindow(dt.date(2024, 1, 1)),
         selection_mode="overnight_0005",
+    ) is False
+
+
+def test_hrrr_monthly_validation_rejects_wrong_extract_contract(tmp_path):
+    summary_root = tmp_path / "runtime" / "hrrr_summary" / "target_date_local=2024-01-01"
+    state_root = tmp_path / "runtime" / "hrrr_summary_state" / "target_date_local=2024-01-01"
+    summary_root.mkdir(parents=True, exist_ok=True)
+    state_root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"target_date_local": "2024-01-01", "status": "ok"}]).to_parquet(
+        summary_root / "hrrr.overnight.parquet",
+        index=False,
+    )
+    (state_root / "hrrr.manifest.json").write_text(
+        json.dumps(
+            {
+                "complete": True,
+                "expected_task_count": 1,
+                "completed_task_keys": ["task_a"],
+                "target_date_local": "2024-01-01",
+                "selection_mode": "overnight_0005",
+                "extract_method": "eccodes",
+                "summary_profile": "overnight",
+                "provenance_written": False,
+            }
+        )
+    )
+    pd.DataFrame(
+        [
+            {
+                "status": "ok",
+                "selection_mode": "overnight_0005",
+                "extract_method": "eccodes",
+                "summary_profile": "overnight",
+                "provenance_written": False,
+            }
+        ]
+    ).to_parquet(state_root / "hrrr.manifest.parquet", index=False)
+
+    day = hrrr_monthly_backfill.DayWindow(dt.date(2024, 1, 1))
+
+    assert hrrr_monthly_backfill.validate_hrrr_day(
+        tmp_path / "runtime",
+        day,
+        selection_mode="overnight_0005",
+        extract_method="eccodes",
+        summary_profile="overnight",
+        provenance_written=False,
+    ) is True
+    assert hrrr_monthly_backfill.validate_hrrr_day(
+        tmp_path / "runtime",
+        day,
+        selection_mode="overnight_0005",
+        extract_method="wgrib2-bin",
+        summary_profile="overnight",
+        provenance_written=False,
     ) is False
 
 

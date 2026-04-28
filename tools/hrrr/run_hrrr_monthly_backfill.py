@@ -91,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-method", choices=("auto", "small_grib", "ijsmall_grib"))
     parser.add_argument("--crop-grib-type")
     parser.add_argument("--wgrib2-threads", type=int)
-    parser.add_argument("--extract-method", choices=("cfgrib", "eccodes"))
+    parser.add_argument("--extract-method", choices=("cfgrib", "eccodes", "wgrib2-bin", "wgrib2-ijbox-bin"))
     parser.add_argument("--summary-profile", choices=("full", "overnight"))
     parser.add_argument("--skip-provenance", action="store_true")
     parser.add_argument("--progress-mode", choices=("auto", "dashboard", "log"), default="auto")
@@ -217,7 +217,15 @@ def hrrr_day_performance_path(run_root: Path, day: DayWindow) -> Path:
     return hrrr_summary_paths(run_root, day)["performance"]
 
 
-def validate_hrrr_day(run_root: Path, day: DayWindow, *, selection_mode: str) -> bool:
+def validate_hrrr_day(
+    run_root: Path,
+    day: DayWindow,
+    *,
+    selection_mode: str,
+    extract_method: str = "cfgrib",
+    summary_profile: str = "full",
+    provenance_written: bool = True,
+) -> bool:
     paths = hrrr_summary_paths(run_root, day)
     if not paths["summary"].exists() or not paths["manifest_json"].exists() or not paths["manifest_parquet"].exists():
         return False
@@ -237,6 +245,12 @@ def validate_hrrr_day(run_root: Path, day: DayWindow, *, selection_mode: str) ->
         return False
     if str(manifest.get("selection_mode")) != selection_mode:
         return False
+    if str(manifest.get("extract_method", "cfgrib")) != extract_method:
+        return False
+    if str(manifest.get("summary_profile", "full")) != summary_profile:
+        return False
+    if bool(manifest.get("provenance_written", True)) != provenance_written:
+        return False
     expected_count = int(manifest.get("expected_task_count", -1))
     completed_count = len(manifest.get("completed_task_keys", []))
     if expected_count < 0 or expected_count != completed_count:
@@ -245,7 +259,22 @@ def validate_hrrr_day(run_root: Path, day: DayWindow, *, selection_mode: str) ->
         return False
     if "selection_mode" in manifest_df.columns and not manifest_df["selection_mode"].eq(selection_mode).all():
         return False
+    if "extract_method" in manifest_df.columns and not manifest_df["extract_method"].fillna("cfgrib").eq(extract_method).all():
+        return False
+    if "summary_profile" in manifest_df.columns and not manifest_df["summary_profile"].fillna("full").eq(summary_profile).all():
+        return False
+    if "provenance_written" in manifest_df.columns and not manifest_df["provenance_written"].fillna(True).eq(provenance_written).all():
+        return False
     return bool((manifest_df["status"] == "ok").all())
+
+
+def requested_hrrr_contract(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "selection_mode": str(args.selection_mode),
+        "extract_method": str(getattr(args, "extract_method", None) or "cfgrib"),
+        "summary_profile": str(getattr(args, "summary_profile", None) or "full"),
+        "provenance_written": not bool(getattr(args, "skip_provenance", False)),
+    }
 
 
 def child_progress_mode(args: argparse.Namespace, *, parent_dashboard_active: bool) -> str:
@@ -290,39 +319,39 @@ def build_hrrr_command(
         "--batch-reduce-mode",
         str(getattr(args, "batch_reduce_mode", "off")),
     ]
-    if args.download_workers is not None:
+    if getattr(args, "download_workers", None) is not None:
         command.extend(["--download-workers", str(args.download_workers)])
-    if args.reduce_workers is not None:
+    if getattr(args, "reduce_workers", None) is not None:
         command.extend(["--reduce-workers", str(args.reduce_workers)])
-    if args.extract_workers is not None:
+    if getattr(args, "extract_workers", None) is not None:
         command.extend(["--extract-workers", str(args.extract_workers)])
-    if args.reduce_queue_size is not None:
+    if getattr(args, "reduce_queue_size", None) is not None:
         command.extend(["--reduce-queue-size", str(args.reduce_queue_size)])
-    if args.extract_queue_size is not None:
+    if getattr(args, "extract_queue_size", None) is not None:
         command.extend(["--extract-queue-size", str(args.extract_queue_size)])
-    if args.range_merge_gap_bytes is not None:
+    if getattr(args, "range_merge_gap_bytes", None) is not None:
         command.extend(["--range-merge-gap-bytes", str(args.range_merge_gap_bytes)])
-    if args.crop_method is not None:
+    if getattr(args, "crop_method", None) is not None:
         command.extend(["--crop-method", str(args.crop_method)])
-    if args.crop_grib_type is not None:
+    if getattr(args, "crop_grib_type", None) is not None:
         command.extend(["--crop-grib-type", str(args.crop_grib_type)])
-    if args.wgrib2_threads is not None:
+    if getattr(args, "wgrib2_threads", None) is not None:
         command.extend(["--wgrib2-threads", str(args.wgrib2_threads)])
-    if args.extract_method is not None:
+    if getattr(args, "extract_method", None) is not None:
         command.extend(["--extract-method", str(args.extract_method)])
-    if args.summary_profile is not None:
+    if getattr(args, "summary_profile", None) is not None:
         command.extend(["--summary-profile", str(args.summary_profile)])
-    if args.skip_provenance:
+    if getattr(args, "skip_provenance", False):
         command.append("--skip-provenance")
-    if args.max_task_attempts is not None:
+    if getattr(args, "max_task_attempts", None) is not None:
         command.extend(["--max-task-attempts", str(args.max_task_attempts)])
-    if args.retry_backoff_seconds is not None:
+    if getattr(args, "retry_backoff_seconds", None) is not None:
         command.extend(["--retry-backoff-seconds", str(args.retry_backoff_seconds)])
-    if args.retry_max_backoff_seconds is not None:
+    if getattr(args, "retry_max_backoff_seconds", None) is not None:
         command.extend(["--retry-max-backoff-seconds", str(args.retry_max_backoff_seconds)])
-    if include_pause_control_file and args.pause_control_file is not None:
+    if include_pause_control_file and getattr(args, "pause_control_file", None) is not None:
         command.extend(["--pause-control-file", str(args.pause_control_file)])
-    if args.allow_partial:
+    if getattr(args, "allow_partial", False):
         command.append("--allow-partial")
     if getattr(args, "keep_reduced", False):
         command.append("--keep-reduced")
@@ -767,7 +796,7 @@ def process_day(args: argparse.Namespace, day: DayWindow, *, bridge: DayProgress
         if bridge is not None:
             bridge.update_day(token, lifecycle_phase="validate", details="validate")
             bridge.set_day_phase_worker(token, phase="validate", details="validate")
-        if not validate_hrrr_day(args.run_root, day, selection_mode=str(args.selection_mode)):
+        if not validate_hrrr_day(args.run_root, day, **requested_hrrr_contract(args)):
             raise ValueError(f"HRRR validation failed for target_date_local={token}")
     except BaseException:
         if bridge is not None:
@@ -809,7 +838,7 @@ def run_backfill(args: argparse.Namespace) -> int:
     skipped_count = 0
     for day in days:
         token = day_token(day)
-        if validate_hrrr_day(args.run_root, day, selection_mode=str(args.selection_mode)):
+        if validate_hrrr_day(args.run_root, day, **requested_hrrr_contract(args)):
             emit_runner_log("skip", f"hrrr date={token}")
             skipped_count += 1
             continue

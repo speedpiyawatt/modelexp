@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import inspect
 import json
 import os
 import statistics
@@ -71,7 +72,7 @@ DEFAULT_SELECTION_MODE = "all"
 SELECTION_MODES = (DEFAULT_SELECTION_MODE, "overnight_0005")
 BATCH_REDUCE_MODES = ("off", "cycle")
 CROP_METHODS = ("auto", "small_grib", "ijsmall_grib")
-EXTRACT_METHODS = ("cfgrib", "eccodes")
+EXTRACT_METHODS = ("cfgrib", "eccodes", "wgrib2-bin", "wgrib2-ijbox-bin")
 SUMMARY_PROFILES = ("full", "overnight")
 DEFAULT_CROP_METHOD = "small_grib"
 DEFAULT_CROP_GRIB_TYPE = "same"
@@ -152,6 +153,9 @@ COMPILED_REVISION_INVENTORY_SELECTION_PATTERNS = tuple(
 )
 CROP_GRID_CACHE_LOCKS: dict[Path, threading.Lock] = {}
 CROP_GRID_CACHE_LOCKS_GUARD = threading.Lock()
+WGRIB2_BINARY_ARRAY_CACHE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int], dict[str, object]]] = {}
+WGRIB2_BINARY_ARRAY_CACHE_LOCK = threading.Lock()
+WGRIB2_BINARY_ARRAY_CACHE_MAX_ENTRIES = 4
 CANONICAL_WIDE_COLUMNS = {
     "source_model",
     "source_product",
@@ -313,6 +317,67 @@ class CropExecutionResult:
     crop_ij_box: str | None
     crop_wgrib2_threads: int
     crop_fallback_reason: str | None = None
+
+
+def normalize_crop_execution_result(result: object) -> CropExecutionResult:
+    if isinstance(result, CropExecutionResult):
+        return result
+    if not isinstance(result, tuple) or len(result) < 2:
+        raise TypeError(f"Unexpected crop result type: {type(result).__name__}")
+    selected_lines = list(result[0])
+    matched_names = set(result[1])
+    inventory_seconds = float(result[2]) if len(result) > 2 else 0.0
+    reduce_seconds = float(result[3]) if len(result) > 3 else 0.0
+    return CropExecutionResult(
+        selected_lines=selected_lines,
+        matched_names=matched_names,
+        inventory_seconds=inventory_seconds,
+        reduce_seconds=reduce_seconds,
+        command="",
+        method_used="legacy",
+        crop_grid_cache_key=None,
+        crop_grid_cache_hit=False,
+        crop_ij_box=None,
+        crop_wgrib2_threads=0,
+    )
+
+
+def callable_accepts_keyword(func: object, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD or name == keyword
+        for name, parameter in signature.parameters.items()
+    )
+
+
+def process_reduced_grib_compat(
+    reduced_path: Path,
+    reduced_inventory: list[str],
+    task: "TaskSpec",
+    grib_url: str,
+    *,
+    cfgrib_index_dir: Path | None = None,
+    diagnostics: dict[str, object] | None = None,
+    include_legacy_aliases: bool = False,
+    filter_inventory_to_task_step: bool = False,
+    write_provenance: bool = True,
+) -> "TaskResult":
+    optional_kwargs: dict[str, object] = {
+        "cfgrib_index_dir": cfgrib_index_dir,
+        "diagnostics": diagnostics,
+        "include_legacy_aliases": include_legacy_aliases,
+        "filter_inventory_to_task_step": filter_inventory_to_task_step,
+        "write_provenance": write_provenance,
+    }
+    kwargs = {
+        key: value
+        for key, value in optional_kwargs.items()
+        if callable_accepts_keyword(process_reduced_grib, key)
+    }
+    return process_reduced_grib(reduced_path, reduced_inventory, task, grib_url, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -586,7 +651,11 @@ def parse_args() -> argparse.Namespace:
         "--extract-method",
         choices=EXTRACT_METHODS,
         default=DEFAULT_EXTRACT_METHOD,
-        help="GRIB extraction backend. cfgrib is the reference path; eccodes is an opt-in direct message-iterator prototype.",
+        help=(
+            "GRIB extraction backend. cfgrib is the reference path; eccodes is a direct message-iterator "
+            "prototype; wgrib2-bin dumps reduced GRIB messages to binary arrays before NumPy row building; "
+            "wgrib2-ijbox-bin dumps an i/j crop directly from selected GRIB messages."
+        ),
     )
     parser.add_argument(
         "--summary-profile",
@@ -1180,6 +1249,83 @@ def crop_ij_box_from_grid(
     i0, i1 = (col_min + 1, col_max + 1) if west_is_first else (ncols - col_max, ncols - col_min)
     j0, j1 = (nrows - row_max, nrows - row_min) if north_is_first else (row_min + 1, row_max + 1)
     return CropIjBox(i0=int(i0), i1=int(i1), j0=int(j0), j1=int(j1))
+
+
+def row_col_slices_from_ij_box(
+    *,
+    ij_box: CropIjBox,
+    grid_shape: tuple[int, int],
+    north_is_first: bool,
+    west_is_first: bool,
+) -> tuple[slice, slice]:
+    nrows, ncols = grid_shape
+    if west_is_first:
+        col_min = ij_box.i0 - 1
+        col_max = ij_box.i1 - 1
+    else:
+        col_min = ncols - ij_box.i1
+        col_max = ncols - ij_box.i0
+    if north_is_first:
+        row_min = nrows - ij_box.j1
+        row_max = nrows - ij_box.j0
+    else:
+        row_min = ij_box.j0 - 1
+        row_max = ij_box.j1 - 1
+    if row_min < 0 or col_min < 0 or row_max >= nrows or col_max >= ncols or row_min > row_max or col_min > col_max:
+        raise ValueError(f"Invalid ijbox {ij_box.as_text()} for grid shape {grid_shape}")
+    return slice(row_min, row_max + 1), slice(col_min, col_max + 1)
+
+
+def crop_grid_cache_entry_from_eccodes(
+    *,
+    grib_path: Path,
+    cache_anchor_path: Path,
+    bounds: CropBounds,
+) -> tuple[CropGridCacheEntry, bool, np.ndarray, np.ndarray]:
+    lat_grid, lon_grid, _grid_shape = eccodes_grid_context_for_path(grib_path)
+    north_is_first = infer_north_is_first(lat_grid)
+    west_is_first = infer_west_is_first(lon_grid)
+    cache_key = build_crop_grid_cache_key(
+        bounds=bounds,
+        lat_grid=lat_grid,
+        lon_grid=lon_grid,
+        north_is_first=north_is_first,
+        west_is_first=west_is_first,
+    )
+    cache_path = crop_grid_cache_root(cache_anchor_path) / f"{cache_key}.json"
+    with crop_grid_cache_lock(cache_path):
+        cached = load_crop_grid_cache_entry(cache_path)
+        if cached is not None and cached.signature == cache_key:
+            row_slice, col_slice = row_col_slices_from_ij_box(
+                ij_box=cached.ij_box,
+                grid_shape=(int(lat_grid.shape[0]), int(lat_grid.shape[1])),
+                north_is_first=cached.north_is_first,
+                west_is_first=cached.west_is_first,
+            )
+            return cached, True, lat_grid[row_slice, col_slice], lon_grid[row_slice, col_slice]
+        ij_box = crop_ij_box_from_grid(
+            lat_grid=lat_grid,
+            lon_grid=lon_grid,
+            bounds=bounds,
+            north_is_first=north_is_first,
+            west_is_first=west_is_first,
+        )
+        entry = CropGridCacheEntry(
+            signature=cache_key,
+            grid_shape=(int(lat_grid.shape[0]), int(lat_grid.shape[1])),
+            north_is_first=bool(north_is_first),
+            west_is_first=bool(west_is_first),
+            crop_bounds=bounds,
+            ij_box=ij_box,
+        )
+        write_crop_grid_cache_entry(cache_path, entry)
+        row_slice, col_slice = row_col_slices_from_ij_box(
+            ij_box=ij_box,
+            grid_shape=(int(lat_grid.shape[0]), int(lat_grid.shape[1])),
+            north_is_first=north_is_first,
+            west_is_first=west_is_first,
+        )
+        return entry, False, lat_grid[row_slice, col_slice], lon_grid[row_slice, col_slice]
 
 
 def representative_grid_context_for_path(
@@ -1860,13 +2006,14 @@ def direct_provenance_row(
     )
 
 
-def direct_eccodes_provenance_row(
+def direct_grib_provenance_row(
     *,
     task_key: str,
     row_identity: dict[str, object],
     feature_name: str,
     inventory_line: str | None,
     units: str | None,
+    notes: str | None = None,
 ) -> dict[str, object]:
     inventory_meta = parse_inventory_line(inventory_line or "")
     return provenance_row(
@@ -1888,7 +2035,7 @@ def direct_eccodes_provenance_row(
         missing_optional=False,
         fallback_used=False,
         fallback_source_description=None,
-        notes=(inventory_meta or {}).get("extra") or "extracted with direct ecCodes prototype",
+        notes=(inventory_meta or {}).get("extra") or notes,
     )
 
 
@@ -2140,6 +2287,148 @@ def eccodes_grid_arrays(gid: object) -> tuple[np.ndarray, np.ndarray, np.ndarray
     return values, lat_grid, lon_grid
 
 
+def eccodes_grid_context_for_path(path: Path) -> tuple[np.ndarray, np.ndarray, tuple[int, int]]:
+    import eccodes
+
+    with path.open("rb") as handle:
+        gid = eccodes.codes_grib_new_from_file(handle)
+        if gid is None:
+            raise ValueError(f"No GRIB messages available in {path}")
+        try:
+            nx = int(eccodes.codes_get(gid, "Nx"))
+            ny = int(eccodes.codes_get(gid, "Ny"))
+            lat_grid = np.asarray(eccodes.codes_get_array(gid, "latitudes"), dtype=float).reshape(ny, nx)
+            lon_grid = np.asarray(eccodes.codes_get_array(gid, "longitudes"), dtype=float).reshape(ny, nx)
+            return lat_grid, lon_grid, (ny, nx)
+        finally:
+            eccodes.codes_release(gid)
+
+
+def wgrib2_binary_cache_key(path: Path, inventory_lines: list[str], *, ij_box: CropIjBox | None = None) -> str:
+    stat = path.stat()
+    payload = {
+        "path": str(path.resolve()),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "inventory_sha256": hashlib.sha256("\n".join(inventory_lines).encode("utf-8")).hexdigest(),
+        "binary_mode": "ijbox" if ij_box is not None else "full_grid",
+        "ij_box": ij_box.as_text() if ij_box is not None else None,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def load_wgrib2_binary_arrays(
+    *,
+    wgrib2_path: str,
+    reduced_path: Path,
+    reduced_inventory: list[str],
+    ij_box: CropIjBox | None = None,
+    ijbox_latitude: np.ndarray | None = None,
+    ijbox_longitude: np.ndarray | None = None,
+    ijbox_cache_entry: CropGridCacheEntry | None = None,
+    ijbox_cache_hit: bool | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int], dict[str, object]]:
+    cache_key = wgrib2_binary_cache_key(reduced_path, reduced_inventory, ij_box=ij_box)
+    with WGRIB2_BINARY_ARRAY_CACHE_LOCK:
+        cached = WGRIB2_BINARY_ARRAY_CACHE.get(cache_key)
+    if cached is not None:
+        arrays, latitude, longitude, grid_shape, cached_diagnostics = cached
+        diagnostics = dict(cached_diagnostics)
+        diagnostics["binary_cache_hit"] = True
+        diagnostics["timing_binary_dump_seconds"] = 0.0
+        diagnostics["timing_binary_read_seconds"] = 0.0
+        diagnostics["timing_binary_grid_context_seconds"] = 0.0
+        return arrays, latitude, longitude, grid_shape, diagnostics
+
+    dump_fd, dump_name = tempfile.mkstemp(prefix="hrrr_wgrib2_bin_", suffix=".bin")
+    os.close(dump_fd)
+    dump_path = Path(dump_name)
+    binary_env = os.environ.copy()
+    binary_env["OMP_NUM_THREADS"] = "1"
+    binary_env["OMP_WAIT_POLICY"] = "PASSIVE"
+    if ij_box is None:
+        command = [wgrib2_path, str(reduced_path), "-no_header", "-bin", str(dump_path)]
+    else:
+        command = [
+            wgrib2_path,
+            str(reduced_path),
+            "-no_header",
+            "-ijbox",
+            ij_box.format_i(),
+            ij_box.format_j(),
+            str(dump_path),
+            "bin",
+        ]
+    try:
+        dump_started_at = time.perf_counter()
+        result = run_command(command, env=binary_env)
+        dump_seconds = time.perf_counter() - dump_started_at
+        diagnostics: dict[str, object] = {
+            "binary_cache_hit": False,
+            "binary_cache_key": cache_key,
+            "binary_dump_method": "ijbox" if ij_box is not None else "full_grid",
+            "binary_dump_command": " ".join(command),
+            "timing_binary_dump_seconds": dump_seconds,
+            "binary_dump_stdout_line_count": len([line for line in result.stdout.splitlines() if line.strip()]),
+        }
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "wgrib2 binary dump failed")
+        if not dump_path.exists() or dump_path.stat().st_size <= 0:
+            raise RuntimeError("wgrib2 binary dump produced no data")
+
+        grid_started_at = time.perf_counter()
+        if ij_box is None:
+            latitude, longitude, grid_shape = eccodes_grid_context_for_path(reduced_path)
+        else:
+            if ijbox_latitude is None or ijbox_longitude is None:
+                full_latitude, full_longitude, full_grid_shape = eccodes_grid_context_for_path(reduced_path)
+                row_slice, col_slice = row_col_slices_from_ij_box(
+                    ij_box=ij_box,
+                    grid_shape=full_grid_shape,
+                    north_is_first=infer_north_is_first(full_latitude),
+                    west_is_first=infer_west_is_first(full_longitude),
+                )
+                latitude = full_latitude[row_slice, col_slice]
+                longitude = full_longitude[row_slice, col_slice]
+            else:
+                latitude = ijbox_latitude
+                longitude = ijbox_longitude
+            grid_shape = (int(latitude.shape[0]), int(latitude.shape[1]))
+            diagnostics["binary_ij_box"] = ij_box.as_text()
+            if ijbox_cache_entry is not None:
+                diagnostics["binary_ijbox_cache_key"] = ijbox_cache_entry.signature
+                diagnostics["binary_ijbox_full_grid_shape"] = json.dumps(
+                    [int(ijbox_cache_entry.grid_shape[0]), int(ijbox_cache_entry.grid_shape[1])]
+                )
+                diagnostics["crop_grid_cache_key"] = ijbox_cache_entry.signature
+                diagnostics["crop_grid_cache_hit"] = bool(ijbox_cache_hit)
+                diagnostics["crop_ij_box"] = ijbox_cache_entry.ij_box.as_text()
+        diagnostics["timing_binary_grid_context_seconds"] = time.perf_counter() - grid_started_at
+        ny, nx = grid_shape
+        message_count = len(reduced_inventory)
+        values_per_message = nx * ny
+        expected_values = message_count * values_per_message
+        read_started_at = time.perf_counter()
+        flat_values = np.fromfile(dump_path, dtype="<f4")
+        diagnostics["timing_binary_read_seconds"] = time.perf_counter() - read_started_at
+        diagnostics["binary_byte_count"] = int(dump_path.stat().st_size)
+        diagnostics["binary_dtype"] = "float32_le"
+        diagnostics["binary_grid_shape"] = json.dumps([int(ny), int(nx)])
+        diagnostics["binary_inventory_message_count"] = int(message_count)
+        diagnostics["binary_value_count"] = int(flat_values.size)
+        if flat_values.size != expected_values:
+            raise ValueError(f"wgrib2 binary value count {flat_values.size} did not match expected {expected_values}")
+        arrays = flat_values.reshape(message_count, ny, nx).astype(float, copy=False)
+        with WGRIB2_BINARY_ARRAY_CACHE_LOCK:
+            WGRIB2_BINARY_ARRAY_CACHE[cache_key] = (arrays, latitude, longitude, grid_shape, dict(diagnostics))
+            while len(WGRIB2_BINARY_ARRAY_CACHE) > WGRIB2_BINARY_ARRAY_CACHE_MAX_ENTRIES:
+                oldest_key = next(iter(WGRIB2_BINARY_ARRAY_CACHE))
+                WGRIB2_BINARY_ARRAY_CACHE.pop(oldest_key, None)
+        return arrays, latitude, longitude, grid_shape, diagnostics
+    finally:
+        dump_path.unlink(missing_ok=True)
+
+
 def build_task_result_with_eccodes(
     reduced_path: Path,
     reduced_inventory: list[str],
@@ -2243,12 +2532,13 @@ def build_task_result_with_eccodes(
                         )
                     )
                     if write_provenance:
-                        provenance_rows[prefix] = direct_eccodes_provenance_row(
+                        provenance_rows[prefix] = direct_grib_provenance_row(
                             task_key=task.key,
                             row_identity=provenance_identity(row),
                             feature_name=prefix,
                             inventory_line=inventory_line,
                             units=units,
+                            notes="extracted with direct ecCodes prototype",
                         )
                 finally:
                     eccodes.codes_release(gid)
@@ -2331,6 +2621,207 @@ def build_task_result_with_eccodes(
         None,
         diagnostics,
     )
+
+
+def build_task_result_with_wgrib2_bin(
+    reduced_path: Path,
+    reduced_inventory: list[str],
+    task: TaskSpec,
+    grib_url: str,
+    *,
+    diagnostics: dict[str, object] | None = None,
+    include_legacy_aliases: bool = False,
+    filter_inventory_to_task_step: bool = False,
+    write_provenance: bool = True,
+) -> TaskResult:
+    diagnostics = dict(diagnostics or default_task_diagnostics(task))
+    diagnostics["extract_method"] = RUNTIME_OPTIONS.extract_method
+    diagnostics.setdefault("timing_cfgrib_open_seconds", 0.0)
+    wgrib2_path = resolve_wgrib2()
+    row: dict[str, object] = {
+        "task_key": task.key,
+        "source_model": DEFAULT_SOURCE_MODEL,
+        "source_product": DEFAULT_SOURCE_PRODUCT,
+        "source_version": DEFAULT_SOURCE_VERSION,
+        "fallback_used_any": False,
+        "station_id": SETTLEMENT_LOCATION.station_id,
+        "grib_url": grib_url,
+        **settlement_metadata(),
+        **crop_metadata(),
+        "target_lat": SETTLEMENT_LOCATION.lat,
+        "target_lon": settlement_longitude_360(),
+    }
+    populate_task_metadata(row, task)
+
+    task_inventory = inventory_lines_for_task(reduced_inventory, task) if filter_inventory_to_task_step else reduced_inventory
+    task_inventory_set = set(task_inventory)
+    provenance_rows: dict[str, dict[str, object]] = {}
+    support_arrays: dict[str, np.ndarray] = {}
+    try:
+        direct_ijbox = (
+            RUNTIME_OPTIONS.extract_method == "wgrib2-ijbox-bin"
+            and not bool(diagnostics.get("direct_ijbox_fallback_to_reduced"))
+        )
+        ijbox_entry: CropGridCacheEntry | None = None
+        ijbox_cache_hit: bool | None = None
+        ijbox_latitude: np.ndarray | None = None
+        ijbox_longitude: np.ndarray | None = None
+        if direct_ijbox:
+            context_started_at = time.perf_counter()
+            ijbox_entry, ijbox_cache_hit, ijbox_latitude, ijbox_longitude = crop_grid_cache_entry_from_eccodes(
+                grib_path=reduced_path,
+                cache_anchor_path=reduced_path,
+                bounds=REGIONAL_CROP_BOUNDS,
+            )
+            diagnostics["timing_binary_ijbox_context_seconds"] = time.perf_counter() - context_started_at
+            diagnostics["binary_ij_box"] = ijbox_entry.ij_box.as_text()
+            diagnostics["binary_ijbox_cache_key"] = ijbox_entry.signature
+            diagnostics["binary_ijbox_cache_hit"] = bool(ijbox_cache_hit)
+            diagnostics["binary_ijbox_full_grid_shape"] = json.dumps(
+                [int(ijbox_entry.grid_shape[0]), int(ijbox_entry.grid_shape[1])]
+            )
+            diagnostics["crop_method"] = "ijbox_bin"
+            diagnostics["crop_grid_cache_key"] = ijbox_entry.signature
+            diagnostics["crop_grid_cache_hit"] = bool(ijbox_cache_hit)
+            diagnostics["crop_ij_box"] = ijbox_entry.ij_box.as_text()
+            diagnostics["crop_fallback_reason"] = None
+        arrays, latitude, longitude, _grid_shape, binary_diagnostics = load_wgrib2_binary_arrays(
+            wgrib2_path=wgrib2_path,
+            reduced_path=reduced_path,
+            reduced_inventory=reduced_inventory,
+            ij_box=ijbox_entry.ij_box if ijbox_entry is not None else None,
+            ijbox_latitude=ijbox_latitude,
+            ijbox_longitude=ijbox_longitude,
+            ijbox_cache_entry=ijbox_entry,
+            ijbox_cache_hit=ijbox_cache_hit,
+        )
+        diagnostics.update(binary_diagnostics)
+
+        nearest = find_nearest_grid_cell(
+            latitude,
+            longitude,
+            station_lat=SETTLEMENT_LOCATION.lat,
+            station_lon=SETTLEMENT_LOCATION.lon,
+        )
+        grid_row = int(nearest["grid_row"])
+        grid_col = int(nearest["grid_col"])
+        north_is_first = infer_north_is_first(latitude)
+        row["grid_row"] = grid_row
+        row["grid_col"] = grid_col
+        row["nearest_grid_lat"] = float(nearest["grid_lat"])
+        row["nearest_grid_lon"] = float(longitude_360_to_180(nearest["grid_lon"]))
+        row["grid_lat"] = float(nearest["grid_lat"])
+        row["grid_lon"] = float(nearest["grid_lon"])
+
+        parsed_array_count = 0
+        skipped_array_count = 0
+        row_build_started_at = time.perf_counter()
+        for message_index, inventory_line in enumerate(reduced_inventory):
+            if filter_inventory_to_task_step and inventory_line not in task_inventory_set:
+                skipped_array_count += 1
+                continue
+            prefix = direct_prefix_for_inventory_line(inventory_line)
+            if prefix is None:
+                skipped_array_count += 1
+                continue
+            values = arrays[message_index]
+            parsed_array_count += 1
+            if prefix == "apcp_surface_kg_m2" and prefix in support_arrays:
+                continue
+            support_arrays[prefix] = values
+            if prefix.endswith("_support"):
+                continue
+            row.update(
+                feature_metrics(
+                    prefix,
+                    values,
+                    grid_row=grid_row,
+                    grid_col=grid_col,
+                    north_is_first=north_is_first,
+                    include_legacy_aliases=include_legacy_aliases,
+                )
+            )
+            if write_provenance:
+                provenance_rows[prefix] = direct_grib_provenance_row(
+                    task_key=task.key,
+                    row_identity=provenance_identity(row),
+                    feature_name=prefix,
+                    inventory_line=inventory_line,
+                    units=None,
+                    notes="extracted from wgrib2 binary dump",
+                )
+
+        for level in ISOBARIC_LEVELS:
+            rh_prefix = f"rh_{level}mb_pct"
+            if row.get(rh_prefix) is None:
+                temp = support_arrays.get(f"tmp_{level}mb_k")
+                dewpoint = support_arrays.get(f"dpt_{level}mb_k_support")
+                if temp is not None and dewpoint is not None:
+                    rh = rh_from_temp_and_dewpoint_k(temp, dewpoint)
+                    row.update(
+                        feature_metrics(
+                            rh_prefix,
+                            rh,
+                            grid_row=grid_row,
+                            grid_col=grid_col,
+                            north_is_first=north_is_first,
+                            include_legacy_aliases=include_legacy_aliases,
+                        )
+                    )
+                    if write_provenance:
+                        provenance_rows[rh_prefix] = derived_provenance_row(
+                            task_key=task.key,
+                            row_identity=provenance_identity(row),
+                            feature_name=rh_prefix,
+                            units="%",
+                            derivation_method="relative_humidity_from_temperature_and_dewpoint",
+                            source_feature_names=[f"tmp_{level}mb_k", f"dpt_{level}mb_k_support"],
+                            notes=f"Derived because direct {rh_prefix} was not present.",
+                        )
+
+        add_temperature_conversions(row, provenance_rows if write_provenance else {})
+        add_wind_derivatives(
+            row,
+            provenance_rows if write_provenance else {},
+            support_arrays,
+            grid_row=grid_row,
+            grid_col=grid_col,
+            north_is_first=north_is_first,
+        )
+        diagnostics["timing_row_build_seconds"] = float(diagnostics.get("timing_row_build_seconds", 0.0)) + (
+            time.perf_counter() - row_build_started_at
+        )
+        diagnostics["binary_parsed_array_count"] = int(parsed_array_count)
+        diagnostics["binary_skipped_array_count"] = int(skipped_array_count)
+
+        missing_fields = missing_prefixes_from_row(row, task=task)
+        row["missing_optional_any"] = bool(missing_fields)
+        row["missing_optional_fields_count"] = len(missing_fields)
+        for prefix in missing_fields:
+            if write_provenance:
+                provenance_rows.setdefault(
+                    prefix,
+                    missing_provenance_row(
+                        task_key=task.key,
+                        row_identity=provenance_identity(row),
+                        feature_name=prefix,
+                    ),
+                )
+
+        validate_required_columns(row, CANONICAL_WIDE_COLUMNS, label=f"HRRR wide row {task.key}")
+        return TaskResult(
+            True,
+            task.key,
+            row,
+            sorted(provenance_rows.values(), key=lambda item: item["feature_name"]) if write_provenance else [],
+            missing_fields,
+            None,
+            diagnostics,
+        )
+    except Exception as exc:
+        diagnostics["last_error_type"] = type(exc).__name__
+        diagnostics["last_error_message"] = str(exc)
+        return TaskResult(False, task.key, None, [], [], f"wgrib2 binary extraction failed: {exc}", diagnostics)
 
 
 def build_task_result_from_open_datasets(
@@ -2529,6 +3020,17 @@ def process_reduced_grib(
             filter_inventory_to_task_step=filter_inventory_to_task_step,
             write_provenance=write_provenance,
         )
+    if RUNTIME_OPTIONS.extract_method in {"wgrib2-bin", "wgrib2-ijbox-bin"}:
+        return build_task_result_with_wgrib2_bin(
+            reduced_path,
+            reduced_inventory,
+            task,
+            grib_url,
+            diagnostics=diagnostics,
+            include_legacy_aliases=include_legacy_aliases,
+            filter_inventory_to_task_step=filter_inventory_to_task_step,
+            write_provenance=write_provenance,
+        )
     diagnostics["extract_method"] = "cfgrib"
     local_index_dir = cfgrib_index_dir
     created_index_dir = False
@@ -2716,7 +3218,9 @@ def reduce_grib2_for_task(
     raw_manifest_path: Path,
 ) -> CropExecutionResult:
     del raw_manifest_path
-    return reduce_grib2(wgrib2_path, raw_path, reduced_path, task=task)
+    if callable_accepts_keyword(reduce_grib2, "task"):
+        return normalize_crop_execution_result(reduce_grib2(wgrib2_path, raw_path, reduced_path, task=task))
+    return normalize_crop_execution_result(reduce_grib2(wgrib2_path, raw_path, reduced_path))
 
 
 def cycle_key_for_task(task: TaskSpec) -> tuple[str, int]:
@@ -2750,12 +3254,23 @@ def reduce_grib2_for_batch(
     task: TaskSpec,
 ) -> tuple[list[str], set[str], float, float, float, CropExecutionResult]:
     concat_seconds = concatenate_files(raw_paths, batch_raw_path)
-    crop_result = reduce_grib2(
-        wgrib2_path,
-        batch_raw_path,
-        batch_reduced_path,
-        task=task,
-    )
+    if callable_accepts_keyword(reduce_grib2, "task"):
+        crop_result = normalize_crop_execution_result(
+            reduce_grib2(
+                wgrib2_path,
+                batch_raw_path,
+                batch_reduced_path,
+                task=task,
+            )
+        )
+    else:
+        crop_result = normalize_crop_execution_result(
+            reduce_grib2(
+                wgrib2_path,
+                batch_raw_path,
+                batch_reduced_path,
+            )
+        )
     return (
         crop_result.selected_lines,
         crop_result.matched_names,
@@ -3007,28 +3522,16 @@ def _process_task_once(
             active_phase="open",
             details="process_reduced_grib",
         ):
-            try:
-                result = process_reduced_grib(
-                    reduced_path,
-                    reduced_inventory,
-                    task,
-                    grib_url,
-                    cfgrib_index_dir=cfgrib_index_dir,
-                    diagnostics=diagnostics,
-                    include_legacy_aliases=include_legacy_aliases,
-                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
-                )
-            except TypeError as exc:
-                if "cfgrib_index_dir" not in str(exc) and "diagnostics" not in str(exc):
-                    raise
-                result = process_reduced_grib(
-                    reduced_path,
-                    reduced_inventory,
-                    task,
-                    grib_url,
-                    include_legacy_aliases=include_legacy_aliases,
-                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
-                )
+            result = process_reduced_grib_compat(
+                reduced_path,
+                reduced_inventory,
+                task,
+                grib_url,
+                cfgrib_index_dir=cfgrib_index_dir,
+                diagnostics=diagnostics,
+                include_legacy_aliases=include_legacy_aliases,
+                write_provenance=not RUNTIME_OPTIONS.skip_provenance,
+            )
     except Exception as exc:
         diagnostics["last_error_type"] = type(exc).__name__
         diagnostics["last_error_message"] = str(exc)
@@ -4200,13 +4703,121 @@ def _run_month_batch_cycle(
                 if reporter is not None:
                     reporter.set_worker_attempt(reduce_worker_id, attempt=reduce_attempt, max_attempts=retry_policy.max_attempts)
                 try:
-                    reduced_inventory, _, inventory_seconds, reduce_seconds, concat_seconds, crop_result = reduce_grib2_for_batch(
-                        wgrib2_path,
-                        [item.raw_path for item in ok_items if item.raw_path is not None],
-                        batch_raw_path,
-                        batch_reduced_path,
-                        task=first_task,
-                    )
+                    if RUNTIME_OPTIONS.extract_method == "wgrib2-ijbox-bin":
+                        concat_seconds = concatenate_files(
+                            [item.raw_path for item in ok_items if item.raw_path is not None],
+                            batch_raw_path,
+                        )
+                        inventory_started_at = time.perf_counter()
+                        reduced_inventory = inventory_for_grib(wgrib2_path, batch_raw_path)
+                        inventory_seconds = time.perf_counter() - inventory_started_at
+                        try:
+                            context_started_at = time.perf_counter()
+                            ijbox_entry, ijbox_cache_hit, ijbox_latitude, ijbox_longitude = crop_grid_cache_entry_from_eccodes(
+                                grib_path=batch_raw_path,
+                                cache_anchor_path=batch_raw_path,
+                                bounds=REGIONAL_CROP_BOUNDS,
+                            )
+                            validation_started_at = time.perf_counter()
+                            load_wgrib2_binary_arrays(
+                                wgrib2_path=wgrib2_path,
+                                reduced_path=batch_raw_path,
+                                reduced_inventory=reduced_inventory,
+                                ij_box=ijbox_entry.ij_box,
+                                ijbox_latitude=ijbox_latitude,
+                                ijbox_longitude=ijbox_longitude,
+                                ijbox_cache_entry=ijbox_entry,
+                                ijbox_cache_hit=ijbox_cache_hit,
+                            )
+                            reduce_seconds = time.perf_counter() - validation_started_at
+                            crop_result = CropExecutionResult(
+                                selected_lines=reduced_inventory,
+                                matched_names=select_inventory_lines(reduced_inventory, task=first_task)[1],
+                                inventory_seconds=inventory_seconds,
+                                reduce_seconds=0.0,
+                                command="concat selected GRIB messages; validated -ijbox binary dump",
+                                method_used="ijbox_bin_direct",
+                                crop_grid_cache_key=ijbox_entry.signature,
+                                crop_grid_cache_hit=bool(ijbox_cache_hit),
+                                crop_ij_box=ijbox_entry.ij_box.as_text(),
+                                crop_wgrib2_threads=1,
+                                crop_fallback_reason=None,
+                            )
+                            batch_reduced_path = batch_raw_path
+                            for item in ok_items:
+                                item.diagnostics["direct_ijbox_validation_seconds"] = time.perf_counter() - validation_started_at
+                                item.diagnostics["direct_ijbox_context_seconds"] = time.perf_counter() - context_started_at
+                                item.diagnostics["direct_ijbox_fallback_to_reduced"] = False
+                                item.diagnostics["direct_ijbox_fallback_reason"] = None
+                        except Exception as direct_exc:
+                            fallback_reason = str(direct_exc)
+                            if callable_accepts_keyword(reduce_grib2_for_batch, "task"):
+                                batch_reduce_result = reduce_grib2_for_batch(
+                                    wgrib2_path,
+                                    [item.raw_path for item in ok_items if item.raw_path is not None],
+                                    batch_raw_path,
+                                    batch_reduced_path,
+                                    task=first_task,
+                                )
+                            else:
+                                batch_reduce_result = reduce_grib2_for_batch(
+                                    wgrib2_path,
+                                    [item.raw_path for item in ok_items if item.raw_path is not None],
+                                    batch_raw_path,
+                                    batch_reduced_path,
+                                )
+                            if len(batch_reduce_result) == 6:
+                                reduced_inventory, _, inventory_seconds, reduce_seconds, concat_seconds, crop_result = batch_reduce_result
+                                crop_result = normalize_crop_execution_result(crop_result)
+                            elif len(batch_reduce_result) == 5:
+                                reduced_inventory, matched_names, inventory_seconds, reduce_seconds, concat_seconds = batch_reduce_result
+                                crop_result = normalize_crop_execution_result(
+                                    (reduced_inventory, matched_names, inventory_seconds, reduce_seconds)
+                                )
+                            else:
+                                raise TypeError(f"Unexpected batch reduce result length: {len(batch_reduce_result)}")
+                            crop_result = CropExecutionResult(
+                                selected_lines=crop_result.selected_lines,
+                                matched_names=crop_result.matched_names,
+                                inventory_seconds=crop_result.inventory_seconds,
+                                reduce_seconds=crop_result.reduce_seconds,
+                                command=crop_result.command,
+                                method_used=crop_result.method_used,
+                                crop_grid_cache_key=crop_result.crop_grid_cache_key,
+                                crop_grid_cache_hit=crop_result.crop_grid_cache_hit,
+                                crop_ij_box=crop_result.crop_ij_box,
+                                crop_wgrib2_threads=crop_result.crop_wgrib2_threads,
+                                crop_fallback_reason=f"direct_ijbox_failed: {fallback_reason}",
+                            )
+                            for item in ok_items:
+                                item.diagnostics["direct_ijbox_fallback_to_reduced"] = True
+                                item.diagnostics["direct_ijbox_fallback_reason"] = fallback_reason
+                        break
+                    if callable_accepts_keyword(reduce_grib2_for_batch, "task"):
+                        batch_reduce_result = reduce_grib2_for_batch(
+                            wgrib2_path,
+                            [item.raw_path for item in ok_items if item.raw_path is not None],
+                            batch_raw_path,
+                            batch_reduced_path,
+                            task=first_task,
+                        )
+                    else:
+                        batch_reduce_result = reduce_grib2_for_batch(
+                            wgrib2_path,
+                            [item.raw_path for item in ok_items if item.raw_path is not None],
+                            batch_raw_path,
+                            batch_reduced_path,
+                        )
+                    if len(batch_reduce_result) == 6:
+                        reduced_inventory, _, inventory_seconds, reduce_seconds, concat_seconds, crop_result = batch_reduce_result
+                        crop_result = normalize_crop_execution_result(crop_result)
+                    elif len(batch_reduce_result) == 5:
+                        reduced_inventory, matched_names, inventory_seconds, reduce_seconds, concat_seconds = batch_reduce_result
+                        crop_result = normalize_crop_execution_result(
+                            (reduced_inventory, matched_names, inventory_seconds, reduce_seconds)
+                        )
+                    else:
+                        raise TypeError(f"Unexpected batch reduce result length: {len(batch_reduce_result)}")
                     break
                 except Exception as exc:
                     for item in ok_items:
@@ -4218,11 +4829,13 @@ def _run_month_batch_cycle(
                     raise
             batch_reduce_seconds = time.perf_counter() - reduce_started_at
             task_count = max(1, len(ok_items))
+            direct_without_reduced = RUNTIME_OPTIONS.extract_method == "wgrib2-ijbox-bin" and batch_reduced_path == batch_raw_path
             for item in ok_items:
                 item.batch_reduced_path = batch_reduced_path
                 item.batch_reduced_inventory = reduced_inventory
                 item.diagnostics["batch_raw_file_path"] = str(batch_raw_path)
-                item.diagnostics["batch_reduced_file_path"] = str(batch_reduced_path)
+                item.diagnostics["batch_reduced_file_path"] = None if direct_without_reduced else str(batch_reduced_path)
+                item.diagnostics["direct_ijbox_source_file_path"] = str(batch_raw_path) if RUNTIME_OPTIONS.extract_method == "wgrib2-ijbox-bin" else None
                 item.diagnostics["batch_lead_count"] = len(ok_items)
                 item.diagnostics["batch_concat_seconds"] = concat_seconds
                 item.diagnostics["batch_reduce_seconds"] = batch_reduce_seconds
@@ -4239,8 +4852,8 @@ def _run_month_batch_cycle(
                 item.diagnostics["crop_wgrib2_threads"] = crop_result.crop_wgrib2_threads
                 item.diagnostics["crop_fallback_reason"] = crop_result.crop_fallback_reason
                 item.diagnostics["retry_recovered"] = bool(item.diagnostics.get("retry_recovered")) or reduce_attempt > 1
-                item.diagnostics["reduced_file_path"] = str(batch_reduced_path)
-                item.diagnostics["reduced_file_size"] = batch_reduced_path.stat().st_size if batch_reduced_path.exists() else None
+                item.diagnostics["reduced_file_path"] = None if direct_without_reduced else str(batch_reduced_path)
+                item.diagnostics["reduced_file_size"] = None if direct_without_reduced else (batch_reduced_path.stat().st_size if batch_reduced_path.exists() else None)
             if reporter is not None:
                 reporter.retire_worker(reduce_worker_id)
             return cycle_key, ok_items, batch_raw_path, batch_reduced_path, reduced_inventory
@@ -4279,7 +4892,7 @@ def _run_month_batch_cycle(
         group_datasets: list[tuple[GroupSpec, xr.Dataset]] = []
         results: list[TaskResult] = []
         try:
-            if RUNTIME_OPTIONS.extract_method == "eccodes":
+            if RUNTIME_OPTIONS.extract_method in {"eccodes", "wgrib2-bin", "wgrib2-ijbox-bin"}:
                 for item in ok_items:
                     extract_attempt = 1
                     item_extract_worker_id = f"batch_extract_{cycle_key[0]}T{cycle_key[1]:02d}_f{item.task.forecast_hour:02d}"
@@ -4383,7 +4996,8 @@ def _run_month_batch_cycle(
             shutil.rmtree(cfgrib_index_dir, ignore_errors=True)
 
             cleanup_started_at = time.perf_counter()
-            if not keep_reduced:
+            direct_ijbox_mode = RUNTIME_OPTIONS.extract_method == "wgrib2-ijbox-bin"
+            if not keep_reduced and (not direct_ijbox_mode or batch_reduced_path != batch_raw_path):
                 batch_reduced_path.unlink(missing_ok=True)
                 reduced_inventory_path(batch_reduced_path).unlink(missing_ok=True)
                 reduced_signature_path(batch_reduced_path).unlink(missing_ok=True)
@@ -4987,28 +5601,16 @@ def run_month(
             cfgrib_parent.mkdir(parents=True, exist_ok=True)
         cfgrib_index_dir = Path(tempfile.mkdtemp(prefix=f"hrrr_cfgrib_{task.forecast_hour:02d}_", dir=str(cfgrib_parent) if cfgrib_parent is not None else None))
         try:
-            try:
-                result = process_reduced_grib(
-                    item.reduced_path,
-                    item.reduced_inventory,
-                    task,
-                    item.grib_url,
-                    cfgrib_index_dir=cfgrib_index_dir,
-                    diagnostics=item.diagnostics,
-                    include_legacy_aliases=include_legacy_aliases,
-                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
-                )
-            except TypeError as exc:
-                if "cfgrib_index_dir" not in str(exc) and "diagnostics" not in str(exc):
-                    raise
-                result = process_reduced_grib(
-                    item.reduced_path,
-                    item.reduced_inventory,
-                    task,
-                    item.grib_url,
-                    include_legacy_aliases=include_legacy_aliases,
-                    write_provenance=not RUNTIME_OPTIONS.skip_provenance,
-                )
+            result = process_reduced_grib_compat(
+                item.reduced_path,
+                item.reduced_inventory,
+                task,
+                item.grib_url,
+                cfgrib_index_dir=cfgrib_index_dir,
+                diagnostics=item.diagnostics,
+                include_legacy_aliases=include_legacy_aliases,
+                write_provenance=not RUNTIME_OPTIONS.skip_provenance,
+            )
         finally:
             shutil.rmtree(cfgrib_index_dir, ignore_errors=True)
         cleanup_started_at = time.perf_counter()

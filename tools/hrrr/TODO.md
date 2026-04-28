@@ -1,101 +1,175 @@
-# HRRR Pipeline Optimization TODO
+# HRRR Binary Extraction TODO
 
-This TODO tracks optimization work for the KLGA overnight HRRR feature pipeline.
+This file is only for the new HRRR optimization path.
 
-Future agents: update these checkboxes as work is completed or intentionally deferred. If a task changes scope, edit the note under that task rather than leaving stale boxes behind.
+Future agents: update these checkboxes as work is completed or intentionally deferred. Do not add old completed phase history back into this file. The previous cfgrib/ecCodes/GRIB-repack paths are reference implementations for parity, not the optimization target.
 
-## Goal
+## Current Goal
 
-Make the HRRR overnight backfill materially faster without changing the settlement target or model contract:
+Build a new binary extraction path that avoids the current expensive sequence:
 
-- target remains final KLGA daily high for the `America/New_York` local station day
+- selected-record download
+- GRIB-to-GRIB crop/repack with `-small_grib` or `-ijsmall_grib`
+- Python GRIB decode through cfgrib/ecCodes full-array reads
+
+The target path should use `wgrib2` to dump selected HRRR messages directly to binary arrays, then compute KLGA nearest/neighborhood/crop stats in NumPy.
+
+Keep the weather/model contract unchanged:
+
+- settlement target remains final KLGA daily high
+- station day remains `America/New_York`
 - overnight cutoff remains `00:05 America/New_York`
-- core output remains a stable weather target and `hrrr.overnight.parquet` summary features
-- lag/revision cycles should do only the work required for revision features
+- summary output remains the HRRR overnight feature table
+- cfgrib/ecCodes outputs are parity references only
 
-## Phase 1: Low-Risk Production Wins
+## Why This Is The Lead
 
-- [x] Port the NBM crop layer into HRRR.
-  - Add cached `-ijsmall_grib` support for stable HRRR grids.
-  - Keep `-small_grib` fallback for validation failures or unsupported grids.
-  - Add `-set_grib_type` support.
-  - Add crop-specific `OMP_NUM_THREADS` / `OMP_WAIT_POLICY` handling.
-  - Record crop method, grid cache key, crop seconds, and fallback reason in diagnostics.
+Local smoke on cached `2023-02-04T05Z` reduced multi-forecast file:
 
-- [x] Add HRRR `--summary-profile overnight`.
-  - Anchor cycle keeps the fields needed for the full overnight summary.
-  - Lag/revision cycles fetch and extract only fields needed by `build_revision_features()`.
-  - Keep an escape hatch such as `--summary-profile full` or `--full-raw` for diagnostics.
-  - Status: implemented as a task-aware field profile. Under `--summary-profile overnight`, anchor tasks use the full field set and non-anchor revision tasks use the revision-only field set.
+- current ecCodes extractor: `23.72s` for 19 forecast-hour tasks
+- `wgrib2 -no_header -bin ...` over the same reduced GRIB: about `0.33s` with `OMP_NUM_THREADS=1`
+- NumPy read of the resulting `151 MB` binary: about `0.26s`
 
-- [x] Add HRRR `--skip-provenance`.
-  - Skip provenance row construction and provenance parquet writes for production overnight backfills.
-  - Preserve current provenance behavior by default.
-  - Record `provenance_written=false` in manifests when skipped.
+This is the first optimization lead that attacks the real bottleneck: GRIB repacking plus Python full-array GRIB decode.
 
-- [x] Fix batch timing diagnostics.
-  - Store cycle-level reduce/open timings separately from task-level timings.
-  - Avoid stamping full cycle-level cfgrib open seconds onto every task as if it were per-task cost.
-  - Keep legacy-compatible apportioned timing fields if existing analysis scripts need them.
+## Step 1: Reduced-GRIB Binary Extractor
 
-## Phase 2: Narrow Lag-Cycle Work
+- [x] Add opt-in extraction backend `--extract-method wgrib2-bin`.
+  - Keep current `cfgrib` and `eccodes` paths as reference implementations.
+  - Do not make `wgrib2-bin` the default until parity and representative benchmarks pass.
 
-- [x] Define an explicit lag-cycle field plan.
-  - Required revision bases:
-    - `hrrr_temp_2m_day_max_k`
-    - `hrrr_temp_2m_09_local_k`
-    - `hrrr_temp_2m_12_local_k`
-    - `hrrr_temp_2m_15_local_k`
-    - `hrrr_tcdc_day_mean_pct`
-    - `hrrr_dswrf_day_max_w_m2`
-    - `hrrr_pwat_day_mean_kg_m2`
-    - `hrrr_hpbl_day_max_m`
-    - `hrrr_mslp_day_mean_pa`
+- [x] Start from the current reduced multi-forecast GRIB.
+  - Input: existing `selected_multiforecast.reduced.grib2`.
+  - Run `wgrib2 selected_multiforecast.reduced.grib2 -no_header -bin <tmp.bin>` or equivalent.
+  - Use `OMP_NUM_THREADS=1` unless a benchmark proves otherwise.
+  - Preserve the reduced inventory used to create the binary dump.
 
-- [x] Use the lag-cycle field plan during selected-record byte-range fetch.
-  - Do not download broad HRRR fields for lag cycles when only revision bases are needed.
-  - Preserve current behavior for anchor cycles and full diagnostic runs.
+- [x] Parse the binary dump in Python.
+  - Determine dtype, endian, array shape, and message count from wgrib2/grid metadata.
+  - Parse arrays by reduced-inventory message order.
+  - Map each binary array back to the same feature prefix used by the current HRRR row builder.
+  - Handle multi-forecast files and forecast-hour filtering without relying on cfgrib coordinates.
 
-- [x] Use the lag-cycle field plan during reduce/extract.
-  - Avoid opening cfgrib groups that cannot contribute to revision features.
-  - Avoid provenance and derived-field work that is irrelevant to revision deltas.
+- [x] Reuse existing row math.
+  - Reuse `feature_metrics()`.
+  - Reuse temperature conversion logic.
+  - Reuse derived RH logic.
+  - Reuse derived wind speed/direction logic.
+  - Reuse summary row generation.
 
-- [x] Add parity tests for anchor-plus-lag summary output.
-  - Compare old full lag-cycle extraction against narrow lag-cycle extraction for a small fixed date window.
-  - Assert unchanged final overnight summary columns and values, except expected diagnostics/provenance differences.
-  - Status: focused parity smoke compared the six revision raw fields for `2026-04-11__2026-04-11_t04_f00` between full extraction and narrow revision extraction; all matched exactly.
+- [x] Add diagnostics.
+  - `extract_method=wgrib2-bin`
+  - binary dump command
+  - binary dump seconds
+  - binary read seconds
+  - row-build seconds
+  - binary byte count
+  - dtype/endian
+  - grid shape
+  - inventory message count
+  - parsed array count
+  - skipped/unknown message count
 
-## Phase 3: Faster Extraction Prototype
+## Step 2: Parity Gates
 
-- [x] Prototype a direct `wgrib2` or ecCodes station-summary extractor.
-  - Bypass cfgrib/xarray for the production summary path.
-  - Extract only KLGA nearest point and required neighborhood/crop stats.
-  - Compute daily summaries directly from selected messages.
-  - Keep current cfgrib path as the reference implementation until parity is proven.
-  - Status: implemented as opt-in `--extract-method eccodes`. It iterates GRIB messages directly with ecCodes, builds the same wide-row metrics, supports batch-cycle extraction, and keeps `--extract-method cfgrib` as the default reference path.
+- [x] Add a focused parity command.
+  - Added `tools/hrrr/check_hrrr_wgrib2_bin_parity.py`.
+  - Compares `wgrib2-bin` against cfgrib and/or ecCodes reference rows.
+  - Asserts task/message alignment using reduced inventory order.
+  - Writes a JSON report and exits nonzero on parity failure.
 
-- [x] Benchmark direct extraction against current cfgrib extraction.
-  - Use the same dates, cycles, fields, crop bounds, and worker settings.
-  - Compare wall time, CPU time, memory pressure, and output parity.
-  - Record results in HRRR diagnostics or a short benchmark note.
-  - Status: extraction-only benchmark on cached reduced GRIB `2023-02-04T05Z`, forecast hours 0-18, found cfgrib total 26.32s vs ecCodes total 23.72s, a 1.11x speedup. Separate-process resource runs measured cfgrib at 25.73s wall, 25.68s CPU, 190 MB max RSS and ecCodes at 23.75s wall, 23.61s CPU, 149 MB max RSS. Row parity matched within small floating-point tolerance after fixing ecCodes APCP duplicate-message handling; max numeric difference was 0.0001202 across 17,328 compared values.
+- [ ] Run the focused parity command for cached `2023-02-04T05Z`.
+  - Use forecast hours `0-18`.
+  - Record the JSON report path and max numeric drift.
+  - Status: not run in this step because that cached artifact was not available in the current local scratch path.
 
-## Phase 4: Cloud-Native Prototype
+- [x] Verify row-level parity on available local smoke artifacts.
+  - Compare all shared numeric wide-row columns with documented tolerances.
+  - Compare missing-field lists.
+  - Compare grid identity: row/col, nearest grid lat/lon, crop metadata.
+  - Verify forecast-hour filtering in multi-forecast batch files.
+  - Verify duplicate-message handling, especially APCP.
+  - Verify derived RH and wind fields.
+  - Status: passed vs ecCodes at `1e-4` tolerance for `2026-04-11T04Z f00` narrow revision artifact and full 42-message artifact.
+  - Reports: `/var/folders/yy/nsr07t_14b118f00wc0gd4km0000gn/T/hrrr_wgrib2_bin_parity_revision.json` and `/var/folders/yy/nsr07t_14b118f00wc0gd4km0000gn/T/hrrr_wgrib2_bin_parity_full.json`.
+  - Max row drift: `3.4332275390625e-05` narrow, `6.201003812833505e-05` full.
 
-- [ ] Prototype HRRR-Zarr access for the 2023-2026 training window.
-  - Verify required variables, levels, forecast hours, and archive coverage.
-  - Confirm KLGA point extraction and local-day summaries match the current GRIB path.
-  - Keep GRIB path as fallback for gaps.
-  - Status: started with `tools/hrrr/probe_hrrr_zarr.py`, a metadata-only public S3 probe that maps the current HRRR feature contract to `hrrrzarr` paths and checks retained forecast-hour coverage. Initial probes for `2023-02-04` and `2026-04-11` found recurring gaps: missing upper-level direct `RH`, missing upper-level direct `SPFH`, missing `925mb/HGT`, and missing `f18` coverage on the latest non-full overnight cycle. See `tools/hrrr/ZARR.md`.
+- [x] Verify summary-level parity on available local smoke artifacts.
+  - Run at least one narrow `--summary-profile overnight` smoke.
+  - Run at least one full-profile smoke.
+  - Confirm `hrrr.overnight.parquet` values are unchanged within expected numeric tolerance.
+  - Status: passed vs ecCodes at `1e-4` tolerance for the same narrow and full `2026-04-11T04Z f00` artifacts.
+  - Max summary drift: `0.0` narrow, `4.87795949197789e-05` full.
 
-- [ ] Evaluate Kerchunk only if HRRR-Zarr is insufficient.
-  - Use Kerchunk to avoid repeated GRIB scans while preserving cloud/range access.
-  - Promote only if it is simpler or faster than the direct extractor for this station-summary workload.
-  - Status: started with `tools/hrrr/probe_hrrr_kerchunk.py`, which uses the canonical overnight task planner, records existing `.idx` selected-record byte-range footprint, and times Kerchunk reference generation for the corresponding remote GRIB files. Kerchunk is now a development/prototype dependency, but it is not a production extraction backend. On 2026-04-27, a one-task `2023-02-04` full-file scan took 90.51s for 170 message references, while the same task's current `.idx` path selected 6 records in 6 merged byte ranges with `.idx` fetch/parse around 0.11s before range download. This is not promising unless durable reference reuse pays back the scan cost.
+## Step 3: Bigger Win, Skip Reduced GRIB Creation
+
+If Step 1 works, the bigger win is next:
+
+- input: uncropped `selected_multiforecast.grib2`
+- use cached full-grid `ijbox`
+- skip reduced GRIB creation entirely
+
+Implementation tasks:
+
+- [x] Add cached full-grid `ijbox` support.
+  - Infer the full-grid i/j rectangle needed for KLGA nearest/neighborhood/crop metrics.
+  - Cache by HRRR grid signature and crop/stat bounds.
+  - Validate grid shape and orientation against reference output.
+  - Status: implemented for the opt-in `wgrib2-ijbox-bin` path using the existing crop-grid cache format and an ecCodes full-grid lat/lon context.
+
+- [x] Dump binary arrays directly from the uncropped selected multi-forecast GRIB.
+  - Input: `selected_multiforecast.grib2` from the existing `.idx` byte-range downloader.
+  - Run `wgrib2 selected_multiforecast.grib2 -ijbox ... -no_header -bin <tmp.bin>` or equivalent.
+  - Avoid `-small_grib` and `-ijsmall_grib`.
+  - Avoid writing any reduced GRIB output.
+  - Status: implemented as `--extract-method wgrib2-ijbox-bin` in batch-cycle mode. Non-batch mode still goes through the existing per-task reduce stage.
+
+- [x] Add fallback behavior.
+  - If direct `-ijbox ... -bin` fails validation, fall back to current reduced-GRIB path.
+  - Record fallback reason in diagnostics.
+  - Do not silently mix binary and reduced-GRIB outputs without diagnostics.
+  - Status: batch-cycle reduction validates one direct `ijbox` binary dump per cycle. On validation failure it builds the reduced GRIB and sets `direct_ijbox_fallback_to_reduced=true` plus `direct_ijbox_fallback_reason`.
+
+- [x] Add direct-path parity support.
+  - `tools/hrrr/check_hrrr_wgrib2_bin_parity.py` now supports `--candidate-method wgrib2-ijbox-bin` and a separate `--reference-grib`.
+  - Local parity passed for uncropped `2026-04-11T04Z f00` selected GRIB against the reduced ecCodes reference at `1e-4` tolerance.
+  - Report: `/var/folders/yy/nsr07t_14b118f00wc0gd4km0000gn/T/hrrr_wgrib2_ijbox_bin_parity_full.json`.
+
+## Step 4: Benchmarks
+
+- [x] Add a reusable binary-extractor benchmark harness.
+  - Added `tools/hrrr/benchmark_hrrr_binary_extractors.py`.
+  - Compares `cfgrib`, `eccodes`, reduced `wgrib2-bin`, and direct `wgrib2-ijbox-bin` on cached GRIB artifacts.
+  - Writes `benchmark_runs.json`, `benchmark_runs.csv`, and `benchmark_summary.json`.
+  - Records wall time, CPU time, process max RSS, binary temp bytes observed, extractor timing breakouts, and parity drift.
+
+- [ ] Benchmark reduced-GRIB `wgrib2-bin`.
+  - Same cached `2023-02-04T05Z` multi-forecast file.
+  - Same forecast hours `0-18`.
+  - Compare against cfgrib and ecCodes references.
+  - Record wall time, CPU time, max RSS, temp bytes, and output parity.
+  - Smoke status: passed on available `2026-04-11T04Z f00` artifact.
+  - Smoke report: `/tmp/hrrr_binary_benchmark_smoke_20260428T080315Z/benchmark_summary.json`.
+  - Smoke result: ecCodes `0.348s`, reduced `wgrib2-bin` `0.080s`, max row drift `6.201003812833505e-05`.
+
+- [ ] Benchmark direct `-ijbox ... -bin`.
+  - Use the uncropped selected multi-forecast GRIB.
+  - Include time saved by skipping reduced GRIB creation.
+  - Break out download, binary dump, binary read, row-build, and summary timings.
+  - Smoke status: passed on available uncropped `2026-04-11T04Z f00` selected artifact.
+  - Smoke report: `/tmp/hrrr_binary_benchmark_smoke_20260428T080315Z/benchmark_summary.json`.
+  - Smoke result: direct `wgrib2-ijbox-bin` `0.527s`, max row drift `6.201003812833505e-05`.
+
+- [ ] Benchmark a representative overnight window.
+  - Use the production-ish overnight settings.
+  - Include anchor and lag/revision cycles.
+  - Confirm the end-to-end monthly or multi-day backfill is materially faster.
 
 ## Definition Of Done
 
-- [ ] Monthly overnight HRRR backfill is faster on a representative month.
-- [ ] `hrrr.overnight.parquet` values are unchanged within expected numeric tolerance.
-- [ ] Diagnostics distinguish download, crop/reduce, cfgrib/open, row build, provenance, and summary costs.
-- [ ] Production command examples are documented in `tools/hrrr/README.md`.
+- [x] `--extract-method wgrib2-bin` exists and is opt-in.
+- [x] Reduced-GRIB binary extraction passes row and summary parity.
+- [x] Direct `-ijbox ... -bin` path skips reduced GRIB creation and passes parity.
+- [x] Diagnostics clearly separate download, binary dump, binary read, row build, fallback, and summary costs.
+- [ ] Representative overnight backfill is faster.
+- [x] HRRR overnight output values are unchanged within expected numeric tolerance.
