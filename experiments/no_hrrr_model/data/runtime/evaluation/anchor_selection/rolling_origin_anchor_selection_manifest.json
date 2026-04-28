@@ -1,0 +1,50 @@
+{
+  "anchor_candidate_count": 15,
+  "built_at_utc": "2026-04-28T09:51:09.414889+00:00",
+  "feature_count": 180,
+  "features_path": "experiments/no_hrrr_model/data/runtime/training/training_features_overnight_no_hrrr_normalized.parquet",
+  "fold_metrics_path": "experiments/no_hrrr_model/data/runtime/evaluation/anchor_selection/rolling_origin_anchor_selection_fold_metrics.csv",
+  "leakage_check": {
+    "finding_count": 0,
+    "status": "ok"
+  },
+  "metadata_path": "experiments/no_hrrr_model/data/runtime/evaluation/anchor_selection/rolling_origin_anchor_selection_anchor_metadata.csv",
+  "model_candidate": {
+    "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+    "description": "Very-regularized baseline with stronger leaf-size regularization.",
+    "num_boost_round": 350,
+    "params": {
+      "bagging_fraction": 0.7,
+      "bagging_freq": 1,
+      "feature_fraction": 0.7,
+      "lambda_l1": 0.2,
+      "lambda_l2": 5.0,
+      "learning_rate": 0.025,
+      "max_depth": 3,
+      "min_data_in_leaf": 70,
+      "num_leaves": 7
+    }
+  },
+  "output_dir": "experiments/no_hrrr_model/data/runtime/evaluation/anchor_selection",
+  "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/anchor_selection/rolling_origin_anchor_selection_predictions.parquet",
+  "selected_anchor_candidate_id": "segmented_disagreement_train_mae",
+  "selected_by": [
+    "weighted_mean_event_bin_nll",
+    "weighted_mean_degree_ladder_nll"
+  ],
+  "split_count": 2,
+  "splits": [
+    {
+      "train_end": "2023-12-31",
+      "valid_end": "2024-12-31",
+      "valid_start": "2024-01-01"
+    },
+    {
+      "train_end": "2024-12-31",
+      "valid_end": "2025-12-31",
+      "valid_start": "2025-01-01"
+    }
+  ],
+  "status": "ok",
+  "summary_path": "experiments/no_hrrr_model/data/runtime/evaluation/anchor_selection/rolling_origin_anchor_selection_summary.csv"
+}

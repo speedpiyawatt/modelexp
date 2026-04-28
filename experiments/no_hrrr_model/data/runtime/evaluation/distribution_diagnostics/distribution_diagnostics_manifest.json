@@ -1,0 +1,19 @@
+{
+  "built_at_utc": "2026-04-28T10:10:37.266471+00:00",
+  "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+  "crossing_candidate_summary_path": "experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/quantile_crossing_candidate_summary.csv",
+  "crossing_diagnostics_path": "experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/quantile_crossing_diagnostics.csv",
+  "crossing_penalty_weight": 0.1,
+  "distribution_method_comparison_path": "experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/distribution_method_comparison.csv",
+  "distribution_test_row_count": 365,
+  "distribution_test_valid_start": "2025-01-01",
+  "monotone_safety_guard": "raw quantile crossing is diagnosed here; prediction/evaluation outputs use monotone rearrangement via cumulative maximum before ladder construction.",
+  "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet",
+  "quantile_calibration_manifest_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json",
+  "selected_by": [
+    "event_bin_nll",
+    "degree_ladder_nll"
+  ],
+  "selected_distribution_method_id": "normal_iqr",
+  "status": "ok"
+}

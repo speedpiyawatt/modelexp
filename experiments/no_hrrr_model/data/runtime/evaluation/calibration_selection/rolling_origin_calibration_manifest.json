@@ -1,0 +1,153 @@
+{
+  "built_at_utc": "2026-04-28T09:59:38.185320+00:00",
+  "calibration_row_count": 364,
+  "calibration_valid_end": "2024-12-31",
+  "candidate_id": "very_regularized_min_leaf70_lgbm_350",
+  "methods": {
+    "conformal_intervals": {
+      "config": {
+        "interval_adjustments_f": {
+          "q05_q95": 0.6163948601333402,
+          "q10_q90": 0.4750772591955439,
+          "q25_q75": 0.23940569441290904
+        },
+        "median_offsets_f": {
+          "q05": -1.1944952843460979,
+          "q10": -0.6606466937114085,
+          "q25": -0.4892606737864078,
+          "q50": 0.015120083018835828,
+          "q75": -0.07212418203582516,
+          "q90": 0.27164325016444657,
+          "q95": 0.28338099158194785
+        }
+      },
+      "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_predictions_conformal_intervals_test.parquet"
+    },
+    "disagreement_offsets": {
+      "config": {
+        "global_offsets_f": {
+          "q05": -1.1944952843460979,
+          "q10": -0.6606466937114085,
+          "q25": -0.4892606737864078,
+          "q50": 0.015120083018835828,
+          "q75": -0.07212418203582516,
+          "q90": 0.27164325016444657,
+          "q95": 0.28338099158194785
+        },
+        "min_segment_rows": 60,
+        "segment_counts": {
+          "2_to_5f": 56,
+          "5f_or_more": 1,
+          "under_2f": 307
+        },
+        "segment_name": "disagreement",
+        "segment_offsets_f": {
+          "under_2f": {
+            "q05": -1.0734417074514284,
+            "q10": -0.7696784214455618,
+            "q25": -0.5710313194907073,
+            "q50": -0.02892583080931388,
+            "q75": -0.05174485889705949,
+            "q90": 0.24450067784279259,
+            "q95": 0.2168509590005168
+          }
+        }
+      },
+      "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_predictions_disagreement_offsets_test.parquet"
+    },
+    "global_offsets": {
+      "config": {
+        "offsets_f": {
+          "q05": -1.1944952843460979,
+          "q10": -0.6606466937114085,
+          "q25": -0.4892606737864078,
+          "q50": 0.015120083018835828,
+          "q75": -0.07212418203582516,
+          "q90": 0.27164325016444657,
+          "q95": 0.28338099158194785
+        }
+      },
+      "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_predictions_global_offsets_test.parquet"
+    },
+    "month_offsets": {
+      "config": {
+        "global_offsets_f": {
+          "q05": -1.1944952843460979,
+          "q10": -0.6606466937114085,
+          "q25": -0.4892606737864078,
+          "q50": 0.015120083018835828,
+          "q75": -0.07212418203582516,
+          "q90": 0.27164325016444657,
+          "q95": 0.28338099158194785
+        },
+        "min_segment_rows": 60,
+        "segment_counts": {
+          "month_01": 31,
+          "month_02": 29,
+          "month_03": 31,
+          "month_04": 30,
+          "month_05": 31,
+          "month_06": 30,
+          "month_07": 31,
+          "month_08": 31,
+          "month_09": 30,
+          "month_10": 31,
+          "month_11": 28,
+          "month_12": 31
+        },
+        "segment_name": "month",
+        "segment_offsets_f": {}
+      },
+      "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_predictions_month_offsets_test.parquet"
+    },
+    "season_offsets": {
+      "config": {
+        "global_offsets_f": {
+          "q05": -1.1944952843460979,
+          "q10": -0.6606466937114085,
+          "q25": -0.4892606737864078,
+          "q50": 0.015120083018835828,
+          "q75": -0.07212418203582516,
+          "q90": 0.27164325016444657,
+          "q95": 0.28338099158194785
+        },
+        "min_segment_rows": 60,
+        "segment_counts": {
+          "cool": 211,
+          "warm": 153
+        },
+        "segment_name": "season",
+        "segment_offsets_f": {
+          "cool": {
+            "q05": -0.5942391125342077,
+            "q10": -0.522967474900895,
+            "q25": -0.4578043172362847,
+            "q50": 0.06742808372781184,
+            "q75": 0.08501502086137336,
+            "q90": 0.2833481638991202,
+            "q95": 0.21780149675234028
+          },
+          "warm": {
+            "q05": -1.260965704729071,
+            "q10": -0.8353901830248076,
+            "q25": -0.5862996225121293,
+            "q50": -0.11591400707884247,
+            "q75": -0.1905539188258274,
+            "q90": -0.061572318341734086,
+            "q95": 0.32767196164326495
+          }
+        }
+      },
+      "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_predictions_season_offsets_test.parquet"
+    }
+  },
+  "predictions_path": "experiments/no_hrrr_model/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet",
+  "selected_by": [
+    "event_bin_nll",
+    "degree_ladder_nll"
+  ],
+  "selected_method_id": "global_offsets",
+  "status": "ok",
+  "test_row_count": 365,
+  "test_valid_start": "2025-01-01"
+}

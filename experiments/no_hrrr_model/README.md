@@ -95,6 +95,45 @@ Train residual quantile models:
 
 The training entrypoint trains LightGBM residual quantile models using `target_residual_f` on rows where `model_training_eligible=True`. It uses a chronological validation split and writes model artifacts plus manifests under `experiments/no_hrrr_model/data/runtime/models/`.
 
+## Current Phase 8 Runtime Defaults
+
+As of 2026-04-28, the prediction CLI uses these validated defaults when the corresponding runtime artifacts are present:
+
+- Model candidate: `very_regularized_min_leaf70_lgbm_350`, trained with fixed `350` boosting rounds and no inner early stopping.
+- Anchor policy: use `anchor_tmax_f` from the normalized feature row. In the current training artifacts this is still the 50/50 NBM/LAMP anchor; the Phase 3 segmented anchor was not promoted because the final residual models were not retrained against a deployable anchor policy.
+- Quantile calibration: selected `global_offsets` from `experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json`.
+- Distribution method: selected `normal_iqr` from `experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json`.
+- Ensemble: not promoted; the Phase 7 top-3 ensemble had only a tiny event-bin NLL gain and worse degree-ladder NLL/Brier.
+- Ladder reliability calibration: not promoted by default because it was fit on the interpolation-tail ladder; keep it as an artifact until it is revalidated with `normal_iqr`.
+
+The required inference artifacts for this default stack are committed despite the broader runtime-data ignore rule:
+
+- `experiments/no_hrrr_model/data/runtime/models/feature_manifest.json`
+- `experiments/no_hrrr_model/data/runtime/models/residual_quantile_q*.txt`
+- `experiments/no_hrrr_model/data/runtime/models/training_manifest.json`
+- `experiments/no_hrrr_model/data/runtime/training/training_features_overnight_no_hrrr_normalized.manifest.json`
+- `experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json`
+- `experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json`
+
+Out-of-time `2025` validation metrics for the promoted probability stack:
+
+| Stack | Event-bin NLL | Event-bin Brier | Degree NLL | Degree Brier | Degree RPS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Uncalibrated interpolation ladder | `1.4275` | `0.6346` | `2.3442` | `0.8550` | `0.01063` |
+| Global quantile offsets + interpolation ladder | `1.3271` | `0.6222` | `2.1461` | `0.8403` | `0.01049` |
+| Global quantile offsets + `normal_iqr` ladder | `1.2712` | `0.6190` | `2.0287` | `0.8293` | `0.00975` |
+
+Exact rerun commands for the selection/calibration chain:
+
+```bash
+.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.rolling_origin_model_select
+.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.train_quantile_models
+.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.calibrate_rolling_origin
+.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.calibrate_ladder
+.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.distribution_diagnostics
+.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.ensemble_diagnostics
+```
+
 Evaluate model and baseline artifacts:
 
 ```bash
@@ -154,7 +193,15 @@ Generate a probability forecast from a normalized feature row:
 
 The prediction output includes residual quantiles, final-Tmax quantiles, expected final high, a 1°F internal probability ladder, and optional mapped event-bin probabilities. It does not include market prices or trading decisions.
 
-If `experiments/no_hrrr_model/data/runtime/evaluation/rolling_origin_calibration_manifest.json` exists, `predict.py` applies those out-of-sample-tested quantile offsets by default. Use `--calibration-path PATH` to choose a different calibration manifest.
+If `experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json` exists, `predict.py` applies those out-of-sample-tested quantile offsets by default. Use `--calibration-path PATH` to choose a different calibration manifest.
+
+Phase 8 prediction defaults use the selected calibration and distribution manifests when present. Use these flags for comparisons:
+
+- `--no-calibration` disables quantile offsets.
+- `--calibration-path PATH` selects a different calibration manifest.
+- `--distribution-method interpolation_tail` reproduces the older interpolation-tail ladder.
+- `--distribution-method normal_iqr` forces the promoted Phase 6 ladder even if the manifest is absent.
+- `--distribution-manifest-path PATH` selects a different distribution-selection manifest for `--distribution-method auto`.
 
 Build a normalized inference feature row from local source artifacts:
 

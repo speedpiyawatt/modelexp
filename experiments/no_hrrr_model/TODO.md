@@ -73,6 +73,7 @@ Scope guardrails:
   - Done 2026-04-28: implemented `experiments/no_hrrr_model/no_hrrr_model/rolling_origin_anchor_select.py` with fixed NBM-weight grid `0.0` through `1.0` by `0.1`. Verified with `.venv/bin/python -m pytest -q experiments/no_hrrr_model/tests` and `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.rolling_origin_anchor_select`. Outputs written under `experiments/no_hrrr_model/data/runtime/evaluation/anchor_selection/`.
   - Eval 2026-04-28: selected fixed anchor is `fixed_nbm_weight_0.6`, meaning `0.6 * NBM + 0.4 * LAMP`, by weighted event-bin NLL. Compared with current `fixed_nbm_weight_0.5`: event-bin NLL `1.6652 -> 1.6515` improved, event-bin Brier `0.6855 -> 0.6844` improved, degree-ladder NLL `2.6068 -> 2.6064` about flat, degree-ladder RPS `0.01135 -> 0.01128` improved, q50 MAE/RMSE `1.4265/2.0062 -> 1.4290/2.0088` slightly worse, q05-q95 coverage `0.7339 -> 0.7284` slightly worse. This is a probability-score improvement with small point-error and coverage tradeoffs.
   - Refresh 2026-04-28: after Phase 4 selected `very_regularized_lgbm_350`, reran anchor selection so artifacts use the new model default. New selected fixed anchor is `fixed_nbm_weight_0.7`, meaning `0.7 * NBM + 0.3 * LAMP`. Compared with the Phase 4 50/50 anchor: event-bin NLL `1.5667 -> 1.5518`, event-bin Brier `0.6670 -> 0.6601`, degree-ladder NLL `2.4605 -> 2.4372`, degree-ladder RPS `0.01131 -> 0.01120`, q50 MAE/RMSE `1.4581/2.0314 -> 1.4471/2.0246`, q05-q95 coverage `0.7805 -> 0.7929`.
+  - Refresh 2026-04-28: after structured Phase 4 expansion selected `very_regularized_min_leaf70_lgbm_350`, reran anchor selection. Selected anchor by weighted event-bin NLL is now `segmented_disagreement_train_mae`: event-bin NLL/Brier `1.5204/0.6613`, degree-ladder NLL/Brier/RPS `2.3893/0.8520/0.01137`, q50 MAE/RMSE `1.4697/2.0451`, q05-q95 coverage `0.8038`. The fixed `0.7` NBM anchor remains close: event-bin NLL/Brier `1.5365/0.6607`, degree-ladder NLL/RPS `2.3910/0.01128`, q50 MAE/RMSE `1.4667/2.0405`, q05-q95 coverage `0.8066`.
 
 - [x] Test simple segmented anchor weights.
   - Try month, warm/cool season, and high-vs-low `abs(nbm_minus_lamp_tmax_f)` segments.
@@ -94,6 +95,8 @@ Scope guardrails:
   - Avoid broad AutoML over the small training set.
   - Done 2026-04-28: expanded `experiments/no_hrrr_model/no_hrrr_model/rolling_origin_model_select.py` from the current baseline to a six-candidate constrained grid: `current_lgbm_fixed_250_no_inner_es`, `regularized_shallow_lgbm_300`, `regularized_moderate_lgbm_300`, `high_min_leaf_lgbm_250`, `very_regularized_lgbm_350`, and `slower_regularized_lgbm_350`. Tuned candidates cap depth, raise `min_data_in_leaf`, add `lambda_l1`, strengthen `lambda_l2`, and use feature/bagging subsampling.
   - Eval 2026-04-28: baseline current config before tuning had weighted event-bin NLL/Brier `1.6652/0.6855`, degree-ladder NLL/Brier/RPS `2.6068/0.8800/0.01135`, q50 MAE/RMSE `1.4265/2.0062`, q05-q95 coverage `0.7339`.
+  - Follow-up 2026-04-28: pulled missing runtime training feature artifacts from `ssh.lightning.ai:/teamspace/studios/this_studio/modelexp/experiments/no_hrrr_model/data/runtime/training/`, then added a structured 10-candidate expansion around `very_regularized_lgbm_350` and `regularized_shallow_lgbm_300` in `experiments/no_hrrr_model/no_hrrr_model/model_config.py`, bringing the default grid to `16` candidates. The added candidates vary only one or two knobs at a time across learning rate/rounds, `min_data_in_leaf`, `lambda_l2`, feature/bagging fraction, and a small `num_leaves=11`/`max_depth=4` capacity bump.
+  - Eval 2026-04-28: `.venv/bin/python -m pytest -q experiments/no_hrrr_model/tests` passed (`41` tests). Reran `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.rolling_origin_model_select`; outputs were written under `experiments/no_hrrr_model/data/runtime/evaluation/model_selection/`. Structured-expansion winner was `very_regularized_min_leaf70_lgbm_350`: weighted event-bin NLL/Brier `1.5370/0.6637`, degree-ladder NLL/Brier/RPS `2.3978/0.8602/0.01137`, q50 MAE/RMSE `1.4687/2.0465`, q05-q95 coverage `0.8052`, event-bin NLL fold std `0.1097`, q50 MAE fold std `0.0477`. Compared with prior default `very_regularized_lgbm_350`, event-bin NLL improved `1.5667 -> 1.5370`, event-bin Brier improved `0.6670 -> 0.6637`, degree-ladder NLL improved `2.4605 -> 2.3978`, q05-q95 coverage improved `0.7805 -> 0.8052`, while q50 MAE/RMSE worsened modestly `1.4581/2.0314 -> 1.4687/2.0465`.
 
 - [x] Tune quantile models through rolling-origin folds.
   - Evaluate each candidate across all configured folds.
@@ -107,72 +110,84 @@ Scope guardrails:
   - Done 2026-04-28: selected `very_regularized_lgbm_350` as the default probability-first config and wired it into `DEFAULT_MODEL_CANDIDATE_ID`, Phase 3 anchor selection's model candidate lookup, and `train_quantile_models.py`. Reran `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.train_quantile_models`; `experiments/no_hrrr_model/data/runtime/models/training_manifest.json` now records `model_candidate_id=very_regularized_lgbm_350`, `num_boost_round=350`, and the selected LightGBM params.
   - Eval 2026-04-28: selected vs current improved event-bin NLL `1.6652 -> 1.5667`, event-bin Brier `0.6855 -> 0.6670`, degree-ladder NLL `2.6068 -> 2.4605`, degree-ladder Brier `0.8800 -> 0.8611`, and q05-q95 coverage `0.7339 -> 0.7805`. Accepted point-error regression for probability improvement: q50 MAE/RMSE worsened `1.4265/2.0062 -> 1.4581/2.0314`, and q50 pinball worsened `0.7128 -> 0.7290`.
   - Review fix 2026-04-28: centralized model candidates and the selected default in `experiments/no_hrrr_model/no_hrrr_model/model_config.py`, changed final training to use fixed `350` rounds with no inner early stopping, and regenerated model-selection, training, and anchor-selection manifests so they all reference `very_regularized_lgbm_350`.
+  - Follow-up 2026-04-28: promoted `very_regularized_min_leaf70_lgbm_350` to `DEFAULT_MODEL_CANDIDATE_ID` after the structured expansion. Reran `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.rolling_origin_model_select`, `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.train_quantile_models`, and `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.rolling_origin_anchor_select`; model-selection and training manifests now record `model_candidate_id=very_regularized_min_leaf70_lgbm_350` with fixed `350` boosting rounds.
 
 ## Phase 5: Calibration Improvements
 
-- [ ] Add segmented quantile calibration.
+- [x] Add segmented quantile calibration.
   - Compare global offsets against month/season and NBM-LAMP-disagreement segments.
   - Require out-of-time improvement before making segmented calibration the default.
-  - Eval: not started. Compare segmented calibration against current rolling-origin calibration on coverage, PIT, interval score, degree-ladder NLL/Brier/RPS, and event-bin NLL/Brier.
+  - Done 2026-04-28: expanded `experiments/no_hrrr_model/no_hrrr_model/calibrate_rolling_origin.py` into a calibration-selection runner using the selected rolling-origin model predictions. It fits calibration on the `2024` fold and tests out-of-time on the `2025` fold, comparing uncalibrated predictions, global quantile offsets, season offsets, NBM-LAMP disagreement offsets, and month offsets. Prediction loading now supports the new selected-method manifest format in `experiments/no_hrrr_model/no_hrrr_model/predict.py`.
+  - Eval 2026-04-28: command `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.calibrate_rolling_origin`; artifacts under `experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/`. Calibration rows `364`; test rows `365`; candidate `very_regularized_min_leaf70_lgbm_350`. Global offsets were selected by event-bin NLL. On the `2025` test fold, uncalibrated vs global offsets: event-bin NLL/Brier `1.4275/0.6346 -> 1.3271/0.6222`, degree-ladder NLL/Brier/RPS `2.3442/0.8550/0.01063 -> 2.1461/0.8403/0.01049`, q05-q95 coverage `0.8137 -> 0.9151`, q05-q95 interval score `8.4965 -> 8.3044`, q50 MAE/RMSE about flat `1.4211/1.9869 -> 1.4210/1.9870`. Segmented methods did not beat global offsets on event-bin NLL: season `1.3370`, disagreement `1.3387`, month fell back to global because each month had fewer than `60` calibration rows.
 
-- [ ] Implement conformalized quantile calibration.
+- [x] Implement conformalized quantile calibration.
   - Use rolling-origin predictions as calibration data.
   - Preserve valid out-of-time interval behavior while keeping intervals as sharp as practical.
   - Compare against current additive quantile offsets.
-  - Eval: not started. Record conformal vs additive calibration coverage, interval width/score, PIT, probability scores, and q50 MAE/RMSE.
+  - Done 2026-04-28: added `conformal_intervals` to `calibrate_rolling_origin.py`. It uses split-conformal nonconformity scores on the `2024` calibration fold for q05-q95, q10-q90, and q25-q75 intervals, with q50 using the empirical median offset.
+  - Eval 2026-04-28: on the `2025` test fold, conformal intervals improved degree-ladder NLL/Brier/RPS and interval score slightly more than global offsets: degree-ladder NLL/Brier/RPS `2.1438/0.8362/0.01033`, q05-q95 coverage `0.9178`, q05-q95 interval score `8.0908`, q50 MAE/RMSE `1.4210/1.9870`. It was not selected because event-bin NLL was slightly worse than global offsets, `1.3278` vs `1.3271`, despite slightly better event-bin Brier `0.6218` vs `0.6222`.
 
-- [ ] Calibrate the final 1°F probability ladder.
+- [x] Calibrate the final 1°F probability ladder.
   - Adjust probability mass using validation reliability diagnostics without breaking total probability or monotonic CDF behavior.
   - Validate on held-out rolling-origin folds before updating `predict.py` defaults.
-  - Eval: not started. Compare calibrated vs uncalibrated ladder NLL/Brier/RPS and event-bin NLL/Brier on held-out folds.
+  - Done 2026-04-28: added `experiments/no_hrrr_model/no_hrrr_model/calibrate_ladder.py`. The runner applies the selected quantile calibration, fits probability-bucket reliability factors on the `2024` fold, tests shrinkage values on the `2025` fold, renormalizes each daily 1°F ladder to probability mass `1.0`, and writes artifacts under `experiments/no_hrrr_model/data/runtime/evaluation/ladder_calibration/`.
+  - Eval 2026-04-28: command `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.calibrate_ladder`; calibration rows `364`; test rows `365`; selected ladder method `bucket_reliability_s0_50`. Compared with the quantile-calibrated ladder, selected bucket reliability improved event-bin NLL/Brier `1.3271/0.6222 -> 1.3259/0.6214`, degree-ladder NLL/Brier/RPS `2.1461/0.8403/0.01049 -> 2.1407/0.8378/0.01049`, and PIT std `0.2701 -> 0.2685`. Mean observed degree probability decreased slightly `0.1638 -> 0.1628`. Keep this as a validated artifact for now; wire live prediction defaults in Phase 8 after deciding how to combine selected anchor, quantile calibration, and ladder calibration.
 
 ## Phase 6: Quantile Crossing And Distribution Shape
 
-- [ ] Expand quantile-crossing diagnostics.
+- [x] Expand quantile-crossing diagnostics.
   - Report crossing frequency by fold, season, quantile pair, and candidate hyperparameter config.
   - Penalize configs with frequent crossing even if monotone rearrangement can repair outputs.
-  - Eval: not started. Record crossing-rate reductions and whether probability metrics improve after penalizing crossing-heavy configs.
+  - Done 2026-04-28: added `experiments/no_hrrr_model/no_hrrr_model/distribution_diagnostics.py`. It reconstructs raw final quantiles from `anchor_tmax_f + pred_residual_q*_f`, reports adjacent-pair and any-adjacent crossing rates by candidate, fold, season, and NBM-LAMP disagreement slice, and writes a crossing-penalized candidate ranking.
+  - Eval 2026-04-28: command `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.distribution_diagnostics`; artifacts under `experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/`. For selected `very_regularized_min_leaf70_lgbm_350`, any-adjacent raw crossing rate was `42/364 = 0.1154` on the `2024` fold and `42/365 = 0.1151` on the `2025` fold. Worst adjacent pairs were tail pairs: `q05_q10` crossing `20/364` in `2024` and `17/365` in `2025`; `q25_q50` had `0` crossings in both folds. Crossing-penalized event-bin NLL with penalty weight `0.10` still ranked `very_regularized_min_leaf70_lgbm_350` first: penalized score `1.5485`, ahead of `very_regularized_lr020_lgbm_450` at `1.5605`. The original current config was much more crossing-heavy: `179/729 = 0.2455` any-adjacent crossing rate.
 
-- [ ] Compare distribution-construction methods.
+- [x] Compare distribution-construction methods.
   - Compare the current interpolation-based 1°F ladder with alternative smooth CDF or kernelized residual methods.
   - Score methods by whole-degree probability calibration and event-bin metrics.
-  - Eval: not started. Compare each method against current interpolation baseline using degree-ladder and event-bin probability metrics.
+  - Done 2026-04-28: `distribution_diagnostics.py` compares `interpolation_tail` (current method), `interpolation_no_tail`, `smoothed_interpolation_tail`, and `normal_iqr` on the `2025` out-of-time fold after applying the selected quantile calibration.
+  - Eval 2026-04-28: selected distribution method by event-bin NLL was `normal_iqr`. Compared with current `interpolation_tail`, event-bin NLL/Brier improved `1.3271/0.6222 -> 1.2712/0.6190`, degree-ladder NLL/Brier/RPS improved `2.1461/0.8403/0.01049 -> 2.0287/0.8293/0.00975`, and mean observed-bin probability improved `0.3664 -> 0.3735`. `smoothed_interpolation_tail` also improved event-bin NLL to `1.2878`; `interpolation_no_tail` was much worse on NLL despite better RPS, event-bin NLL `1.8292`.
 
-- [ ] Keep monotone rearrangement as a safety guard.
+- [x] Keep monotone rearrangement as a safety guard.
   - Do not emit non-monotone quantiles from prediction artifacts.
   - Document whether crossing was repaired and how often.
-  - Eval: not started. Record repair frequency and any score differences before/after rearrangement.
+  - Done 2026-04-28: Phase 6 manifest now records the monotone safety contract: raw crossing is diagnosed, while prediction/evaluation outputs use cumulative-maximum monotone rearrangement before ladder construction. Existing `predict.py`, rolling-origin model selection, and calibration paths already apply monotone rearrangement before emitting final quantiles or ladders.
+  - Eval 2026-04-28: selected model raw crossings requiring repair occurred on `84/729 = 0.1152` rolling-origin rows. The repair is still required as a safety guard; no live default changed in Phase 6. Defer wiring `normal_iqr` or any alternative distribution default to Phase 8 after validating interaction with selected anchor and ladder calibration.
 
 ## Phase 7: Small Ensembles
 
-- [ ] Test a small ensemble of stable model variants.
+- [x] Test a small ensemble of stable model variants.
   - Combine only a few strong rolling-origin candidates, such as best LightGBM configs or anchor variants.
   - Average final 1°F ladders or monotone quantile outputs.
-  - Eval: not started. Compare ensemble vs selected single model on rolling-origin probability metrics, PIT, coverage, and q50 MAE/RMSE.
+  - Done 2026-04-28: added `experiments/no_hrrr_model/no_hrrr_model/ensemble_diagnostics.py`. The runner builds small quantile-mean ensembles from the probability-ranked LightGBM candidates (`top2`, `top3`, `top5`), applies monotone rearrangement to averaged quantiles, fits global quantile offsets on the `2024` fold for each method, and tests out-of-time on the `2025` fold.
+  - Eval 2026-04-28: command `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.ensemble_diagnostics`; artifacts under `experiments/no_hrrr_model/data/runtime/evaluation/ensemble_diagnostics/`. Tested selected single model plus `top2_quantile_mean`, `top3_quantile_mean`, and `top5_quantile_mean`. All ensemble sizes used only the probability-ranked candidates from rolling-origin model selection, capped at `5` members.
 
-- [ ] Compare ensemble against the selected single model.
+- [x] Compare ensemble against the selected single model.
   - Require improvement in probability scores and calibration stability.
   - Avoid large ensembles that hide overfit candidate selection.
-  - Eval: not started. Record whether ensemble improvement is large enough to justify added complexity.
+  - Eval 2026-04-28: `top3_quantile_mean` had the best event-bin NLL on the `2025` fold, but the gain over `selected_single` was tiny and mixed: event-bin NLL `1.3271 -> 1.3264` improved, event-bin Brier `0.6222 -> 0.6232` worsened, degree-ladder NLL `2.1461 -> 2.1550` worsened, degree-ladder Brier `0.8403 -> 0.8369` improved, degree-ladder RPS `0.01049 -> 0.01038` improved, q50 MAE/RMSE `1.4210/1.9870 -> 1.4126/1.9765` improved, and q05-q95 coverage `0.9151 -> 0.9178` improved. `top5` improved point error further but had worse event-bin NLL `1.3310`. Conclusion: do not promote an ensemble default yet; the top-3 probability gain is too small relative to added complexity and worse degree-ladder NLL/Brier tradeoff. Keep the ensemble artifact for Phase 8 comparison.
 
 ## Phase 8: Prediction Defaults And Runbook Updates
 
-- [ ] Update `predict.py` defaults only after out-of-time validation.
+- [x] Update `predict.py` defaults only after out-of-time validation.
   - Use the selected anchor, model config, distribution method, and calibration manifest.
   - Preserve override flags for comparing old and new behavior.
-  - Eval: not started. Record old-default vs new-default metrics and artifact paths.
+  - Done 2026-04-28: `predict.py` now applies the selected calibration-selection manifest by default, uses the Phase 6 selected distribution manifest in `--distribution-method auto`, emits `distribution_method`, `distribution_manifest_path`, `calibration_enabled`, and `anchor_policy`, and adds `--no-calibration`, `--distribution-method`, and `--distribution-manifest-path` comparison flags. The promoted runtime distribution method is `normal_iqr` when `experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json` is present; `--distribution-method interpolation_tail` preserves the previous ladder behavior.
+  - Eval 2026-04-28: command `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.distribution_diagnostics`; artifact `experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/distribution_method_comparison.csv`. On the `2025` out-of-time fold, old uncalibrated interpolation vs selected global-offset interpolation vs selected global-offset `normal_iqr`: event-bin NLL/Brier `1.4275/0.6346 -> 1.3271/0.6222 -> 1.2712/0.6190`, degree-ladder NLL/Brier/RPS `2.3442/0.8550/0.01063 -> 2.1461/0.8403/0.01049 -> 2.0287/0.8293/0.00975`. Anchor policy remains `feature_anchor_tmax_f` from the normalized feature row because the final residual model artifacts were trained against that anchor; the Phase 3 segmented anchor is not promoted until final models are retrained against a deployable anchor policy.
+  - Runtime check 2026-04-28: default command `.venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.predict --target-date-local 2025-04-11 --event-bin "70 or below" --event-bin "71-75" --event-bin "76 or above"` wrote `experiments/no_hrrr_model/data/runtime/predictions/prediction_KLGA_2025-04-11.json` with `distribution_method=normal_iqr`, `calibration_enabled=true`, and degree-ladder probability mass `1.0`. Override command with `--distribution-method interpolation_tail` wrote `experiments/no_hrrr_model/data/runtime/predictions/interpolation_tail_check/prediction_KLGA_2025-04-11.json` with the old ladder method and probability mass `1.0`.
 
-- [ ] Update README and manifests.
+- [x] Update README and manifests.
   - Document the selected validation design, score targets, model-selection results, and current default artifacts.
   - Include exact commands to rerun selection and calibration.
-  - Eval: not started. Include final before/after metric table in the README or linked report.
+  - Done 2026-04-28: updated `experiments/no_hrrr_model/README.md` with the Phase 8 runtime defaults, non-promoted Phase 7 ensemble / Phase 5 ladder reliability decisions, exact rerun commands, override flags, and the before/after metric table. Runtime manifests already record the selected model, calibration, distribution, and ladder-calibration artifacts under `experiments/no_hrrr_model/data/runtime/models/` and `experiments/no_hrrr_model/data/runtime/evaluation/`.
+  - Eval 2026-04-28: README metric table cites `experiments/no_hrrr_model/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_summary.csv` and `experiments/no_hrrr_model/data/runtime/evaluation/distribution_diagnostics/distribution_method_comparison.csv`.
 
-- [ ] Add regression tests for selected behavior.
+- [x] Add regression tests for selected behavior.
   - Test probability mass sums to 1.
   - Test event-bin mapping remains stable.
   - Test calibration manifests are applied deterministically.
   - Test no HRRR columns enter feature selection.
-  - Eval: not started. Record test command and passing test count.
+  - Done 2026-04-28: added runtime-distribution tests for manifest-selected `auto`, explicit interpolation override, and `normal_iqr` probability-mass preservation; existing tests cover event-bin mapping, deterministic calibration-manifest offsets, and no-HRRR feature-selection leakage.
+  - Eval 2026-04-28: `.venv/bin/python -m pytest -q experiments/no_hrrr_model/tests` passed, `55 passed`.
 
 ## Later: Paper-Trading Simulation
 

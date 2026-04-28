@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 from experiments.no_hrrr_model.no_hrrr_model.build_training_features import build_training_features
 from experiments.no_hrrr_model.no_hrrr_model.build_inference_features import filter_label_history_for_inference
 from experiments.no_hrrr_model.no_hrrr_model.contracts import audit_training_features
-from experiments.no_hrrr_model.no_hrrr_model.distribution import quantiles_to_degree_ladder
+from experiments.no_hrrr_model.no_hrrr_model.distribution import degree_ladder_from_quantiles, quantiles_to_degree_ladder
 from experiments.no_hrrr_model.no_hrrr_model.event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from experiments.no_hrrr_model.no_hrrr_model.evaluate import (
     build_degree_ladder_diagnostics,
@@ -24,6 +24,11 @@ from experiments.no_hrrr_model.no_hrrr_model.evaluate import (
 )
 from experiments.no_hrrr_model.no_hrrr_model.normalize_features import normalize_features
 from experiments.no_hrrr_model.no_hrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
+from experiments.no_hrrr_model.no_hrrr_model.predict import calibration_offsets, selected_distribution_method
+from experiments.no_hrrr_model.no_hrrr_model.calibrate_rolling_origin import calibration_sort_key
+from experiments.no_hrrr_model.no_hrrr_model.calibrate_ladder import apply_bucket_reliability, fit_bucket_reliability, selected_quantile_calibrated_frame
+from experiments.no_hrrr_model.no_hrrr_model.distribution_diagnostics import crossing_diagnostics, normal_iqr_ladder, smooth_ladder
+from experiments.no_hrrr_model.no_hrrr_model.ensemble_diagnostics import build_ensemble_frame, ensemble_specs, ranked_candidates
 from experiments.no_hrrr_model.no_hrrr_model.rolling_origin_anchor_select import (
     anchor_candidate_specs,
     apply_anchor,
@@ -382,10 +387,10 @@ def test_model_selection_summary_sorts_by_probability_scores() -> None:
 
 
 def test_default_model_selection_grid_is_constrained_and_regularized() -> None:
-    assert 2 <= len(DEFAULT_CANDIDATES) <= 8
+    assert 15 <= len(DEFAULT_CANDIDATES) <= 20
     candidate_ids = [str(candidate["candidate_id"]) for candidate in DEFAULT_CANDIDATES]
     assert "current_lgbm_fixed_250_no_inner_es" in candidate_ids
-    assert DEFAULT_MODEL_CANDIDATE_ID == "very_regularized_lgbm_350"
+    assert DEFAULT_MODEL_CANDIDATE_ID == "very_regularized_min_leaf70_lgbm_350"
     assert candidate_by_id(DEFAULT_MODEL_CANDIDATE_ID)["candidate_id"] == DEFAULT_MODEL_CANDIDATE_ID
     assert len(candidate_ids) == len(set(candidate_ids))
     tuned_candidates = [candidate for candidate in DEFAULT_CANDIDATES if str(candidate["candidate_id"]) != "current_lgbm_fixed_250_no_inner_es"]
@@ -395,7 +400,7 @@ def test_default_model_selection_grid_is_constrained_and_regularized() -> None:
         assert "max_depth" in params
         assert "lambda_l1" in params
         assert "lambda_l2" in params
-        assert int(candidate["num_boost_round"]) <= 350
+        assert int(candidate["num_boost_round"]) <= 450
 
 
 def test_model_selection_rejects_duplicate_candidate_ids(tmp_path) -> None:
@@ -407,6 +412,246 @@ def test_model_selection_rejects_duplicate_candidate_ids(tmp_path) -> None:
         assert "duplicate candidate_id" in str(exc)
     else:
         raise AssertionError("duplicate candidate ids should be rejected")
+
+
+def test_prediction_reads_selected_calibration_manifest_offsets() -> None:
+    payload = {
+        "selected_method_id": "global_offsets",
+        "methods": {
+            "global_offsets": {
+                "config": {
+                    "offsets_f": {
+                        "q05": -1.0,
+                        "q50": 0.25,
+                        "q95": 0.5,
+                    }
+                }
+            }
+        },
+    }
+    assert calibration_offsets(payload) == {"q05": -1.0, "q50": 0.25, "q95": 0.5}
+
+
+def test_prediction_reads_selected_conformal_manifest_median_offsets() -> None:
+    payload = {
+        "selected_method_id": "conformal_intervals",
+        "methods": {
+            "conformal_intervals": {
+                "config": {
+                    "median_offsets_f": {
+                        "q05": -0.5,
+                        "q50": 0.0,
+                        "q95": 0.5,
+                    },
+                    "interval_adjustments_f": {"q05_q95": 1.0, "q10_q90": 0.5, "q25_q75": 0.25},
+                }
+            }
+        },
+    }
+    assert calibration_offsets(payload) == {"q05": -1.0, "q10": -0.5, "q25": -0.25, "q50": 0.0, "q75": 0.25, "q90": 0.5, "q95": 1.0}
+
+
+def test_prediction_reads_selected_segmented_manifest_offsets() -> None:
+    payload = {
+        "selected_method_id": "disagreement_offsets",
+        "methods": {
+            "disagreement_offsets": {
+                "config": {
+                    "segment_name": "disagreement",
+                    "global_offsets_f": {"q50": 0.0},
+                    "segment_offsets_f": {"2_to_5f": {"q50": 0.75}},
+                }
+            }
+        },
+    }
+    row = pd.DataFrame([{"nbm_minus_lamp_tmax_f": 3.0}])
+    assert calibration_offsets(payload, row=row) == {"q50": 0.75}
+
+
+def test_prediction_auto_distribution_uses_selected_manifest(tmp_path) -> None:
+    manifest_path = tmp_path / "distribution_manifest.json"
+    manifest_path.write_text('{"selected_distribution_method_id": "normal_iqr"}')
+    method_id, path = selected_distribution_method("auto", manifest_path=manifest_path)
+    assert method_id == "normal_iqr"
+    assert path == manifest_path
+
+
+def test_prediction_distribution_override_preserves_old_ladder_method() -> None:
+    method_id, path = selected_distribution_method("interpolation_tail", manifest_path=pathlib.Path("/missing/manifest.json"))
+    assert method_id == "interpolation_tail"
+    assert path is None
+
+
+def test_calibration_sort_key_uses_probability_scores_before_uncalibrated_penalty() -> None:
+    summary = pd.DataFrame(
+        [
+            {"method_id": "uncalibrated", "event_bin_nll": 1.0, "degree_ladder_nll": 2.0},
+            {"method_id": "global_offsets", "event_bin_nll": 1.0, "degree_ladder_nll": 2.0},
+            {"method_id": "worse", "event_bin_nll": 1.1, "degree_ladder_nll": 1.9},
+        ]
+    )
+    assert list(calibration_sort_key(summary)["method_id"]) == ["global_offsets", "uncalibrated", "worse"]
+
+
+def test_ladder_bucket_reliability_preserves_probability_mass() -> None:
+    records = pd.DataFrame(
+        [
+            {"target_date_local": "2025-01-01", "station_id": "KLGA", "temp_f": 69, "probability": 0.25, "observed": False},
+            {"target_date_local": "2025-01-01", "station_id": "KLGA", "temp_f": 70, "probability": 0.50, "observed": True},
+            {"target_date_local": "2025-01-01", "station_id": "KLGA", "temp_f": 71, "probability": 0.25, "observed": False},
+            {"target_date_local": "2025-01-02", "station_id": "KLGA", "temp_f": 69, "probability": 0.20, "observed": True},
+            {"target_date_local": "2025-01-02", "station_id": "KLGA", "temp_f": 70, "probability": 0.30, "observed": False},
+            {"target_date_local": "2025-01-02", "station_id": "KLGA", "temp_f": 71, "probability": 0.50, "observed": False},
+        ]
+    )
+    reliability = fit_bucket_reliability(records, bucket_count=5)
+    calibrated = apply_bucket_reliability(records, reliability, bucket_count=5, shrinkage=0.5)
+    totals = calibrated.groupby(["target_date_local", "station_id"])["probability"].sum().round(6).tolist()
+    assert totals == [1.0, 1.0]
+    assert float(calibrated["probability"].min()) >= 0.0
+
+
+def test_ladder_uses_selected_quantile_calibration_manifest() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "target_date_local": "2025-01-01",
+                "station_id": "KLGA",
+                "pred_tmax_q05_f": 69.0,
+                "pred_tmax_q10_f": 69.5,
+                "pred_tmax_q25_f": 70.0,
+                "pred_tmax_q50_f": 71.0,
+                "pred_tmax_q75_f": 72.0,
+                "pred_tmax_q90_f": 72.5,
+                "pred_tmax_q95_f": 73.0,
+            }
+        ]
+    )
+    manifest = {"selected_method_id": "global_offsets", "methods": {"global_offsets": {"config": {"offsets_f": {"q05": 1.0, "q10": 1.0, "q25": 1.0, "q50": 1.0, "q75": 1.0, "q90": 1.0, "q95": 1.0}}}}}
+    out = selected_quantile_calibrated_frame(df, manifest)
+    assert float(out["pred_tmax_q50_f"].iloc[0]) == 72.0
+
+
+def test_distribution_crossing_diagnostics_counts_raw_crossings() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "candidate_id": "candidate",
+                "train_end": "2023-12-31",
+                "valid_start": "2024-01-01",
+                "valid_end": "2024-12-31",
+                "target_date_local": "2024-01-01",
+                "anchor_tmax_f": 70.0,
+                "nbm_minus_lamp_tmax_f": 1.0,
+                "pred_residual_q05_f": 1.0,
+                "pred_residual_q10_f": 0.0,
+                "pred_residual_q25_f": 2.0,
+                "pred_residual_q50_f": 3.0,
+                "pred_residual_q75_f": 4.0,
+                "pred_residual_q90_f": 5.0,
+                "pred_residual_q95_f": 6.0,
+            }
+        ]
+    )
+    diagnostics = crossing_diagnostics(df)
+    row = diagnostics.loc[(diagnostics["slice"] == "overall") & (diagnostics["quantile_pair"] == "q05_q10")].iloc[0]
+    assert int(row["crossing_count"]) == 1
+    any_row = diagnostics.loc[(diagnostics["slice"] == "overall") & (diagnostics["quantile_pair"] == "any_adjacent")].iloc[0]
+    assert int(any_row["crossing_count"]) == 1
+
+
+def test_distribution_alternative_ladders_preserve_mass() -> None:
+    ladder = pd.DataFrame({"temp_f": [69, 70, 71], "probability": [0.0, 1.0, 0.0]})
+    smoothed = smooth_ladder(ladder)
+    assert round(float(smoothed["probability"].sum()), 6) == 1.0
+    row = pd.Series({"pred_tmax_q05_f": 65.0, "pred_tmax_q25_f": 68.0, "pred_tmax_q50_f": 70.0, "pred_tmax_q75_f": 72.0, "pred_tmax_q95_f": 75.0})
+    normal = normal_iqr_ladder(row, min_temp_f=60, max_temp_f=80)
+    assert round(float(normal["probability"].sum()), 6) == 1.0
+    assert float(normal["probability"].min()) >= 0.0
+    collapsed = normal_iqr_ladder(pd.Series({"pred_tmax_q05_f": 70.0, "pred_tmax_q25_f": 70.0, "pred_tmax_q50_f": 70.0, "pred_tmax_q75_f": 70.0, "pred_tmax_q95_f": 70.0}), min_temp_f=65, max_temp_f=75)
+    assert round(float(collapsed["probability"].sum()), 6) == 1.0
+    assert collapsed["probability"].isna().sum() == 0
+    runtime = degree_ladder_from_quantiles({0.05: 65.0, 0.1: 66.0, 0.25: 68.0, 0.5: 70.0, 0.75: 72.0, 0.9: 74.0, 0.95: 75.0}, method_id="normal_iqr")
+    assert round(float(runtime["probability"].sum()), 6) == 1.0
+    assert float(runtime["probability"].min()) >= 0.0
+
+
+def test_ensemble_specs_use_selected_single_and_ranked_top_sets() -> None:
+    ranked = ["a", "b", "c", "d"]
+    specs = ensemble_specs(ranked, selected_candidate_id="b", sizes=[2, 3])
+    assert specs[0] == {"method_id": "selected_single", "member_candidate_ids": ["b"]}
+    assert specs[1] == {"method_id": "top2_quantile_mean", "member_candidate_ids": ["a", "b"]}
+    assert specs[2] == {"method_id": "top3_quantile_mean", "member_candidate_ids": ["a", "b", "c"]}
+
+
+def test_ranked_candidates_sorts_by_probability_scores() -> None:
+    summary = pd.DataFrame(
+        [
+            {"candidate_id": "b", "weighted_mean_event_bin_nll": 1.1, "weighted_mean_degree_ladder_nll": 2.0},
+            {"candidate_id": "a", "weighted_mean_event_bin_nll": 1.0, "weighted_mean_degree_ladder_nll": 2.1},
+            {"candidate_id": "c", "weighted_mean_event_bin_nll": 1.0, "weighted_mean_degree_ladder_nll": 1.9},
+        ]
+    )
+    assert ranked_candidates(summary) == ["c", "a", "b"]
+
+
+def test_build_ensemble_frame_averages_and_rearranges_quantiles() -> None:
+    rows = []
+    for candidate_id, q05, q10 in [("a", 70.0, 69.0), ("b", 72.0, 73.0)]:
+        row = {
+            "candidate_id": candidate_id,
+            "target_date_local": "2025-01-01",
+            "station_id": "KLGA",
+            "train_end": "2024-12-31",
+            "valid_start": "2025-01-01",
+            "valid_end": "2025-12-31",
+            "final_tmax_f": 71.0,
+            "target_residual_f": 0.0,
+            "anchor_tmax_f": 71.0,
+            "nbm_tmax_open_f": 71.0,
+            "lamp_tmax_open_f": 71.0,
+            "nbm_minus_lamp_tmax_f": 0.0,
+        }
+        for quantile in (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95):
+            tag = f"q{int(round(quantile * 100)):02d}"
+            row[f"pred_tmax_{tag}_f"] = 71.0
+        row["pred_tmax_q05_f"] = q05
+        row["pred_tmax_q10_f"] = q10
+        rows.append(row)
+    out = build_ensemble_frame(pd.DataFrame(rows), member_candidate_ids=["a", "b"], method_id="test")
+    assert len(out) == 1
+    assert float(out["pred_tmax_q05_f"].iloc[0]) == 71.0
+    assert float(out["pred_tmax_q10_f"].iloc[0]) == 71.0
+    assert str(out["member_candidate_ids"].iloc[0]) == "a,b"
+
+
+def test_build_ensemble_frame_rejects_missing_member_for_target_key() -> None:
+    rows = []
+    for candidate_id, target_date in [("a", "2025-01-01"), ("b", "2025-01-01"), ("a", "2025-01-02")]:
+        row = {
+            "candidate_id": candidate_id,
+            "target_date_local": target_date,
+            "station_id": "KLGA",
+            "train_end": "2024-12-31",
+            "valid_start": "2025-01-01",
+            "valid_end": "2025-12-31",
+            "final_tmax_f": 71.0,
+            "target_residual_f": 0.0,
+            "anchor_tmax_f": 71.0,
+            "nbm_tmax_open_f": 71.0,
+            "lamp_tmax_open_f": 71.0,
+            "nbm_minus_lamp_tmax_f": 0.0,
+        }
+        for quantile in (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95):
+            tag = f"q{int(round(quantile * 100)):02d}"
+            row[f"pred_tmax_{tag}_f"] = 71.0
+        rows.append(row)
+    try:
+        build_ensemble_frame(pd.DataFrame(rows), member_candidate_ids=["a", "b"], method_id="test")
+    except ValueError as exc:
+        assert "without all requested members" in str(exc)
+    else:
+        raise AssertionError("ensemble frame should reject target keys missing a requested member")
 
 
 def test_model_selection_loads_custom_splits(tmp_path) -> None:
