@@ -9,12 +9,12 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+from .model_config import DEFAULT_MODEL_CANDIDATE_ID, DEFAULT_QUANTILES, RANDOM_SEED, selected_model_candidate
+
 
 DEFAULT_INPUT_PATH = pathlib.Path("experiments/no_hrrr_model/data/runtime/training/training_features_overnight_no_hrrr_normalized.parquet")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/no_hrrr_model/data/runtime/models")
-DEFAULT_QUANTILES: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
 DEFAULT_VALIDATION_FRACTION = 0.20
-RANDOM_SEED = 20260425
 
 IDENTITY_COLUMNS = {"target_date_local", "station_id", "selection_cutoff_local"}
 NON_FEATURE_COLUMNS = {
@@ -132,36 +132,33 @@ def train_one_quantile(
     x_valid: pd.DataFrame,
     y_valid: pd.Series,
 ) -> tuple[lgb.Booster, dict[str, float]]:
+    selected_candidate = selected_model_candidate()
+    candidate_params = selected_candidate["params"]
+    if not isinstance(candidate_params, dict):
+        raise ValueError(f"selected candidate {DEFAULT_MODEL_CANDIDATE_ID} params must be a dict")
     train_data = lgb.Dataset(x_train, label=y_train, free_raw_data=False)
     valid_data = lgb.Dataset(x_valid, label=y_valid, reference=train_data, free_raw_data=False)
     params = {
         "objective": "quantile",
         "alpha": quantile,
         "metric": "quantile",
-        "learning_rate": 0.035,
-        "num_leaves": 15,
-        "min_data_in_leaf": 25,
-        "feature_fraction": 0.85,
-        "bagging_fraction": 0.85,
-        "bagging_freq": 1,
-        "lambda_l2": 1.0,
         "verbosity": -1,
         "seed": RANDOM_SEED,
         "feature_fraction_seed": RANDOM_SEED,
         "bagging_seed": RANDOM_SEED,
     }
+    params.update(candidate_params)
     booster = lgb.train(
         params,
         train_data,
-        num_boost_round=1200,
+        num_boost_round=int(selected_candidate.get("num_boost_round", 250)),
         valid_sets=[valid_data],
         valid_names=["validation"],
-        callbacks=[lgb.early_stopping(50, verbose=False)],
     )
-    train_pred = booster.predict(x_train, num_iteration=booster.best_iteration)
-    valid_pred = booster.predict(x_valid, num_iteration=booster.best_iteration)
+    train_pred = booster.predict(x_train)
+    valid_pred = booster.predict(x_valid)
     metrics = {
-        "best_iteration": int(booster.best_iteration or booster.current_iteration()),
+        "best_iteration": int(booster.current_iteration()),
         "train_pinball_loss": pinball_loss(y_train.to_numpy(), train_pred, quantile),
         "validation_pinball_loss": pinball_loss(y_valid.to_numpy(), valid_pred, quantile),
     }
@@ -175,6 +172,10 @@ def write_json(path: pathlib.Path, payload: dict[str, object]) -> None:
 
 def main() -> int:
     args = parse_args()
+    selected_candidate = selected_model_candidate()
+    selected_params = selected_candidate["params"]
+    if not isinstance(selected_params, dict):
+        raise ValueError(f"selected candidate {DEFAULT_MODEL_CANDIDATE_ID} params must be a dict")
     df = pd.read_parquet(args.input_path)
     feature_columns = select_feature_columns(df)
     if not feature_columns:
@@ -221,6 +222,11 @@ def main() -> int:
         "output_dir": str(args.output_dir),
         "target_column": "target_residual_f",
         "quantiles": list(DEFAULT_QUANTILES),
+        "model_candidate_id": DEFAULT_MODEL_CANDIDATE_ID,
+        "model_candidate": selected_candidate,
+        "training_procedure": "fixed_num_boost_round_no_inner_early_stopping",
+        "lightgbm_params": selected_params,
+        "num_boost_round": int(selected_candidate.get("num_boost_round", 250)),
         "row_count_total": int(len(df)),
         "row_count_eligible": int(df["model_training_eligible"].astype("boolean").fillna(False).sum()),
         "row_count_used": int(len(x)),

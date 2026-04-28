@@ -545,3 +545,16 @@ Build paper-trading simulation:
 - Include fees, spread, slippage, liquidity, and position sizing assumptions as explicit inputs.
 - Emit a report with model probability, market-implied probability, edge after costs, and action/no-action status per bin.
 - Do not add live order placement.
+
+## Current Optimization Roadmap
+
+Status: not done
+
+The no-HRRR model-quality roadmap now lives in `experiments/no_hrrr_model/TODO.md`.
+
+Future agents must update that TODO after finishing each optimization task:
+
+- change the task checkbox from `[ ]` to `[x]`
+- add the completion date
+- include command(s), artifact paths, and a short result note
+- if blocked, leave the task unchecked and add a `Blocked:` note with the exact blocker

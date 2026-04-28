@@ -9,12 +9,48 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+from .distribution import quantiles_to_degree_ladder
+from .event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from .train_quantile_models import DEFAULT_QUANTILES, pinball_loss
 
 
 DEFAULT_FEATURES_PATH = pathlib.Path("experiments/no_hrrr_model/data/runtime/training/training_features_overnight_no_hrrr_normalized.parquet")
 DEFAULT_MODELS_DIR = pathlib.Path("experiments/no_hrrr_model/data/runtime/models")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/no_hrrr_model/data/runtime/evaluation")
+EPSILON = 1e-12
+DEFAULT_REPRESENTATIVE_EVENT_BINS: tuple[str, ...] = (
+    "35F or below",
+    "36-37F",
+    "38-39F",
+    "40-41F",
+    "42-43F",
+    "44-45F",
+    "46-47F",
+    "48-49F",
+    "50-51F",
+    "52-53F",
+    "54-55F",
+    "56-57F",
+    "58-59F",
+    "60-61F",
+    "62-63F",
+    "64-65F",
+    "66-67F",
+    "68-69F",
+    "70-71F",
+    "72-73F",
+    "74-75F",
+    "76-77F",
+    "78-79F",
+    "80-81F",
+    "82-83F",
+    "84-85F",
+    "86-87F",
+    "88-89F",
+    "90-91F",
+    "92-93F",
+    "94F or higher",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--features-path", type=pathlib.Path, default=DEFAULT_FEATURES_PATH)
     parser.add_argument("--models-dir", type=pathlib.Path, default=DEFAULT_MODELS_DIR)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--representative-event-bins-path", type=pathlib.Path, default=None)
     return parser.parse_args()
 
 
@@ -113,6 +150,276 @@ def summarize_point_metrics(df: pd.DataFrame, prediction_column: str) -> dict[st
         "mae_f": mae(df["final_tmax_f"], df[prediction_column]),
         "rmse_f": rmse(df["final_tmax_f"], df[prediction_column]),
     }
+
+
+def prediction_quantiles(row: pd.Series) -> dict[float, float]:
+    return {quantile: float(row[f"pred_tmax_{quantile_tag(quantile)}_f"]) for quantile in DEFAULT_QUANTILES}
+
+
+def ordered_ladder_bounds(prediction_df: pd.DataFrame) -> tuple[int, int]:
+    values = pd.to_numeric(prediction_df["final_tmax_f"], errors="coerce").dropna().to_numpy(float)
+    quantile_columns = [f"pred_tmax_{quantile_tag(quantile)}_f" for quantile in DEFAULT_QUANTILES]
+    predicted = prediction_df[quantile_columns].apply(pd.to_numeric, errors="coerce").to_numpy(float).ravel()
+    combined = np.concatenate([values, predicted[np.isfinite(predicted)]])
+    if len(combined) == 0:
+        raise ValueError("cannot build ladder bounds without finite temperatures")
+    return int(np.floor(np.nanmin(combined) - 8.0)), int(np.ceil(np.nanmax(combined) + 8.0))
+
+
+def ladder_for_prediction(row: pd.Series, *, min_temp_f: int, max_temp_f: int) -> pd.DataFrame:
+    return quantiles_to_degree_ladder(
+        prediction_quantiles(row),
+        min_temp_f=min_temp_f,
+        max_temp_f=max_temp_f,
+    )
+
+
+def ranked_probability_score(ladder: pd.DataFrame, observed_temp_f: int) -> float:
+    degrees = pd.to_numeric(ladder["temp_f"]).astype(int).to_numpy()
+    probabilities = pd.to_numeric(ladder["probability"], errors="coerce").fillna(0.0).to_numpy(float)
+    predicted_cdf = np.cumsum(probabilities)
+    observed_cdf = (degrees >= int(observed_temp_f)).astype(float)
+    if len(degrees) <= 1:
+        return float(np.mean((predicted_cdf - observed_cdf) ** 2))
+    return float(np.mean((predicted_cdf - observed_cdf) ** 2))
+
+
+def interval_hit(row: pd.Series, lower_tag: str, upper_tag: str) -> bool:
+    observed = float(row["final_tmax_f"])
+    return float(row[f"pred_tmax_{lower_tag}_f"]) <= observed <= float(row[f"pred_tmax_{upper_tag}_f"])
+
+
+def build_degree_ladder_diagnostics(prediction_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    min_temp_f, max_temp_f = ordered_ladder_bounds(prediction_df)
+    rows: list[dict[str, object]] = []
+    reliability_rows: list[dict[str, object]] = []
+    per_degree_rows: list[dict[str, object]] = []
+    for _, row in prediction_df.iterrows():
+        ladder = ladder_for_prediction(row, min_temp_f=min_temp_f, max_temp_f=max_temp_f)
+        observed_temp = int(round(float(row["final_tmax_f"])))
+        probabilities = pd.to_numeric(ladder["probability"], errors="coerce").fillna(0.0)
+        degrees = pd.to_numeric(ladder["temp_f"]).astype(int)
+        observed_probability = float(probabilities.loc[degrees == observed_temp].sum())
+        modal_index = int(probabilities.to_numpy(float).argmax())
+        modal_temp = int(degrees.iloc[modal_index])
+        modal_probability = float(probabilities.iloc[modal_index])
+        one_hot = (degrees == observed_temp).astype(float).to_numpy()
+        brier = float(np.sum((probabilities.to_numpy(float) - one_hot) ** 2))
+        cdf_below = float(probabilities.loc[degrees < observed_temp].sum())
+        pit_mid = cdf_below + 0.5 * observed_probability
+        rows.append(
+            {
+                "target_date_local": row["target_date_local"],
+                "station_id": row["station_id"],
+                "final_tmax_f": float(row["final_tmax_f"]),
+                "observed_temp_f": observed_temp,
+                "observed_probability": observed_probability,
+                "negative_log_likelihood": float(-np.log(max(observed_probability, EPSILON))),
+                "brier_score": brier,
+                "ranked_probability_score": ranked_probability_score(ladder, observed_temp),
+                "pit_lower": cdf_below,
+                "pit_mid": pit_mid,
+                "pit_upper": cdf_below + observed_probability,
+                "modal_temp_f": modal_temp,
+                "modal_probability": modal_probability,
+                "modal_correct": modal_temp == observed_temp,
+                "q05_q95_hit": interval_hit(row, "q05", "q95"),
+                "q10_q90_hit": interval_hit(row, "q10", "q90"),
+                "q25_q75_hit": interval_hit(row, "q25", "q75"),
+                "nbm_lamp_abs_disagreement_f": abs(float(row["nbm_minus_lamp_tmax_f"])),
+            }
+        )
+        reliability_rows.append(
+            {
+                "target_date_local": row["target_date_local"],
+                "confidence": modal_probability,
+                "correct": modal_temp == observed_temp,
+            }
+        )
+        for degree, probability in zip(degrees, probabilities):
+            per_degree_rows.append(
+                {
+                    "target_date_local": row["target_date_local"],
+                    "temp_f": int(degree),
+                    "probability": float(probability),
+                    "observed": int(degree) == observed_temp,
+                }
+            )
+    diagnostics = pd.DataFrame(rows)
+    reliability_input = pd.DataFrame(reliability_rows)
+    reliability_input["confidence_bucket"] = pd.cut(
+        reliability_input["confidence"],
+        bins=np.linspace(0.0, 1.0, 11),
+        include_lowest=True,
+        right=True,
+    ).astype(str)
+    reliability = (
+        reliability_input.groupby("confidence_bucket", dropna=False)
+        .agg(
+            row_count=("correct", "size"),
+            mean_confidence=("confidence", "mean"),
+            observed_accuracy=("correct", "mean"),
+        )
+        .reset_index()
+    )
+    per_degree_input = pd.DataFrame(per_degree_rows)
+    per_degree_input["probability_bucket"] = pd.cut(
+        per_degree_input["probability"],
+        bins=np.linspace(0.0, 1.0, 11),
+        include_lowest=True,
+        right=True,
+    ).astype(str)
+    per_degree_reliability = (
+        per_degree_input.groupby("probability_bucket", dropna=False)
+        .agg(
+            row_count=("observed", "size"),
+            mean_predicted_probability=("probability", "mean"),
+            observed_frequency=("observed", "mean"),
+        )
+        .reset_index()
+    )
+    pit = build_pit_diagnostics(diagnostics)
+    metrics = {
+        "status": "ok",
+        "row_count": int(len(diagnostics)),
+        "ladder_min_temp_f": min_temp_f,
+        "ladder_max_temp_f": max_temp_f,
+        "mean_negative_log_likelihood": float(diagnostics["negative_log_likelihood"].mean()),
+        "mean_brier_score": float(diagnostics["brier_score"].mean()),
+        "mean_ranked_probability_score": float(diagnostics["ranked_probability_score"].mean()),
+        "mean_observed_probability": float(diagnostics["observed_probability"].mean()),
+        "modal_accuracy": float(diagnostics["modal_correct"].mean()),
+        "q05_q95_coverage": float(diagnostics["q05_q95_hit"].mean()),
+        "q10_q90_coverage": float(diagnostics["q10_q90_hit"].mean()),
+        "q25_q75_coverage": float(diagnostics["q25_q75_hit"].mean()),
+    }
+    return diagnostics, reliability, per_degree_reliability, pit, metrics
+
+
+def pit_summary(df: pd.DataFrame, *, slice_name: str) -> dict[str, object]:
+    pit = pd.to_numeric(df["pit_mid"], errors="coerce").dropna()
+    if pit.empty:
+        return {
+            "slice": slice_name,
+            "row_count": 0,
+            "pit_mean": np.nan,
+            "pit_std": np.nan,
+            "pit_below_0_1": np.nan,
+            "pit_above_0_9": np.nan,
+        }
+    return {
+        "slice": slice_name,
+        "row_count": int(len(pit)),
+        "pit_mean": float(pit.mean()),
+        "pit_std": float(pit.std(ddof=0)),
+        "pit_below_0_1": float((pit < 0.1).mean()),
+        "pit_above_0_9": float((pit > 0.9).mean()),
+    }
+
+
+def build_pit_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
+    work = diagnostics.copy()
+    dates = pd.to_datetime(work["target_date_local"])
+    abs_disagreement = pd.to_numeric(work["nbm_lamp_abs_disagreement_f"], errors="coerce")
+    rows = [pit_summary(work, slice_name="overall")]
+    for name, mask in (
+        ("warm_apr_oct", dates.dt.month.between(4, 10)),
+        ("cool_nov_mar", ~dates.dt.month.between(4, 10)),
+        ("nbm_lamp_abs_disagreement_lt_2f", abs_disagreement < 2.0),
+        ("nbm_lamp_abs_disagreement_2_to_5f", (abs_disagreement >= 2.0) & (abs_disagreement < 5.0)),
+        ("nbm_lamp_abs_disagreement_gte_5f", abs_disagreement >= 5.0),
+    ):
+        subset = work.loc[mask]
+        if not subset.empty:
+            rows.append(pit_summary(subset, slice_name=name))
+    return pd.DataFrame(rows)
+
+
+def representative_event_bins(labels: list[str] | None = None) -> list[EventBin]:
+    source_labels = labels if labels is not None else list(DEFAULT_REPRESENTATIVE_EVENT_BINS)
+    return [parse_event_bin(label) for label in source_labels]
+
+
+def observed_event_bin_name(observed_temp_f: int, bins: list[EventBin]) -> str:
+    matches = [event_bin.name for event_bin in bins if event_bin.contains(observed_temp_f)]
+    if len(matches) != 1:
+        raise ValueError(f"observed temperature {observed_temp_f} matched {len(matches)} representative bins")
+    return matches[0]
+
+
+def build_event_bin_diagnostics(prediction_df: pd.DataFrame, *, bins: list[EventBin] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    min_temp_f, max_temp_f = ordered_ladder_bounds(prediction_df)
+    bins = bins if bins is not None else representative_event_bins()
+    score_rows: list[dict[str, object]] = []
+    probability_rows: list[dict[str, object]] = []
+    for _, row in prediction_df.iterrows():
+        ladder = ladder_for_prediction(row, min_temp_f=min_temp_f, max_temp_f=max_temp_f)
+        mapped = map_ladder_to_bins(ladder, bins)
+        observed_temp = int(round(float(row["final_tmax_f"])))
+        observed_bin = observed_event_bin_name(observed_temp, bins)
+        probabilities = pd.to_numeric(mapped["probability"], errors="coerce").fillna(0.0).to_numpy(float)
+        labels = mapped["bin"].astype(str).tolist()
+        observed = np.array([label == observed_bin for label in labels], dtype=float)
+        observed_probability = float(probabilities[observed.astype(bool)].sum())
+        score_rows.append(
+            {
+                "target_date_local": row["target_date_local"],
+                "station_id": row["station_id"],
+                "final_tmax_f": float(row["final_tmax_f"]),
+                "observed_bin": observed_bin,
+                "observed_bin_probability": observed_probability,
+                "negative_log_likelihood": float(-np.log(max(observed_probability, EPSILON))),
+                "brier_score": float(np.sum((probabilities - observed) ** 2)),
+            }
+        )
+        for label, probability, is_observed in zip(labels, probabilities, observed):
+            probability_rows.append(
+                {
+                    "target_date_local": row["target_date_local"],
+                    "bin": label,
+                    "probability": float(probability),
+                    "observed": bool(is_observed),
+                }
+            )
+    scores = pd.DataFrame(score_rows)
+    probabilities_df = pd.DataFrame(probability_rows)
+    bin_metrics = (
+        probabilities_df.assign(squared_error=(probabilities_df["probability"] - probabilities_df["observed"].astype(float)) ** 2)
+        .groupby("bin", dropna=False)
+        .agg(
+            row_count=("observed", "size"),
+            observed_frequency=("observed", "mean"),
+            mean_predicted_probability=("probability", "mean"),
+            brier_score=("squared_error", "mean"),
+        )
+        .reset_index()
+    )
+    reliability_input = probabilities_df.copy()
+    reliability_input["probability_bucket"] = pd.cut(
+        reliability_input["probability"],
+        bins=np.linspace(0.0, 1.0, 11),
+        include_lowest=True,
+        right=True,
+    ).astype(str)
+    reliability = (
+        reliability_input.groupby("probability_bucket", dropna=False)
+        .agg(
+            row_count=("observed", "size"),
+            mean_predicted_probability=("probability", "mean"),
+            observed_frequency=("observed", "mean"),
+        )
+        .reset_index()
+    )
+    metrics = {
+        "status": "ok",
+        "row_count": int(len(scores)),
+        "bin_count": int(len(bins)),
+        "bins": [event_bin.name for event_bin in bins],
+        "mean_negative_log_likelihood": float(scores["negative_log_likelihood"].mean()),
+        "mean_brier_score": float(scores["brier_score"].mean()),
+        "mean_observed_bin_probability": float(scores["observed_bin_probability"].mean()),
+    }
+    return scores, bin_metrics, reliability, metrics
 
 
 def main() -> int:
@@ -222,6 +529,13 @@ def main() -> int:
         if not subset.empty:
             disagreement_rows.append({"disagreement_bucket": name, "row_count": int(len(subset)), **summarize_point_metrics(subset, "pred_tmax_q50_f")})
 
+    degree_scores, modal_reliability, degree_reliability, pit_diagnostics, degree_metrics = build_degree_ladder_diagnostics(prediction_df)
+    representative_bin_labels = load_event_bin_labels(args.representative_event_bins_path) if args.representative_event_bins_path is not None else list(DEFAULT_REPRESENTATIVE_EVENT_BINS)
+    event_scores, event_bin_metrics, event_reliability, event_metrics = build_event_bin_diagnostics(
+        prediction_df,
+        bins=representative_event_bins(representative_bin_labels),
+    )
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_overall = {
         "status": "ok",
@@ -232,6 +546,11 @@ def main() -> int:
         "residual_q50_rmse_f": rmse(prediction_df["target_residual_f"], prediction_df["pred_residual_q50_f"]),
         "final_tmax_q50_mae_f": mae(prediction_df["final_tmax_f"], prediction_df["pred_tmax_q50_f"]),
         "final_tmax_q50_rmse_f": rmse(prediction_df["final_tmax_f"], prediction_df["pred_tmax_q50_f"]),
+        "degree_ladder_mean_negative_log_likelihood": degree_metrics["mean_negative_log_likelihood"],
+        "degree_ladder_mean_brier_score": degree_metrics["mean_brier_score"],
+        "degree_ladder_mean_ranked_probability_score": degree_metrics["mean_ranked_probability_score"],
+        "event_bin_mean_negative_log_likelihood": event_metrics["mean_negative_log_likelihood"],
+        "event_bin_mean_brier_score": event_metrics["mean_brier_score"],
     }
 
     write_json(args.output_dir / "metrics_overall.json", metrics_overall)
@@ -241,6 +560,15 @@ def main() -> int:
     pd.DataFrame(crossing_rows).to_csv(args.output_dir / "quantile_crossing.csv", index=False)
     pd.DataFrame(season_rows).to_csv(args.output_dir / "metrics_by_season.csv", index=False)
     pd.DataFrame(disagreement_rows).to_csv(args.output_dir / "metrics_by_nbm_lamp_disagreement.csv", index=False)
+    degree_scores.to_csv(args.output_dir / "degree_ladder_scores.csv", index=False)
+    modal_reliability.to_csv(args.output_dir / "degree_ladder_modal_reliability.csv", index=False)
+    degree_reliability.to_csv(args.output_dir / "degree_ladder_reliability.csv", index=False)
+    pit_diagnostics.to_csv(args.output_dir / "pit_diagnostics.csv", index=False)
+    event_scores.to_csv(args.output_dir / "event_bin_scores.csv", index=False)
+    event_bin_metrics.to_csv(args.output_dir / "event_bin_metrics.csv", index=False)
+    event_reliability.to_csv(args.output_dir / "event_bin_reliability.csv", index=False)
+    write_json(args.output_dir / "degree_ladder_metrics.json", degree_metrics)
+    write_json(args.output_dir / "event_bin_metrics.json", event_metrics)
     prediction_df.to_parquet(args.output_dir / "validation_predictions.parquet", index=False)
     evaluation_manifest = {
         "status": "ok",
@@ -249,6 +577,7 @@ def main() -> int:
         "models_dir": str(args.models_dir),
         "output_dir": str(args.output_dir),
         "validation_row_count": int(len(prediction_df)),
+        "representative_event_bin_labels": representative_bin_labels,
         "linear_blend_coefficients": [float(value) for value in linear_coef],
         "outputs": [
             "metrics_overall.json",
@@ -258,6 +587,15 @@ def main() -> int:
             "quantile_crossing.csv",
             "metrics_by_season.csv",
             "metrics_by_nbm_lamp_disagreement.csv",
+            "degree_ladder_scores.csv",
+            "degree_ladder_modal_reliability.csv",
+            "degree_ladder_reliability.csv",
+            "degree_ladder_metrics.json",
+            "pit_diagnostics.csv",
+            "event_bin_scores.csv",
+            "event_bin_metrics.csv",
+            "event_bin_metrics.json",
+            "event_bin_reliability.csv",
             "validation_predictions.parquet",
         ],
     }

@@ -14,6 +14,7 @@ def quantiles_to_degree_ladder(
     min_temp_f: int | None = None,
     max_temp_f: int | None = None,
     rearrange_crossing: bool = True,
+    allocate_tail_mass: bool = True,
 ) -> pd.DataFrame:
     if not quantiles:
         raise ValueError("quantiles must be non-empty")
@@ -49,10 +50,19 @@ def quantiles_to_degree_ladder(
     for index, q in zip(inverse, qs):
         unique_qs[index] = max(unique_qs[index], q)
     upper_edges = degrees + 0.5
-    cdf_upper = np.interp(upper_edges, unique_values, unique_qs, left=0.0, right=1.0)
+    cdf_upper = np.interp(upper_edges, unique_values, unique_qs, left=unique_qs[0], right=unique_qs[-1])
     lower_edges = degrees - 0.5
-    cdf_lower = np.interp(lower_edges, unique_values, unique_qs, left=0.0, right=1.0)
+    cdf_lower = np.interp(lower_edges, unique_values, unique_qs, left=unique_qs[0], right=unique_qs[-1])
     probs = np.maximum(cdf_upper - cdf_lower, 0.0)
+    if allocate_tail_mass:
+        lower_tail = degrees < unique_values[0]
+        upper_tail = degrees > unique_values[-1]
+        if not bool(lower_tail.any()):
+            lower_tail = degrees == degrees[0]
+        if not bool(upper_tail.any()):
+            upper_tail = degrees == degrees[-1]
+        probs[lower_tail] += unique_qs[0] / float(lower_tail.sum())
+        probs[upper_tail] += (1.0 - unique_qs[-1]) / float(upper_tail.sum())
     total = probs.sum()
     if total <= 0:
         probs[:] = 1.0 / len(probs)

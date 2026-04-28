@@ -16,8 +16,24 @@ from experiments.no_hrrr_model.no_hrrr_model.build_inference_features import fil
 from experiments.no_hrrr_model.no_hrrr_model.contracts import audit_training_features
 from experiments.no_hrrr_model.no_hrrr_model.distribution import quantiles_to_degree_ladder
 from experiments.no_hrrr_model.no_hrrr_model.event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
+from experiments.no_hrrr_model.no_hrrr_model.evaluate import (
+    build_degree_ladder_diagnostics,
+    build_event_bin_diagnostics,
+    DEFAULT_REPRESENTATIVE_EVENT_BINS,
+    representative_event_bins,
+)
 from experiments.no_hrrr_model.no_hrrr_model.normalize_features import normalize_features
 from experiments.no_hrrr_model.no_hrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
+from experiments.no_hrrr_model.no_hrrr_model.rolling_origin_anchor_select import (
+    anchor_candidate_specs,
+    apply_anchor,
+    best_weight_for_subset,
+    fixed_anchor,
+    fit_ridge_anchor,
+    month_segment,
+    transformed_fold_df,
+)
+from experiments.no_hrrr_model.no_hrrr_model.rolling_origin_model_select import DEFAULT_CANDIDATES, DEFAULT_MODEL_CANDIDATE_ID, candidate_by_id, leakage_findings, load_candidates, load_splits, summarize_candidates
 from experiments.no_hrrr_model.no_hrrr_model.run_online_inference import resolve_lamp_source
 from experiments.no_hrrr_model.no_hrrr_model.tui import (
     command_for_run,
@@ -180,6 +196,90 @@ def test_distribution_rearranges_crossing_quantiles() -> None:
         raise AssertionError("crossing quantiles should be rejected when rearrangement is disabled")
 
 
+def test_distribution_allocates_nonzero_tail_probability() -> None:
+    ladder = quantiles_to_degree_ladder({0.05: 70.0, 0.5: 75.0, 0.95: 80.0}, min_temp_f=60, max_temp_f=90)
+    assert round(float(ladder["probability"].sum()), 6) == 1.0
+    assert float(ladder.loc[ladder["temp_f"] == 60, "probability"].iloc[0]) > 0.0
+    assert float(ladder.loc[ladder["temp_f"] == 90, "probability"].iloc[0]) > 0.0
+    assert round(float(ladder.loc[ladder["temp_f"] < 70, "probability"].sum()), 6) == 0.05
+    assert round(float(ladder.loc[ladder["temp_f"] > 80, "probability"].sum()), 6) == 0.05
+
+
+def test_degree_ladder_diagnostics_score_probability_forecast() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "target_date_local": "2025-04-11",
+                "station_id": "KLGA",
+                "final_tmax_f": 70.0,
+                "nbm_minus_lamp_tmax_f": 1.0,
+                "pred_tmax_q05_f": 68.0,
+                "pred_tmax_q10_f": 69.0,
+                "pred_tmax_q25_f": 70.0,
+                "pred_tmax_q50_f": 70.0,
+                "pred_tmax_q75_f": 71.0,
+                "pred_tmax_q90_f": 72.0,
+                "pred_tmax_q95_f": 73.0,
+            }
+        ]
+    )
+
+    scores, modal_reliability, degree_reliability, pit, metrics = build_degree_ladder_diagnostics(df)
+
+    assert len(scores) == 1
+    assert 0.0 <= float(scores.loc[0, "observed_probability"]) <= 1.0
+    assert 0.0 <= float(scores.loc[0, "pit_mid"]) <= 1.0
+    assert float(scores.loc[0, "negative_log_likelihood"]) >= 0.0
+    assert not modal_reliability.empty
+    assert not degree_reliability.empty
+    assert {"mean_predicted_probability", "observed_frequency"}.issubset(set(degree_reliability.columns))
+    assert pit.loc[0, "slice"] == "overall"
+    assert metrics["row_count"] == 1
+
+
+def test_event_bin_diagnostics_scores_representative_bins() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "target_date_local": "2025-04-11",
+                "station_id": "KLGA",
+                "final_tmax_f": 70.0,
+                "pred_tmax_q05_f": 68.0,
+                "pred_tmax_q10_f": 69.0,
+                "pred_tmax_q25_f": 70.0,
+                "pred_tmax_q50_f": 70.0,
+                "pred_tmax_q75_f": 71.0,
+                "pred_tmax_q90_f": 72.0,
+                "pred_tmax_q95_f": 73.0,
+            },
+            {
+                "target_date_local": "2025-04-12",
+                "station_id": "KLGA",
+                "final_tmax_f": 74.0,
+                "pred_tmax_q05_f": 72.0,
+                "pred_tmax_q10_f": 73.0,
+                "pred_tmax_q25_f": 74.0,
+                "pred_tmax_q50_f": 74.0,
+                "pred_tmax_q75_f": 75.0,
+                "pred_tmax_q90_f": 76.0,
+                "pred_tmax_q95_f": 77.0,
+            },
+        ]
+    )
+
+    bins = representative_event_bins()
+    scores, bin_metrics, reliability, metrics = build_event_bin_diagnostics(df)
+
+    assert [event_bin.name for event_bin in bins] == list(DEFAULT_REPRESENTATIVE_EVENT_BINS)
+    assert bins[0].upper_f is not None
+    assert bins[-1].lower_f is not None
+    assert len(scores) == 2
+    assert set(scores["observed_bin"]).issubset(set(metrics["bins"]))
+    assert not bin_metrics.empty
+    assert not reliability.empty
+    assert metrics["bin_count"] == len(metrics["bins"])
+
+
 def test_event_bin_strict_under_and_greater_than() -> None:
     assert parse_event_bin("under 70").upper_f == 69
     assert parse_event_bin("less than 70").upper_f == 69
@@ -256,6 +356,151 @@ def test_feature_selection_excludes_time_source_and_label_codes() -> None:
         ]
     )
     assert select_feature_columns(df) == ["nbm_temp_2m_day_max_f", "wu_last_temp_f"]
+
+
+def test_model_selection_leakage_checker_flags_forbidden_features() -> None:
+    findings = leakage_findings(["wu_last_temp_f", "label_market_bin_code", "hrrr_temp_2m_day_max_k", "meta_nbm_source_model_code"])
+    reasons = {(row["feature"], row["reason"]) for row in findings}
+    assert ("label_market_bin_code", "forbidden prefix") in reasons
+    assert ("label_market_bin_code", "forbidden substring market") in reasons
+    assert ("hrrr_temp_2m_day_max_k", "forbidden prefix") in reasons
+    assert ("meta_nbm_source_model_code", "forbidden substring _source_model_code") in reasons
+
+
+def test_model_selection_summary_sorts_by_probability_scores() -> None:
+    metrics = pd.DataFrame(
+        [
+            {"candidate_id": "worse", "validation_row_count": 100, "degree_ladder_nll": 2.0, "degree_ladder_brier": 0.9, "degree_ladder_rps": 0.1, "event_bin_nll": 1.5, "event_bin_brier": 0.7, "final_tmax_q50_mae_f": 1.0, "final_tmax_q50_rmse_f": 1.2, "q05_q95_coverage": 0.8, "q50_pinball_loss": 0.5},
+            {"candidate_id": "better", "validation_row_count": 10, "degree_ladder_nll": 2.2, "degree_ladder_brier": 0.9, "degree_ladder_rps": 0.1, "event_bin_nll": 1.0, "event_bin_brier": 0.6, "final_tmax_q50_mae_f": 1.1, "final_tmax_q50_rmse_f": 1.3, "q05_q95_coverage": 0.8, "q50_pinball_loss": 0.4},
+            {"candidate_id": "better", "validation_row_count": 90, "degree_ladder_nll": 2.2, "degree_ladder_brier": 0.9, "degree_ladder_rps": 0.1, "event_bin_nll": 1.0, "event_bin_brier": 0.6, "final_tmax_q50_mae_f": 1.1, "final_tmax_q50_rmse_f": 1.3, "q05_q95_coverage": 0.8, "q50_pinball_loss": 0.6},
+        ]
+    )
+    summary = summarize_candidates(metrics)
+    assert list(summary["candidate_id"]) == ["better", "worse"]
+    assert "weighted_mean_event_bin_nll" in summary.columns
+    assert round(float(summary.loc[summary["candidate_id"] == "better", "weighted_mean_q50_pinball_loss"].iloc[0]), 6) == 0.58
+
+
+def test_default_model_selection_grid_is_constrained_and_regularized() -> None:
+    assert 2 <= len(DEFAULT_CANDIDATES) <= 8
+    candidate_ids = [str(candidate["candidate_id"]) for candidate in DEFAULT_CANDIDATES]
+    assert "current_lgbm_fixed_250_no_inner_es" in candidate_ids
+    assert DEFAULT_MODEL_CANDIDATE_ID == "very_regularized_lgbm_350"
+    assert candidate_by_id(DEFAULT_MODEL_CANDIDATE_ID)["candidate_id"] == DEFAULT_MODEL_CANDIDATE_ID
+    assert len(candidate_ids) == len(set(candidate_ids))
+    tuned_candidates = [candidate for candidate in DEFAULT_CANDIDATES if str(candidate["candidate_id"]) != "current_lgbm_fixed_250_no_inner_es"]
+    for candidate in tuned_candidates:
+        params = candidate["params"]
+        assert isinstance(params, dict)
+        assert "max_depth" in params
+        assert "lambda_l1" in params
+        assert "lambda_l2" in params
+        assert int(candidate["num_boost_round"]) <= 350
+
+
+def test_model_selection_rejects_duplicate_candidate_ids(tmp_path) -> None:
+    path = tmp_path / "candidates.json"
+    path.write_text('{"candidates": [{"candidate_id": "dup", "params": {}}, {"candidate_id": "dup", "params": {}}]}')
+    try:
+        load_candidates(path)
+    except ValueError as exc:
+        assert "duplicate candidate_id" in str(exc)
+    else:
+        raise AssertionError("duplicate candidate ids should be rejected")
+
+
+def test_model_selection_loads_custom_splits(tmp_path) -> None:
+    path = tmp_path / "splits.json"
+    path.write_text('{"splits": [{"train_end": "2023-12-31", "valid_start": "2024-01-01", "valid_end": "2024-06-30"}]}')
+    assert load_splits(path) == [("2023-12-31", "2024-01-01", "2024-06-30")]
+
+
+def test_model_selection_rejects_overlapping_custom_splits(tmp_path) -> None:
+    path = tmp_path / "splits.json"
+    path.write_text('{"splits": [{"train_end": "2024-01-01", "valid_start": "2024-01-01", "valid_end": "2024-06-30"}]}')
+    try:
+        load_splits(path)
+    except ValueError as exc:
+        assert "train_end < valid_start" in str(exc)
+    else:
+        raise AssertionError("overlapping train and validation splits should be rejected")
+
+
+def test_model_selection_rejects_reversed_validation_window(tmp_path) -> None:
+    path = tmp_path / "splits.json"
+    path.write_text('{"splits": [{"train_end": "2023-12-31", "valid_start": "2024-07-01", "valid_end": "2024-06-30"}]}')
+    try:
+        load_splits(path)
+    except ValueError as exc:
+        assert "valid_start <= valid_end" in str(exc)
+    else:
+        raise AssertionError("reversed validation windows should be rejected")
+
+
+def test_anchor_selection_fixed_anchor_and_residual() -> None:
+    df = pd.DataFrame(
+        [
+            {"final_tmax_f": 72.0, "nbm_tmax_open_f": 70.0, "lamp_tmax_open_f": 74.0},
+            {"final_tmax_f": 75.0, "nbm_tmax_open_f": 76.0, "lamp_tmax_open_f": 72.0},
+        ]
+    )
+    anchor = fixed_anchor(df, 0.25)
+    out = apply_anchor(df, anchor)
+    assert list(anchor) == [73.0, 73.0]
+    assert list(out["target_residual_f"]) == [-1.0, 2.0]
+
+
+def test_anchor_selection_best_weight_prefers_train_subset() -> None:
+    df = pd.DataFrame(
+        [
+            {"final_tmax_f": 70.0, "nbm_tmax_open_f": 70.0, "lamp_tmax_open_f": 80.0},
+            {"final_tmax_f": 72.0, "nbm_tmax_open_f": 72.0, "lamp_tmax_open_f": 82.0},
+        ]
+    )
+    assert best_weight_for_subset(df, fallback_weight=0.5) == 1.0
+
+
+def test_anchor_selection_best_weight_uses_fallback_for_nonfinite_subset() -> None:
+    df = pd.DataFrame(
+        [
+            {"final_tmax_f": pd.NA, "nbm_tmax_open_f": pd.NA, "lamp_tmax_open_f": pd.NA},
+        ]
+    )
+    assert best_weight_for_subset(df, fallback_weight=0.3) == 0.3
+
+
+def test_anchor_selection_includes_month_segment_candidate() -> None:
+    ids = {str(candidate["anchor_candidate_id"]) for candidate in anchor_candidate_specs()}
+    assert "segmented_month_train_mae" in ids
+    df = pd.DataFrame([{"target_date_local": "2024-01-15"}, {"target_date_local": "2024-12-31"}])
+    assert list(month_segment(df)) == ["month_01", "month_12"]
+
+
+def test_anchor_selection_ridge_anchor_uses_train_fold_only() -> None:
+    df = pd.DataFrame(
+        [
+            {"target_date_local": "2023-01-01", "final_tmax_f": 70.0, "nbm_tmax_open_f": 70.0, "lamp_tmax_open_f": 70.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2023-01-02", "final_tmax_f": 72.0, "nbm_tmax_open_f": 72.0, "lamp_tmax_open_f": 72.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2023-01-03", "final_tmax_f": 74.0, "nbm_tmax_open_f": 74.0, "lamp_tmax_open_f": 74.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2023-01-04", "final_tmax_f": 76.0, "nbm_tmax_open_f": 76.0, "lamp_tmax_open_f": 76.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2023-01-05", "final_tmax_f": 78.0, "nbm_tmax_open_f": 78.0, "lamp_tmax_open_f": 78.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2023-01-06", "final_tmax_f": 80.0, "nbm_tmax_open_f": 80.0, "lamp_tmax_open_f": 80.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2024-01-01", "final_tmax_f": 999.0, "nbm_tmax_open_f": 76.0, "lamp_tmax_open_f": 76.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2024-01-02", "final_tmax_f": 999.0, "nbm_tmax_open_f": 78.0, "lamp_tmax_open_f": 78.0, "nbm_minus_lamp_tmax_f": 0.0},
+            {"target_date_local": "2024-01-03", "final_tmax_f": 999.0, "nbm_tmax_open_f": 80.0, "lamp_tmax_open_f": 80.0, "nbm_minus_lamp_tmax_f": 0.0},
+        ]
+    )
+    coef = fit_ridge_anchor(df.loc[df["target_date_local"] < "2024-01-01"], l2=0.1)
+    assert len(coef) == 6
+    transformed, metadata = transformed_fold_df(
+        df,
+        {"anchor_candidate_id": "ridge_linear_anchor", "anchor_type": "ridge_linear"},
+        train_end="2023-12-31",
+        valid_start="2024-01-01",
+        valid_end="2024-12-31",
+    )
+    assert "coefficients" in metadata
+    assert transformed.loc[transformed["target_date_local"] >= "2024-01-01", "anchor_tmax_f"].max() < 999.0
 
 
 def test_inference_label_history_excludes_target_day_label() -> None:

@@ -211,6 +211,7 @@ Optimization guidance:
 - use HRRR `--skip-provenance` when the run only needs overnight summary features and provenance parquet output is not needed; manifests should then record `provenance_written=false`
 - keep HRRR `--extract-method cfgrib` as the conservative reference backend; `--extract-method eccodes` is the faster opt-in direct extractor. A 2026-04-27 cached extraction benchmark on `2023-02-04T05Z` measured ecCodes at 23.72s vs cfgrib at 26.32s with lower max RSS and row parity within small floating-point tolerance after APCP duplicate-message handling was fixed.
 - the HRRR monthly helper forwards the optimized raw-builder flags, including `--batch-reduce-mode`, `--range-merge-gap-bytes`, `--crop-method`, `--crop-grib-type`, `--wgrib2-threads`, `--extract-method`, `--summary-profile`, and `--skip-provenance`
+- HRRR-Zarr Phase 4 has started but is not a drop-in GRIB replacement; `tools/hrrr/probe_hrrr_zarr.py` found missing upper-level direct `RH`, missing upper-level direct `SPFH`, missing `925mb/HGT`, and missing `f18` coverage on the latest non-full overnight cycle for tested dates. Keep GRIB fallback in any Zarr prototype.
 - do not assume an optimization is short-window-only unless it changes source selection scope rather than execution throughput
 
 ## Weather Tool Layout
