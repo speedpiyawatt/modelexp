@@ -120,7 +120,11 @@ def summarize_diagnostics(task_reports: list[dict[str, object]]) -> dict[str, ob
         key: sum(numeric(item.get(key)) for item in diagnostics)
         for key in timing_keys
     }
-    binary_byte_counts = [int(item.get("binary_byte_count") or 0) for item in diagnostics if item.get("binary_byte_count") is not None]
+    binary_byte_counts = [
+        int(item.get("binary_byte_count") or 0)
+        for item in diagnostics
+        if item.get("binary_byte_count") is not None and item.get("binary_cache_hit") is False
+    ]
     return {
         **totals,
         "binary_temp_bytes_observed": sum(binary_byte_counts),

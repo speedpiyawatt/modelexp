@@ -29,6 +29,14 @@ from tools.weather.progress import create_progress_reporter, resolve_progress_mo
 DEFAULT_RUN_ROOT = Path("data/runtime/backfill_overnight")
 DEFAULT_SELECTION_MODE = "overnight_0005"
 DEFAULT_DAY_WORKERS = 1
+DEFAULT_RANGE_MERGE_GAP_BYTES = 65536
+DEFAULT_BATCH_REDUCE_MODE = "cycle"
+DEFAULT_CROP_METHOD = "auto"
+DEFAULT_CROP_GRIB_TYPE = "same"
+DEFAULT_WGRIB2_THREADS = 1
+DEFAULT_EXTRACT_METHOD = "wgrib2-bin"
+DEFAULT_SUMMARY_PROFILE = "overnight"
+DEFAULT_SKIP_PROVENANCE = True
 RUN_LOG_LOCK = threading.Lock()
 PROGRESS_PREFIX = "[progress]"
 PROGRESS_KV_RE = re.compile(r"^(?P<key>[^=\s]+)=(?P<value>.*)$")
@@ -86,14 +94,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extract-workers", type=int)
     parser.add_argument("--reduce-queue-size", type=int)
     parser.add_argument("--extract-queue-size", type=int)
-    parser.add_argument("--range-merge-gap-bytes", type=int)
-    parser.add_argument("--batch-reduce-mode", choices=("off", "cycle"), default="off")
-    parser.add_argument("--crop-method", choices=("auto", "small_grib", "ijsmall_grib"))
-    parser.add_argument("--crop-grib-type")
-    parser.add_argument("--wgrib2-threads", type=int)
-    parser.add_argument("--extract-method", choices=("cfgrib", "eccodes", "wgrib2-bin", "wgrib2-ijbox-bin"))
-    parser.add_argument("--summary-profile", choices=("full", "overnight"))
-    parser.add_argument("--skip-provenance", action="store_true")
+    parser.add_argument("--range-merge-gap-bytes", type=int, default=DEFAULT_RANGE_MERGE_GAP_BYTES)
+    parser.add_argument("--batch-reduce-mode", choices=("off", "cycle"), default=DEFAULT_BATCH_REDUCE_MODE)
+    parser.add_argument("--crop-method", choices=("auto", "small_grib", "ijsmall_grib"), default=DEFAULT_CROP_METHOD)
+    parser.add_argument("--crop-grib-type", default=DEFAULT_CROP_GRIB_TYPE)
+    parser.add_argument("--wgrib2-threads", type=int, default=DEFAULT_WGRIB2_THREADS)
+    parser.add_argument("--extract-method", choices=("cfgrib", "eccodes", "wgrib2-bin", "wgrib2-ijbox-bin"), default=DEFAULT_EXTRACT_METHOD)
+    parser.add_argument("--summary-profile", choices=("full", "overnight"), default=DEFAULT_SUMMARY_PROFILE)
+    parser.add_argument("--skip-provenance", action="store_true", default=DEFAULT_SKIP_PROVENANCE)
+    parser.add_argument("--write-provenance", action="store_false", dest="skip_provenance", help="Write provenance parquet output instead of the optimized summary-only default.")
     parser.add_argument("--progress-mode", choices=("auto", "dashboard", "log"), default="auto")
     parser.add_argument(
         "--disable-dashboard-hotkeys",
@@ -222,9 +231,9 @@ def validate_hrrr_day(
     day: DayWindow,
     *,
     selection_mode: str,
-    extract_method: str = "cfgrib",
-    summary_profile: str = "full",
-    provenance_written: bool = True,
+    extract_method: str = DEFAULT_EXTRACT_METHOD,
+    summary_profile: str = DEFAULT_SUMMARY_PROFILE,
+    provenance_written: bool = not DEFAULT_SKIP_PROVENANCE,
 ) -> bool:
     paths = hrrr_summary_paths(run_root, day)
     if not paths["summary"].exists() or not paths["manifest_json"].exists() or not paths["manifest_parquet"].exists():
@@ -271,10 +280,15 @@ def validate_hrrr_day(
 def requested_hrrr_contract(args: argparse.Namespace) -> dict[str, object]:
     return {
         "selection_mode": str(args.selection_mode),
-        "extract_method": str(getattr(args, "extract_method", None) or "cfgrib"),
-        "summary_profile": str(getattr(args, "summary_profile", None) or "full"),
-        "provenance_written": not bool(getattr(args, "skip_provenance", False)),
+        "extract_method": str(getattr(args, "extract_method", None) or DEFAULT_EXTRACT_METHOD),
+        "summary_profile": str(getattr(args, "summary_profile", None) or DEFAULT_SUMMARY_PROFILE),
+        "provenance_written": not bool(getattr(args, "skip_provenance", DEFAULT_SKIP_PROVENANCE)),
     }
+
+
+def effective_arg(args: argparse.Namespace, name: str, default: object) -> object:
+    value = getattr(args, name, None)
+    return default if value is None else value
 
 
 def child_progress_mode(args: argparse.Namespace, *, parent_dashboard_active: bool) -> str:
@@ -317,7 +331,7 @@ def build_hrrr_command(
         "--progress-mode",
         progress_mode or str(args.progress_mode),
         "--batch-reduce-mode",
-        str(getattr(args, "batch_reduce_mode", "off")),
+        str(effective_arg(args, "batch_reduce_mode", DEFAULT_BATCH_REDUCE_MODE)),
     ]
     if getattr(args, "download_workers", None) is not None:
         command.extend(["--download-workers", str(args.download_workers)])
@@ -329,19 +343,13 @@ def build_hrrr_command(
         command.extend(["--reduce-queue-size", str(args.reduce_queue_size)])
     if getattr(args, "extract_queue_size", None) is not None:
         command.extend(["--extract-queue-size", str(args.extract_queue_size)])
-    if getattr(args, "range_merge_gap_bytes", None) is not None:
-        command.extend(["--range-merge-gap-bytes", str(args.range_merge_gap_bytes)])
-    if getattr(args, "crop_method", None) is not None:
-        command.extend(["--crop-method", str(args.crop_method)])
-    if getattr(args, "crop_grib_type", None) is not None:
-        command.extend(["--crop-grib-type", str(args.crop_grib_type)])
-    if getattr(args, "wgrib2_threads", None) is not None:
-        command.extend(["--wgrib2-threads", str(args.wgrib2_threads)])
-    if getattr(args, "extract_method", None) is not None:
-        command.extend(["--extract-method", str(args.extract_method)])
-    if getattr(args, "summary_profile", None) is not None:
-        command.extend(["--summary-profile", str(args.summary_profile)])
-    if getattr(args, "skip_provenance", False):
+    command.extend(["--range-merge-gap-bytes", str(effective_arg(args, "range_merge_gap_bytes", DEFAULT_RANGE_MERGE_GAP_BYTES))])
+    command.extend(["--crop-method", str(effective_arg(args, "crop_method", DEFAULT_CROP_METHOD))])
+    command.extend(["--crop-grib-type", str(effective_arg(args, "crop_grib_type", DEFAULT_CROP_GRIB_TYPE))])
+    command.extend(["--wgrib2-threads", str(effective_arg(args, "wgrib2_threads", DEFAULT_WGRIB2_THREADS))])
+    command.extend(["--extract-method", str(effective_arg(args, "extract_method", DEFAULT_EXTRACT_METHOD))])
+    command.extend(["--summary-profile", str(effective_arg(args, "summary_profile", DEFAULT_SUMMARY_PROFILE))])
+    if bool(effective_arg(args, "skip_provenance", DEFAULT_SKIP_PROVENANCE)):
         command.append("--skip-provenance")
     if getattr(args, "max_task_attempts", None) is not None:
         command.extend(["--max-task-attempts", str(args.max_task_attempts)])

@@ -143,19 +143,27 @@ Implementation tasks:
   - Writes `benchmark_runs.json`, `benchmark_runs.csv`, and `benchmark_summary.json`.
   - Records wall time, CPU time, process max RSS, binary temp bytes observed, extractor timing breakouts, and parity drift.
 
-- [ ] Benchmark reduced-GRIB `wgrib2-bin`.
+- [x] Benchmark reduced-GRIB `wgrib2-bin`.
   - Same cached `2023-02-04T05Z` multi-forecast file.
   - Same forecast hours `0-18`.
   - Compare against cfgrib and ecCodes references.
   - Record wall time, CPU time, max RSS, temp bytes, and output parity.
+  - Full report: `/tmp/hrrr_binary_benchmark_20230204/extractor_benchmark_20260428T105727Z/benchmark_summary.json`.
+  - Full result on `2023-02-04T05Z f00-f18`: ecCodes `5.545s`, cfgrib `113.717s`, reduced `wgrib2-bin` `0.987s`.
+  - Timing breakout for reduced `wgrib2-bin`: binary dump `0.549s`, binary read `0.039s`, row build `0.291s`.
+  - Parity: summary max drift `2.4414062522737368e-05`; row max drift `0.00012016067013576048` in RH fields. The same row drift appears against cfgrib, so this is not unique to the binary path.
   - Smoke status: passed on available `2026-04-11T04Z f00` artifact.
   - Smoke report: `/tmp/hrrr_binary_benchmark_smoke_20260428T080315Z/benchmark_summary.json`.
   - Smoke result: ecCodes `0.348s`, reduced `wgrib2-bin` `0.080s`, max row drift `6.201003812833505e-05`.
 
-- [ ] Benchmark direct `-ijbox ... -bin`.
+- [x] Benchmark direct `-ijbox ... -bin`.
   - Use the uncropped selected multi-forecast GRIB.
   - Include time saved by skipping reduced GRIB creation.
   - Break out download, binary dump, binary read, row-build, and summary timings.
+  - Full report: `/tmp/hrrr_binary_benchmark_20230204/extractor_benchmark_20260428T105727Z/benchmark_summary.json`.
+  - Full result on `2023-02-04T05Z f00-f18`: direct `wgrib2-ijbox-bin` `8.089s`.
+  - Timing breakout for direct `wgrib2-ijbox-bin`: ijbox context `1.613s`, binary dump `5.955s`, binary read `0.064s`, row build `0.314s`.
+  - Conclusion for this benchmark: direct `ijbox` is correct but slower than reduced `wgrib2-bin`; keep it experimental.
   - Smoke status: passed on available uncropped `2026-04-11T04Z f00` selected artifact.
   - Smoke report: `/tmp/hrrr_binary_benchmark_smoke_20260428T080315Z/benchmark_summary.json`.
   - Smoke result: direct `wgrib2-ijbox-bin` `0.527s`, max row drift `6.201003812833505e-05`.
@@ -164,6 +172,11 @@ Implementation tasks:
   - Use the production-ish overnight settings.
   - Include anchor and lag/revision cycles.
   - Confirm the end-to-end monthly or multi-day backfill is materially faster.
+  - Post-download full-day benchmark completed for `2023-02-04` with both retained overnight cycles: `t05z f00-f18` and `t00z f05-f26`.
+  - Existing-batch extraction report: `/tmp/hrrr_real_backfill_benchmark_20260428T110423Z/existing_batch_extract/existing_batch_extract_benchmark.json`.
+  - Extraction-only on existing batch artifacts: ecCodes `12.776s`, reduced `wgrib2-bin` `1.308s`, direct `wgrib2-ijbox-bin` `17.689s`.
+  - Real post-download stage estimate including measured concatenate/reduce costs: ecCodes about `31.5s`, reduced `wgrib2-bin` about `18.5s`, direct `wgrib2-ijbox-bin` about `22.0s`.
+  - Conclusion: reduced `wgrib2-bin` is the best real-world path among current implementations; direct ijbox is correct but not the fastest.
 
 ## Definition Of Done
 

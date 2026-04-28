@@ -3180,12 +3180,25 @@ def test_hrrr_monthly_backfill_runs_daily_commands_extracts_day_output_and_clean
             "expected_task_count": 1,
             "completed_task_keys": ["task_a"],
             "summary_parquet_path": str(summary_dir / f"{month_id}.parquet"),
+            "target_date_local": target_date_local,
+            "selection_mode": "overnight_0005",
+            "extract_method": "wgrib2-bin",
+            "summary_profile": "overnight",
+            "provenance_written": False,
         }
         (output_dir / f"{month_id}.manifest.json").write_text(json.dumps(manifest))
-        pd.DataFrame([{"status": "ok", "summary_parquet_path": str(summary_dir / f"{month_id}.parquet")}]).to_parquet(
-            output_dir / f"{month_id}.manifest.parquet",
-            index=False,
-        )
+        pd.DataFrame(
+            [
+                {
+                    "status": "ok",
+                    "summary_parquet_path": str(summary_dir / f"{month_id}.parquet"),
+                    "selection_mode": "overnight_0005",
+                    "extract_method": "wgrib2-bin",
+                    "summary_profile": "overnight",
+                    "provenance_written": False,
+                }
+            ]
+        ).to_parquet(output_dir / f"{month_id}.manifest.parquet", index=False)
         return argparse.Namespace(returncode=0)
 
     monkeypatch.setattr(hrrr_monthly_backfill.subprocess, "run", fake_run)
@@ -3205,9 +3218,12 @@ def test_hrrr_monthly_backfill_runs_daily_commands_extracts_day_output_and_clean
         "completed_task_keys": ["task_a"],
         "target_date_local": "2024-01-01",
         "selection_mode": "overnight_0005",
+        "extract_method": "wgrib2-bin",
+        "summary_profile": "overnight",
+        "provenance_written": False,
     }
     (valid_state_root / "hrrr.manifest.json").write_text(json.dumps(manifest))
-    pd.DataFrame([{"status": "ok", "selection_mode": "overnight_0005"}]).to_parquet(
+    pd.DataFrame([{"status": "ok", "selection_mode": "overnight_0005", "extract_method": "wgrib2-bin", "summary_profile": "overnight", "provenance_written": False}]).to_parquet(
         valid_state_root / "hrrr.manifest.parquet",
         index=False,
     )
@@ -3273,9 +3289,30 @@ def test_hrrr_monthly_backfill_rebuilds_day_when_selection_mode_changes(tmp_path
         summary_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([{"target_date_local": start_date, "status": "ok"}]).to_parquet(summary_dir / f"{month_id}.parquet", index=False)
         (output_dir / f"{month_id}.manifest.json").write_text(
-            json.dumps({"complete": True, "expected_task_count": 1, "completed_task_keys": ["task_a"]})
+            json.dumps(
+                {
+                    "complete": True,
+                    "expected_task_count": 1,
+                    "completed_task_keys": ["task_a"],
+                    "target_date_local": start_date,
+                    "selection_mode": "overnight_0005",
+                    "extract_method": "wgrib2-bin",
+                    "summary_profile": "overnight",
+                    "provenance_written": False,
+                }
+            )
         )
-        pd.DataFrame([{"status": "ok"}]).to_parquet(output_dir / f"{month_id}.manifest.parquet", index=False)
+        pd.DataFrame(
+            [
+                {
+                    "status": "ok",
+                    "selection_mode": "overnight_0005",
+                    "extract_method": "wgrib2-bin",
+                    "summary_profile": "overnight",
+                    "provenance_written": False,
+                }
+            ]
+        ).to_parquet(output_dir / f"{month_id}.manifest.parquet", index=False)
         return argparse.Namespace(returncode=0)
 
     monkeypatch.setattr(hrrr_monthly_backfill.subprocess, "run", fake_run)
@@ -3429,6 +3466,33 @@ def test_hrrr_monthly_parse_args_accepts_day_workers_and_dashboard_hotkey_flag(m
 
     assert args.day_workers == 3
     assert args.disable_dashboard_hotkeys is True
+    assert args.batch_reduce_mode == "cycle"
+    assert args.range_merge_gap_bytes == 65536
+    assert args.crop_method == "auto"
+    assert args.crop_grib_type == "same"
+    assert args.wgrib2_threads == 1
+    assert args.extract_method == "wgrib2-bin"
+    assert args.summary_profile == "overnight"
+    assert args.skip_provenance is True
+
+
+def test_hrrr_monthly_parse_args_can_write_provenance(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_hrrr_monthly_backfill.py",
+            "--start-local-date",
+            "2024-01-01",
+            "--end-local-date",
+            "2024-01-01",
+            "--write-provenance",
+        ],
+    )
+
+    args = hrrr_monthly_backfill.parse_args()
+
+    assert args.skip_provenance is False
 
 
 def test_hrrr_monthly_build_command_has_single_python_executable_and_optional_parent_pause_forwarding(tmp_path):
@@ -3465,6 +3529,13 @@ def test_hrrr_monthly_build_command_has_single_python_executable_and_optional_pa
     assert command.count(sys.executable) == 1
     assert command[command.index("--progress-mode") + 1] == "log"
     assert command[command.index("--batch-reduce-mode") + 1] == "cycle"
+    assert command[command.index("--range-merge-gap-bytes") + 1] == "65536"
+    assert command[command.index("--crop-method") + 1] == "auto"
+    assert command[command.index("--crop-grib-type") + 1] == "same"
+    assert command[command.index("--wgrib2-threads") + 1] == "1"
+    assert command[command.index("--extract-method") + 1] == "wgrib2-bin"
+    assert command[command.index("--summary-profile") + 1] == "overnight"
+    assert "--skip-provenance" in command
     assert "--pause-control-file" not in command
     assert "--allow-partial" in command
     assert "--keep-reduced" in command
@@ -3710,12 +3781,27 @@ def test_hrrr_monthly_backfill_dashboard_forces_child_log_and_relays_progress(tm
         summary_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([{"target_date_local": start_date, "status": "ok"}]).to_parquet(summary_dir / f"{month_id}.parquet", index=False)
         (output_dir / f"{month_id}.manifest.json").write_text(
-            json.dumps({"complete": True, "expected_task_count": 1, "completed_task_keys": ["task_a"]})
+            json.dumps(
+                {
+                    "complete": True,
+                    "expected_task_count": 1,
+                    "completed_task_keys": ["task_a"],
+                    "target_date_local": start_date,
+                    "selection_mode": "overnight_0005",
+                    "extract_method": "wgrib2-bin",
+                    "summary_profile": "overnight",
+                    "provenance_written": False,
+                }
+            )
         )
         pd.DataFrame(
             [
                 {
                     "status": "ok",
+                    "selection_mode": "overnight_0005",
+                    "extract_method": "wgrib2-bin",
+                    "summary_profile": "overnight",
+                    "provenance_written": False,
                     "timing_range_download_seconds": 0.2,
                     "timing_reduce_seconds": 0.3,
                     "timing_cfgrib_open_seconds": 0.4,
