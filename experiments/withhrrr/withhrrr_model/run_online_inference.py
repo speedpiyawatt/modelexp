@@ -6,6 +6,7 @@ import html
 import json
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -51,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-hrrr", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--continue-on-lamp-fetch-error", action="store_true")
+    parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="Keep downloaded/intermediate runtime artifacts after a successful prediction. By default they are deleted.",
+    )
     return parser.parse_args()
 
 
@@ -191,6 +197,26 @@ def write_run_manifest(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(path, flush=True)
     return path
+
+
+def cleanup_runtime_artifacts(runtime_root: pathlib.Path, candidates: list[pathlib.Path]) -> list[str]:
+    deleted: list[str] = []
+    runtime_root_resolved = runtime_root.resolve()
+    for candidate in candidates:
+        path = candidate.resolve()
+        if not path.exists():
+            continue
+        if path == runtime_root_resolved or runtime_root_resolved not in path.parents:
+            raise SystemExit(f"Refusing to clean path outside runtime root: {candidate}")
+        if path.name == "status" or any(parent.name == "status" for parent in path.parents):
+            raise SystemExit(f"Refusing to clean status path: {candidate}")
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        deleted.append(str(candidate))
+        print(f"[cleanup] deleted {candidate}", flush=True)
+    return deleted
 
 
 def fetch_iem_lamp_cycle(*, station_id: str, utc_date: dt.date, cycle: str, output_dir: pathlib.Path, overwrite: bool) -> pathlib.Path:
@@ -337,9 +363,9 @@ def fetch_nbm(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
         "--download-workers",
         "4",
         "--reduce-workers",
-        "1",
+        "2",
         "--extract-workers",
-        "1",
+        "2",
         "--reduce-queue-size",
         "2",
         "--extract-queue-size",
@@ -379,9 +405,9 @@ def fetch_hrrr(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
         "--download-workers",
         "4",
         "--reduce-workers",
-        "1",
+        "2",
         "--extract-workers",
-        "1",
+        "2",
         "--reduce-queue-size",
         "2",
         "--extract-queue-size",
@@ -432,20 +458,36 @@ def main() -> int:
     )
 
     try:
+        cleanup_candidates: list[pathlib.Path] = []
         if not args.skip_wunderground:
             wu_tables_dir = fetch_wunderground(args, target_date)
             paths["wunderground_tables_dir"] = str(wu_tables_dir)
             paths["wunderground_labels_path"] = str(wu_tables_dir / "labels_daily.parquet")
             paths["wunderground_obs_path"] = str(wu_tables_dir / "wu_obs_intraday.parquet")
+            cleanup_candidates.extend(
+                [
+                    args.runtime_root / "wunderground_history" / date_token,
+                    args.runtime_root / "wunderground_tables" / date_token,
+                ]
+            )
         if not args.skip_lamp:
             lamp_overnight_dir = fetch_lamp(args, target_date)
             paths["lamp_overnight_dir"] = str(lamp_overnight_dir)
+            cleanup_candidates.extend(
+                [
+                    args.runtime_root / "lamp_raw" / date_token,
+                    args.runtime_root / "lamp_features" / date_token,
+                    args.runtime_root / "lamp_overnight",
+                ]
+            )
         if not args.skip_nbm:
             nbm_overnight_dir = fetch_nbm(args, target_date)
             paths["nbm_overnight_dir"] = str(nbm_overnight_dir)
+            cleanup_candidates.append(args.runtime_root / "nbm")
         if not args.skip_hrrr:
             hrrr_summary_dir = fetch_hrrr(args, target_date)
             paths["hrrr_summary_dir"] = str(hrrr_summary_dir)
+            cleanup_candidates.append(args.runtime_root / "hrrr")
 
         event_bins_path = args.event_bins_path
         if args.polymarket_event_slug:
@@ -466,6 +508,7 @@ def main() -> int:
             )
             event_bins_path = polymarket_dir / f"event_slug={polymarket_event_slug}" / "event_bins.json"
             paths["event_bins_path"] = str(event_bins_path)
+            cleanup_candidates.append(polymarket_dir)
 
         features_dir = args.runtime_root / "prediction_features"
         run(
@@ -516,6 +559,11 @@ def main() -> int:
         run(predict_command)
         prediction_path = args.prediction_output_dir / f"prediction_{args.station_id}_{target_date.isoformat()}.json"
         paths["prediction_path"] = str(prediction_path)
+        cleanup_candidates.append(features_dir)
+        if args.keep_artifacts:
+            paths["artifacts_cleanup"] = "skipped_keep_artifacts"
+        else:
+            paths["artifacts_cleanup_deleted"] = json.dumps(cleanup_runtime_artifacts(args.runtime_root, cleanup_candidates))
         write_run_manifest(runtime_root=args.runtime_root, target_date=target_date, station_id=args.station_id, status="ok", message=None, paths=paths)
         return 0
     except SystemExit as exc:

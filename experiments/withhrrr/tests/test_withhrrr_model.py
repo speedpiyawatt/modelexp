@@ -21,6 +21,7 @@ from experiments.withhrrr.withhrrr_model.polymarket_event import extract_event_b
 from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration, calibration_offsets, selected_distribution_method
 from experiments.withhrrr.withhrrr_model.prepare_training_features import build_training_table
 from experiments.withhrrr.withhrrr_model.rolling_origin_model_select import leakage_findings
+from experiments.withhrrr.withhrrr_model.run_online_inference import cleanup_runtime_artifacts
 from experiments.withhrrr.withhrrr_model.train_quantile_models import select_feature_columns
 
 
@@ -217,3 +218,30 @@ def test_calibration_sort_key_uses_probability_scores_before_uncalibrated_penalt
         ]
     )
     assert list(calibration_sort_key(summary)["method_id"]) == ["global_offsets", "uncalibrated", "worse"]
+
+
+def test_online_inference_cleanup_deletes_only_runtime_artifacts(tmp_path) -> None:
+    runtime_root = tmp_path / "runtime"
+    status_dir = runtime_root / "status" / "target_date_local=2026-04-28"
+    hrrr_dir = runtime_root / "hrrr"
+    feature_file = runtime_root / "prediction_features" / "row.parquet"
+    outside_dir = tmp_path / "outside"
+    status_dir.mkdir(parents=True)
+    hrrr_dir.mkdir(parents=True)
+    feature_file.parent.mkdir(parents=True)
+    feature_file.write_text("x")
+    outside_dir.mkdir()
+
+    deleted = cleanup_runtime_artifacts(runtime_root, [hrrr_dir, feature_file])
+
+    assert deleted == [str(hrrr_dir), str(feature_file)]
+    assert not hrrr_dir.exists()
+    assert not feature_file.exists()
+    assert status_dir.exists()
+
+    try:
+        cleanup_runtime_artifacts(runtime_root, [outside_dir])
+    except SystemExit as exc:
+        assert "outside runtime root" in str(exc)
+    else:
+        raise AssertionError("Expected cleanup outside runtime root to fail")

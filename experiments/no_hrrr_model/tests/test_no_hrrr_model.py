@@ -39,7 +39,7 @@ from experiments.no_hrrr_model.no_hrrr_model.rolling_origin_anchor_select import
     transformed_fold_df,
 )
 from experiments.no_hrrr_model.no_hrrr_model.rolling_origin_model_select import DEFAULT_CANDIDATES, DEFAULT_MODEL_CANDIDATE_ID, candidate_by_id, leakage_findings, load_candidates, load_splits, summarize_candidates
-from experiments.no_hrrr_model.no_hrrr_model.run_online_inference import resolve_lamp_source
+from experiments.no_hrrr_model.no_hrrr_model.run_online_inference import cleanup_runtime_artifacts, resolve_lamp_source
 from experiments.no_hrrr_model.no_hrrr_model.tui import (
     command_for_run,
     default_target_date,
@@ -848,6 +848,33 @@ def test_tui_safe_delete_run_root_only_deletes_tui_runs(tmp_path) -> None:
     outside_run.mkdir(parents=True)
     assert not safe_delete_run_root(outside_run, allowed_parent=custom_parent)
     assert outside_run.exists()
+
+
+def test_online_inference_cleanup_deletes_only_runtime_artifacts(tmp_path) -> None:
+    runtime_root = tmp_path / "runtime"
+    status_dir = runtime_root / "status" / "target_date_local=2026-04-28"
+    artifact_dir = runtime_root / "nbm"
+    artifact_file = runtime_root / "prediction_features" / "row.parquet"
+    outside_dir = tmp_path / "outside"
+    status_dir.mkdir(parents=True)
+    artifact_dir.mkdir(parents=True)
+    artifact_file.parent.mkdir(parents=True)
+    artifact_file.write_text("x")
+    outside_dir.mkdir()
+
+    deleted = cleanup_runtime_artifacts(runtime_root, [artifact_dir, artifact_file])
+
+    assert deleted == [str(artifact_dir), str(artifact_file)]
+    assert not artifact_dir.exists()
+    assert not artifact_file.exists()
+    assert status_dir.exists()
+
+    try:
+        cleanup_runtime_artifacts(runtime_root, [outside_dir])
+    except SystemExit as exc:
+        assert "outside runtime root" in str(exc)
+    else:
+        raise AssertionError("Expected cleanup outside runtime root to fail")
 
 
 def test_tui_command_uses_run_scoped_runtime_and_prediction_dirs(tmp_path) -> None:
