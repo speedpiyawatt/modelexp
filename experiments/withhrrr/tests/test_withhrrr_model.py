@@ -48,7 +48,7 @@ def test_training_table_promotes_hrrr_disagreement_features() -> None:
             }
         ]
     )
-    out = build_training_table(base)
+    out = build_training_table(base, anchor_policy="current_50_50")
     assert float(out.loc[0, "anchor_tmax_f"]) == 66.5
     assert float(out.loc[0, "target_residual_f"]) == 3.5
     assert float(out.loc[0, "hrrr_tmax_open_f"]) == 72.0
@@ -57,6 +57,34 @@ def test_training_table_promotes_hrrr_disagreement_features() -> None:
     assert float(out.loc[0, "hrrr_outside_nbm_lamp_range_f"]) == 4.0
     assert bool(out.loc[0, "hrrr_hotter_than_lamp_3f"]) is True
     assert bool(out.loc[0, "model_training_eligible"]) is True
+
+
+def test_training_table_anchor_policy_variants() -> None:
+    base = pd.DataFrame(
+        [
+            {
+                "target_date_local": "2025-04-11",
+                "station_id": "KLGA",
+                "label_final_tmax_f": 70.0,
+                "final_tmax_f": 70.0,
+                "nbm_tmax_open_f": 68.0,
+                "nbm_native_tmax_2m_day_max_f": 71.0,
+                "lamp_tmax_open_f": 65.0,
+                "hrrr_tmax_open_f": 72.0,
+                "meta_nbm_available": True,
+                "meta_lamp_available": True,
+                "meta_hrrr_available": True,
+            }
+        ]
+    )
+    out = build_training_table(base, anchor_policy="hourly_native_lamp_hrrr")
+    assert float(out.loc[0, "anchor_current_50_50_tmax_f"]) == 66.5
+    assert float(out.loc[0, "anchor_hourly_native_lamp_tmax_f"]) == 68.0
+    assert float(out.loc[0, "anchor_hourly_native_lamp_hrrr_tmax_f"]) == 69.0
+    assert float(out.loc[0, "anchor_tmax_f"]) == 69.0
+    assert float(out.loc[0, "target_residual_f"]) == 1.0
+    assert float(out.loc[0, "nbm_native_tmax_minus_anchor_f"]) == 2.0
+    assert bool(out.loc[0, "nbm_native_tmax_above_anchor_2f"]) is True
 
 
 def test_feature_selection_allows_hrrr_but_excludes_leakage() -> None:
@@ -120,7 +148,7 @@ def test_hrrr_ablation_drops_hrrr_and_derived_features() -> None:
 
 def test_default_grid_contains_hrrr_specific_candidates() -> None:
     candidate_ids = [str(candidate["candidate_id"]) for candidate in DEFAULT_CANDIDATES]
-    assert DEFAULT_MODEL_CANDIDATE_ID == "regularized_shallow_lgbm_300"
+    assert DEFAULT_MODEL_CANDIDATE_ID == "very_regularized_min_leaf70_lgbm_350"
     assert len(candidate_ids) == len(set(candidate_ids))
     assert {str(candidate["candidate_id"]) for candidate in HRRR_CANDIDATES}.issubset(set(candidate_ids))
     assert candidate_by_id(DEFAULT_MODEL_CANDIDATE_ID)["candidate_id"] == DEFAULT_MODEL_CANDIDATE_ID

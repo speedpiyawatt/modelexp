@@ -7,7 +7,7 @@ from experiments.no_hrrr_model.no_hrrr_model.model_config import (  # noqa: F401
 )
 
 
-DEFAULT_MODEL_CANDIDATE_ID = "regularized_shallow_lgbm_300"
+DEFAULT_MODEL_CANDIDATE_ID = "very_regularized_min_leaf70_lgbm_350"
 HRRR_CANDIDATES: tuple[dict[str, object], ...] = (
     {
         "candidate_id": "hrrr_shallow_stronger_l2_lgbm_350",

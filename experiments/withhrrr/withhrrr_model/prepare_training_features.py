@@ -18,6 +18,14 @@ DEFAULT_OUTPUT_PATH = pathlib.Path(
 DEFAULT_MANIFEST_PATH = pathlib.Path(
     "experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.manifest.json"
 )
+DEFAULT_ANCHOR_POLICY = "equal_3way"
+ANCHOR_POLICIES = (
+    "current_50_50",
+    "hourly_native_lamp",
+    "hourly_native_lamp_hrrr",
+    "native_lamp",
+    "equal_3way",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hrrr-root", type=pathlib.Path, default=DEFAULT_HRRR_ROOT)
     parser.add_argument("--output-path", type=pathlib.Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--manifest-output-path", type=pathlib.Path, default=DEFAULT_MANIFEST_PATH)
+    parser.add_argument(
+        "--anchor-policy",
+        choices=ANCHOR_POLICIES,
+        default=DEFAULT_ANCHOR_POLICY,
+        help="Anchor formula used for the residual target. Defaults to the selected equal NBM-hourly/LAMP/HRRR anchor.",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +141,8 @@ def _prepare_base_columns(base: pd.DataFrame) -> pd.DataFrame:
             base["nbm_tmax_open_f"] = _numeric_column(base, "nbm_temp_2m_day_max_f")
         else:
             base["nbm_tmax_open_f"] = kelvin_to_f(_numeric_column(base, "nbm_temp_2m_day_max_k"))
+    if "nbm_native_tmax_2m_day_max_f" not in base.columns and "nbm_native_tmax_2m_day_max_k" in base.columns:
+        base["nbm_native_tmax_2m_day_max_f"] = kelvin_to_f(_numeric_column(base, "nbm_native_tmax_2m_day_max_k"))
     if "lamp_tmax_open_f" not in base.columns:
         base["lamp_tmax_open_f"] = _numeric_column(
             base,
@@ -138,6 +154,41 @@ def _prepare_base_columns(base: pd.DataFrame) -> pd.DataFrame:
     if "nbm_minus_lamp_tmax_f" not in base.columns:
         base["nbm_minus_lamp_tmax_f"] = _numeric_column(base, "nbm_tmax_open_f") - _numeric_column(base, "lamp_tmax_open_f")
     return base
+
+
+def apply_anchor_policy(df: pd.DataFrame, *, anchor_policy: str) -> pd.DataFrame:
+    if anchor_policy not in ANCHOR_POLICIES:
+        raise ValueError(f"unknown anchor_policy={anchor_policy!r}")
+    out = df.copy()
+    nbm = _numeric_column(out, "nbm_tmax_open_f")
+    native = _numeric_column(out, "nbm_native_tmax_2m_day_max_f")
+    lamp = _numeric_column(out, "lamp_tmax_open_f")
+    hrrr = _numeric_column(out, "hrrr_tmax_open_f")
+
+    out["anchor_current_50_50_tmax_f"] = 0.5 * nbm + 0.5 * lamp
+    out["anchor_hourly_native_lamp_tmax_f"] = (nbm + native + lamp) / 3.0
+    out["anchor_hourly_native_lamp_hrrr_tmax_f"] = (nbm + native + lamp + hrrr) / 4.0
+    out["anchor_native_lamp_tmax_f"] = 0.5 * native + 0.5 * lamp
+    out["anchor_equal_3way_tmax_f"] = (hrrr + lamp + nbm) / 3.0
+
+    policy_columns = {
+        "current_50_50": "anchor_current_50_50_tmax_f",
+        "hourly_native_lamp": "anchor_hourly_native_lamp_tmax_f",
+        "hourly_native_lamp_hrrr": "anchor_hourly_native_lamp_hrrr_tmax_f",
+        "native_lamp": "anchor_native_lamp_tmax_f",
+        "equal_3way": "anchor_equal_3way_tmax_f",
+    }
+    out["anchor_tmax_f"] = _numeric_column(out, policy_columns[anchor_policy])
+    out["anchor_policy"] = anchor_policy
+    out["nbm_native_tmax_minus_anchor_f"] = native - _numeric_column(out, "anchor_tmax_f")
+    out["nbm_native_tmax_minus_nbm_tmax_f"] = native - nbm
+    out["abs_nbm_native_tmax_minus_anchor_f"] = out["nbm_native_tmax_minus_anchor_f"].abs()
+    out["abs_nbm_native_tmax_minus_nbm_tmax_f"] = out["nbm_native_tmax_minus_nbm_tmax_f"].abs()
+    out["nbm_native_tmax_above_anchor_2f"] = (out["nbm_native_tmax_minus_anchor_f"] >= 2.0).astype("boolean")
+    out["nbm_native_tmax_below_anchor_2f"] = (out["nbm_native_tmax_minus_anchor_f"] <= -2.0).astype("boolean")
+    out["nbm_native_tmax_above_hourly_nbm_2f"] = (out["nbm_native_tmax_minus_nbm_tmax_f"] >= 2.0).astype("boolean")
+    out["nbm_native_tmax_below_hourly_nbm_2f"] = (out["nbm_native_tmax_minus_nbm_tmax_f"] <= -2.0).astype("boolean")
+    return out
 
 
 def _prepare_hrrr_disagreement_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -170,7 +221,12 @@ def _prepare_hrrr_disagreement_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_training_table(base: pd.DataFrame, hrrr: pd.DataFrame | None = None) -> pd.DataFrame:
+def build_training_table(
+    base: pd.DataFrame,
+    hrrr: pd.DataFrame | None = None,
+    *,
+    anchor_policy: str = DEFAULT_ANCHOR_POLICY,
+) -> pd.DataFrame:
     if base.empty:
         raise ValueError("base normalized training table is empty")
     base = _prepare_base_columns(base)
@@ -197,12 +253,13 @@ def build_training_table(base: pd.DataFrame, hrrr: pd.DataFrame | None = None) -
             merged["meta_hrrr_available"] = True
     merged["meta_hrrr_available"] = merged["meta_hrrr_available"].astype("boolean").fillna(False)
     merged = _prepare_hrrr_disagreement_columns(merged)
+    merged = apply_anchor_policy(merged, anchor_policy=anchor_policy)
 
     label = pd.to_numeric(merged["label_final_tmax_f"], errors="coerce")
     anchor = pd.to_numeric(merged["anchor_tmax_f"], errors="coerce")
     residual = label - anchor
     existing_residual = pd.to_numeric(merged.get("target_residual_f"), errors="coerce")
-    if "target_residual_f" in merged.columns:
+    if "target_residual_f" in merged.columns and anchor_policy == "current_50_50":
         mismatch = (existing_residual - residual).abs() > 1e-6
         if bool(mismatch.fillna(False).any()):
             raise ValueError(f"target_residual_f formula mismatch rows: {int(mismatch.sum())}")
@@ -238,7 +295,14 @@ def prefix_counts(columns: list[str]) -> dict[str, int]:
     return counts
 
 
-def build_manifest(*, base_path: pathlib.Path, hrrr_root: pathlib.Path, output_path: pathlib.Path, df: pd.DataFrame) -> dict[str, object]:
+def build_manifest(
+    *,
+    base_path: pathlib.Path,
+    hrrr_root: pathlib.Path,
+    output_path: pathlib.Path,
+    df: pd.DataFrame,
+    anchor_policy: str,
+) -> dict[str, object]:
     dates = df["target_date_local"].astype(str)
     eligible = df["model_training_eligible"].astype("boolean").fillna(False)
     hrrr_available = df["meta_hrrr_available"].astype("boolean").fillna(False)
@@ -248,6 +312,7 @@ def build_manifest(*, base_path: pathlib.Path, hrrr_root: pathlib.Path, output_p
         "base_path": str(base_path),
         "hrrr_root": str(hrrr_root),
         "output_path": str(output_path),
+        "anchor_policy": anchor_policy,
         "row_count": int(len(df)),
         "column_count": int(len(df.columns)),
         "target_date_min": str(dates.min()) if len(df) else None,
@@ -263,10 +328,16 @@ def main() -> int:
     args = parse_args()
     base = pd.read_parquet(args.base_path)
     hrrr = None if any(column.startswith("hrrr_") for column in base.columns) else read_hrrr_summaries(args.hrrr_root)
-    output = build_training_table(base, hrrr)
+    output = build_training_table(base, hrrr, anchor_policy=args.anchor_policy)
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     output.to_parquet(args.output_path, index=False)
-    manifest = build_manifest(base_path=args.base_path, hrrr_root=args.hrrr_root, output_path=args.output_path, df=output)
+    manifest = build_manifest(
+        base_path=args.base_path,
+        hrrr_root=args.hrrr_root,
+        output_path=args.output_path,
+        df=output,
+        anchor_policy=args.anchor_policy,
+    )
     args.manifest_output_path.parent.mkdir(parents=True, exist_ok=True)
     args.manifest_output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(args.output_path)
