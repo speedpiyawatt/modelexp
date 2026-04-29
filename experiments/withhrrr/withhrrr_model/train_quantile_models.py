@@ -27,6 +27,7 @@ NON_FEATURE_COLUMNS = {
     "label_final_tmin_f",
     "target_residual_f",
     "model_training_eligible",
+    "model_prediction_available",
 }
 NON_FEATURE_SUBSTRINGS = (
     "market",

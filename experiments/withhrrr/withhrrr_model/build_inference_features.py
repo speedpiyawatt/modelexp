@@ -87,6 +87,18 @@ def source_available(df: pd.DataFrame, column: str) -> bool:
     return bool(df[column].astype("boolean").fillna(False).iloc[0]) if column in df.columns and not df.empty else False
 
 
+def prediction_available(model_ready: pd.DataFrame) -> pd.Series:
+    return (
+        model_ready["meta_nbm_available"].astype("boolean").fillna(False)
+        & model_ready["meta_lamp_available"].astype("boolean").fillna(False)
+        & model_ready["meta_hrrr_available"].astype("boolean").fillna(False)
+        & pd.to_numeric(model_ready["nbm_tmax_open_f"], errors="coerce").notna()
+        & pd.to_numeric(model_ready["lamp_tmax_open_f"], errors="coerce").notna()
+        & pd.to_numeric(model_ready["hrrr_tmax_open_f"], errors="coerce").notna()
+        & pd.to_numeric(model_ready["anchor_tmax_f"], errors="coerce").notna()
+    )
+
+
 def main() -> int:
     args = parse_args()
     label_history_df = filter_label_history_for_inference(
@@ -126,14 +138,7 @@ def main() -> int:
 
     normalized = normalize_training_features_overnight(unnormalized, load_vocabularies(args.vocab_path))
     model_ready = build_training_table(normalized, hrrr=None)
-    model_ready["model_prediction_available"] = (
-        model_ready["meta_nbm_available"].astype("boolean").fillna(False)
-        & model_ready["meta_lamp_available"].astype("boolean").fillna(False)
-        & model_ready["meta_hrrr_available"].astype("boolean").fillna(False)
-        & pd.to_numeric(model_ready["nbm_tmax_open_f"], errors="coerce").notna()
-        & pd.to_numeric(model_ready["lamp_tmax_open_f"], errors="coerce").notna()
-        & pd.to_numeric(model_ready["anchor_tmax_f"], errors="coerce").notna()
-    )
+    model_ready["model_prediction_available"] = prediction_available(model_ready)
     if not bool(model_ready["model_prediction_available"].iloc[0]):
         availability = {
             "meta_nbm_available": source_available(model_ready, "meta_nbm_available"),

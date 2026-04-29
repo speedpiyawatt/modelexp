@@ -37,6 +37,7 @@ FORBIDDEN_EXACT_FEATURES = {
     "final_tmin_f",
     "target_residual_f",
     "model_training_eligible",
+    "model_prediction_available",
 }
 FORBIDDEN_FEATURE_PREFIXES = ("label_",)
 FORBIDDEN_FEATURE_SUBSTRINGS = (

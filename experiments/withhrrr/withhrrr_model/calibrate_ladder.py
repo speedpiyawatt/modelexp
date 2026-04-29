@@ -20,7 +20,7 @@ DEFAULT_PREDICTIONS_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evalu
 DEFAULT_QUANTILE_CALIBRATION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json")
 DEFAULT_DISTRIBUTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/ladder_calibration")
-FALLBACK_DISTRIBUTION_METHOD_ID = "interpolation_tail"
+FALLBACK_DISTRIBUTION_METHOD_ID = "normal_iqr"
 DistributionMethod = str
 
 

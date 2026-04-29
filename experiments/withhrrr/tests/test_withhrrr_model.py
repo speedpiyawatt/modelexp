@@ -11,8 +11,14 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from experiments.withhrrr.withhrrr_model.calibrate_ladder import apply_bucket_reliability, fit_bucket_reliability, ladder_records
+from experiments.withhrrr.withhrrr_model.calibrate_ladder import (
+    apply_bucket_reliability,
+    fit_bucket_reliability,
+    ladder_records,
+    selected_distribution_method as selected_ladder_distribution_method,
+)
 from experiments.withhrrr.withhrrr_model.calibrate_rolling_origin import calibration_sort_key
+from experiments.withhrrr.withhrrr_model.build_inference_features import prediction_available
 from experiments.withhrrr.withhrrr_model.distribution import degree_ladder_from_quantiles
 from experiments.withhrrr.withhrrr_model.event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from experiments.withhrrr.withhrrr_model.hrrr_ablation_diagnostics import drop_hrrr_feature_columns
@@ -61,6 +67,7 @@ def test_feature_selection_allows_hrrr_but_excludes_leakage() -> None:
                 "station_id": "KLGA",
                 "target_residual_f": 1.0,
                 "model_training_eligible": True,
+                "model_prediction_available": True,
                 "label_final_tmax_f": 70.0,
                 "meta_hrrr_available": True,
                 "hrrr_tmax_open_f": 72.0,
@@ -72,10 +79,30 @@ def test_feature_selection_allows_hrrr_but_excludes_leakage() -> None:
         ]
     )
     assert select_feature_columns(df) == ["meta_hrrr_available", "hrrr_tmax_open_f", "hrrr_minus_lamp_tmax_f", "nbm_tmax_open_f"]
-    findings = leakage_findings(["hrrr_tmax_open_f", "label_final_tmax_f", "meta_hrrr_source_model_code"])
+    findings = leakage_findings(["hrrr_tmax_open_f", "label_final_tmax_f", "meta_hrrr_source_model_code", "model_prediction_available"])
     assert not [row for row in findings if row["feature"] == "hrrr_tmax_open_f"]
     assert [row for row in findings if row["feature"] == "label_final_tmax_f"]
     assert [row for row in findings if row["feature"] == "meta_hrrr_source_model_code"]
+    assert [row for row in findings if row["feature"] == "model_prediction_available"]
+
+
+def test_inference_availability_requires_finite_hrrr_tmax() -> None:
+    row = pd.DataFrame(
+        [
+            {
+                "meta_nbm_available": True,
+                "meta_lamp_available": True,
+                "meta_hrrr_available": True,
+                "nbm_tmax_open_f": 68.0,
+                "lamp_tmax_open_f": 66.0,
+                "hrrr_tmax_open_f": pd.NA,
+                "anchor_tmax_f": 67.0,
+            }
+        ]
+    )
+    assert bool(prediction_available(row).iloc[0]) is False
+    row.loc[0, "hrrr_tmax_open_f"] = 67.5
+    assert bool(prediction_available(row).iloc[0]) is True
 
 
 def test_hrrr_ablation_drops_hrrr_and_derived_features() -> None:
@@ -120,6 +147,7 @@ def test_distribution_and_ladder_calibration_are_manifest_driven(tmp_path) -> No
     method_id, path = selected_distribution_method("auto", manifest_path=tmp_path / "missing_distribution_manifest.json")
     assert method_id == "normal_iqr"
     assert path is None
+    assert selected_ladder_distribution_method("auto", tmp_path / "missing_distribution_manifest.json") == "normal_iqr"
 
     distribution_manifest = tmp_path / "distribution_manifest.json"
     distribution_manifest.write_text('{"selected_distribution_method_id": "normal_iqr"}')
