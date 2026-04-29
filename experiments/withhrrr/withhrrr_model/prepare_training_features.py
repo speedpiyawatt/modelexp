@@ -18,7 +18,7 @@ DEFAULT_OUTPUT_PATH = pathlib.Path(
 DEFAULT_MANIFEST_PATH = pathlib.Path(
     "experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.manifest.json"
 )
-DEFAULT_ANCHOR_POLICY = "equal_3way"
+DEFAULT_ANCHOR_POLICY = "hourly_native_lamp_hrrr"
 ANCHOR_POLICIES = (
     "current_50_50",
     "hourly_native_lamp",
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         "--anchor-policy",
         choices=ANCHOR_POLICIES,
         default=DEFAULT_ANCHOR_POLICY,
-        help="Anchor formula used for the residual target. Defaults to the selected equal NBM-hourly/LAMP/HRRR anchor.",
+        help="Anchor formula used for the residual target. Defaults to the selected NBM-hourly/native-NBM/LAMP/HRRR anchor.",
     )
     return parser.parse_args()
 
