@@ -20,7 +20,7 @@ DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/predictions
 DEFAULT_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json")
 DEFAULT_DISTRIBUTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json")
 DEFAULT_LADDER_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/ladder_calibration/ladder_calibration_manifest.json")
-FALLBACK_DISTRIBUTION_METHOD_ID = "interpolation_tail"
+FALLBACK_DISTRIBUTION_METHOD_ID = "normal_iqr"
 DISTRIBUTION_METHOD_IDS = ["auto", "interpolation_tail", "interpolation_no_tail", "smoothed_interpolation_tail", "normal_iqr"]
 ANCHOR_POLICY = "feature_anchor_tmax_f"
 
@@ -199,7 +199,7 @@ def selected_distribution_method(
     selected_path = manifest_path
     if selected_path is None and DEFAULT_DISTRIBUTION_MANIFEST_PATH.exists():
         selected_path = DEFAULT_DISTRIBUTION_MANIFEST_PATH
-    if selected_path is None:
+    if selected_path is None or not selected_path.exists():
         return FALLBACK_DISTRIBUTION_METHOD_ID, None
     payload = load_json(selected_path)
     method_id = payload.get("selected_distribution_method_id")

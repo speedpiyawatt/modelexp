@@ -117,6 +117,10 @@ def test_prediction_reads_hrrr_segmented_calibration() -> None:
 
 
 def test_distribution_and_ladder_calibration_are_manifest_driven(tmp_path) -> None:
+    method_id, path = selected_distribution_method("auto", manifest_path=tmp_path / "missing_distribution_manifest.json")
+    assert method_id == "normal_iqr"
+    assert path is None
+
     distribution_manifest = tmp_path / "distribution_manifest.json"
     distribution_manifest.write_text('{"selected_distribution_method_id": "normal_iqr"}')
     method_id, path = selected_distribution_method("auto", manifest_path=distribution_manifest)

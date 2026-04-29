@@ -57,6 +57,15 @@ The folder `experiments/no_hrrr_model/` is a separate no-HRRR modeling experimen
 - keep experiment-specific artifacts, notes, and schema names inside the experiment unless the user explicitly asks to promote them
 - the experiment still uses the same settlement target: final KLGA daily high for the `America/New_York` local station day
 
+The folder `experiments/withhrrr/` is the HRRR-inclusive version of the no-HRRR experiment and is now the preferred experiment when the user asks for the best overnight fair-value model with current inputs.
+
+- it keeps the same model family as `experiments/no_hrrr_model`: residual LightGBM quantile models, calibrated final-Tmax quantiles, a 1F temperature ladder, and an event-bin adapter
+- it learns from Wunderground, NBM, LAMP, and HRRR source blocks; HRRR is a model feature and calibration/evaluation regime, not the primary anchor
+- the current anchor remains `0.5 * nbm_tmax_open_f + 0.5 * lamp_tmax_open_f`; HRRR-only was not promoted to anchor because holdout metrics were worse than the residual model
+- HRRR disagreement diagnostics are promoted as features, including HRRR-vs-LAMP/NBM deltas and out-of-range indicators
+- current selected with-HRRR defaults are documented in `experiments/withhrrr/README.md`, `TODO.md`, and `IMPLEMENTATION_TODO.md`
+- future agents must update both `experiments/withhrrr/TODO.md` and `experiments/withhrrr/IMPLEMENTATION_TODO.md` when changing selected model behavior, inference behavior, or reported metrics
+
 ## Event And Bin Architecture
 
 Polymarket structures these weather contracts as **separate daily events**, and each event can have its own set of outcome markets.
@@ -133,6 +142,9 @@ Anchor planning and implementation to what already exists in this repo:
 - for the `00:05 America/New_York` overnight cutoff, fetch candidate full LAMP cycles `0230`, `0330`, and `0430` UTC, then let `build_lamp_overnight_features.py` select the latest issue at or before the local cutoff
 - `tools/hrrr` already uses an overnight local-day summary design with a `00:05` cutoff and retained-cycle revision logic
 - `tools/weather` already provides canonical normalization contracts for downstream training
+- `experiments/no_hrrr_model/no_hrrr_model/run_online_inference.py` runs one-date no-HRRR online inference from Wunderground, LAMP, NBM, and Polymarket bins
+- `experiments/withhrrr/withhrrr_model/run_online_inference.py` runs one-date with-HRRR online inference from Wunderground, LAMP, NBM, HRRR, and Polymarket bins
+- `tools/weather/run_server_dual_inference.py` is the local one-argument command for asking the DigitalOcean server to run both no-HRRR and with-HRRR inference and print a comparison
 
 Do not promise datasets or pipelines that are not currently present.
 
@@ -196,6 +208,16 @@ For download-heavy or long-running network steps:
 - wait for the user to confirm the download or fetch step is complete before continuing
 - do not poll or heartbeat-check external downloads when the user has agreed to run them manually
 - once the user confirms completion, continue with validation, parsing, merging, or downstream local processing
+- for one-date online fair-value inference, prefer the server runner instead of doing heavy GRIB downloads locally:
+
+```bash
+.venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD
+```
+
+- the server runner assumes SSH access to `root@198.199.64.163` and repo path `/root/modelexp`; override with `MODELEXP_SERVER`, `MODELEXP_REMOTE_REPO`, or `MODELEXP_REMOTE_OUTPUT_ROOT` only when needed
+- the server runner runs no-HRRR and HRRR source work in parallel, reuses the no-HRRR Wunderground/LAMP/NBM artifacts to build the with-HRRR prediction, then returns a local text comparison
+- server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, and logs
+- the server runner deletes downloaded/intermediate source artifacts after producing the predictions
 
 Manual current-day Tmax requests:
 
@@ -216,12 +238,42 @@ Optimization guidance:
 - for LAMP overnight backfills, treat `0230`, `0330`, and `0430` UTC as the full-guidance candidate cycles. Do not backfill temperature features from `0345`, `0400`, `0445`, or `0500` UTC archive files; observed 2023-2025 archive files for those cycles were 3-hour `CIG/VIS/OBV`-only products with no `TMP`.
 - known public LAMP archive gaps after the `HH30` rebuild: `2023-04-09`, `2023-04-12`, `2023-06-13`, `2024-11-04`, `2024-11-05`, and `2024-11-06` are absent from the `0230/0330/0430` monthly archive caches. Treat LAMP as unavailable for those target dates rather than as a local extraction failure.
 - treat HRRR merged byte-range downloads and deferred month-manifest flushing as general throughput optimizations that apply beyond short-window runs
-- for HRRR production overnight backfills, prefer the completed throughput options unless debugging requires the legacy path: `--batch-reduce-mode cycle --summary-profile overnight --crop-method auto --crop-grib-type same --range-merge-gap-bytes 65536 --wgrib2-threads 1`
+- for HRRR production overnight backfills, prefer the completed throughput options unless debugging requires the legacy path: `--batch-reduce-mode cycle --summary-profile overnight --crop-method auto --crop-grib-type same --range-merge-gap-bytes 65536 --wgrib2-threads 1 --extract-method wgrib2-bin`
 - use HRRR `--skip-provenance` when the run only needs overnight summary features and provenance parquet output is not needed; manifests should then record `provenance_written=false`
-- keep HRRR `--extract-method cfgrib` as the conservative reference backend; `--extract-method eccodes` is the faster opt-in direct extractor. A 2026-04-27 cached extraction benchmark on `2023-02-04T05Z` measured ecCodes at 23.72s vs cfgrib at 26.32s with lower max RSS and row parity within small floating-point tolerance after APCP duplicate-message handling was fixed.
+- keep HRRR `--extract-method cfgrib` as the conservative reference backend, but production online inference now uses `--extract-method wgrib2-bin`
+- `wgrib2-bin` dumps selected/reduced GRIB messages directly to binary arrays and computes features in NumPy; this was the first major promising extractor speedup compared with Python full-array ecCodes/cfgrib decode
+- `wgrib2-ijbox-bin` is the next larger optimization direction for bypassing reduced GRIB creation from uncropped selected GRIB input; treat it as a separate future step unless the current code already selects it explicitly
 - the HRRR monthly helper forwards the optimized raw-builder flags, including `--batch-reduce-mode`, `--range-merge-gap-bytes`, `--crop-method`, `--crop-grib-type`, `--wgrib2-threads`, `--extract-method`, `--summary-profile`, and `--skip-provenance`
 - HRRR-Zarr Phase 4 has started but is not a drop-in GRIB replacement; `tools/hrrr/probe_hrrr_zarr.py` found missing upper-level direct `RH`, missing upper-level direct `SPFH`, missing `925mb/HGT`, and missing `f18` coverage on the latest non-full overnight cycle for tested dates. Keep GRIB fallback in any Zarr prototype.
 - do not assume an optimization is short-window-only unless it changes source selection scope rather than execution throughput
+
+Online inference worker defaults:
+
+- no-HRRR online inference NBM uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
+- with-HRRR online inference NBM uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
+- with-HRRR online inference HRRR uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
+- keep `wgrib2-threads=1` unless benchmarking proves otherwise; process-level parallelism has been more useful than multi-threading individual `wgrib2` calls
+
+Online inference artifact policy:
+
+- both online inference CLIs delete downloaded/intermediate runtime artifacts after a successful prediction by default
+- final prediction JSONs and status manifests are retained
+- pass `--keep-artifacts` when debugging and you need Wunderground/LAMP/NBM/HRRR source artifacts or prediction feature parquet retained
+- cleanup only targets paths under `--runtime-root` that the wrapper created; external paths supplied through `--skip-*`/explicit root arguments must not be deleted
+
+Server dual inference:
+
+- use `.venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD` from the local repo when the user wants one-date production-style inference and comparison
+- the script starts no-HRRR online inference and HRRR source build concurrently on `root@198.199.64.163`, then builds the with-HRRR row from no-HRRR WU/LAMP/NBM artifacts plus HRRR summary
+- the script prints expected Tmax, anchor, distribution method, event-bin probabilities, and with-HRRR minus no-HRRR probability differences
+- a 2026-04-29 validation run for `2026-04-28` returned no-HRRR expected `65.07F`, with-HRRR expected `64.63F`, and finalized Wunderground/Synoptic peak near `64F`; with-HRRR was closer for that date
+- if the script fails, inspect `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/no_hrrr.log` and `hrrr.log`
+
+Synoptic API spot checks:
+
+- Synoptic Data timeseries endpoint can be used for KLGA observation spot checks around expected Tmax windows, but do not store API tokens in repo files or AGENTS.md
+- endpoint shape: `https://api.synopticdata.com/v2/stations/timeseries?stid=KLGA&start=YYYYMMDDHHMM&end=YYYYMMDDHHMM&vars=air_temp&token=...`
+- on 2026-04-29, a Synoptic check for `2026-04-28 10:00..18:00 America/New_York` returned max `64.4F`, matching the finalized `64F` settlement label behavior
 
 ## Weather Tool Layout
 
