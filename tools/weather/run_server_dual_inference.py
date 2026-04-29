@@ -133,22 +133,21 @@ if [ -z "$EVENT_BINS_PATH" ]; then
   exit 1
 fi
 
-.venv/bin/python -m experiments.withhrrr.withhrrr_model.build_inference_features \\
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.run_online_inference \\
   --target-date-local "$DATE" \\
   --station-id KLGA \\
-  --label-history-path "$NO_HRRR_RUNTIME/wunderground_tables/target_date_local=$DATE/labels_daily.parquet" \\
-  --obs-path "$NO_HRRR_RUNTIME/wunderground_tables/target_date_local=$DATE/wu_obs_intraday.parquet" \\
+  --runtime-root "$WITH_HRRR_RUNTIME" \\
+  --prediction-output-dir "$WITH_HRRR_PRED_DIR" \\
+  --wunderground-tables-dir "$NO_HRRR_RUNTIME/wunderground_tables/target_date_local=$DATE" \\
   --nbm-root "$NO_HRRR_RUNTIME/nbm/nbm_overnight" \\
   --lamp-root "$NO_HRRR_RUNTIME/lamp_overnight" \\
   --hrrr-root "$HRRR_RUN_ROOT/hrrr_summary" \\
-  --output-dir "$WITH_HRRR_RUNTIME/prediction_features"
-
-.venv/bin/python -m experiments.withhrrr.withhrrr_model.predict \\
-  --features-path "$WITH_HRRR_RUNTIME/prediction_features/target_date_local=$DATE/withhrrr.inference_features_normalized.parquet" \\
-  --output-dir "$WITH_HRRR_PRED_DIR" \\
-  --target-date-local "$DATE" \\
-  --station-id KLGA \\
-  --event-bins-path "$EVENT_BINS_PATH"
+  --event-bins-path "$EVENT_BINS_PATH" \\
+  --skip-wunderground \\
+  --skip-lamp \\
+  --skip-nbm \\
+  --skip-hrrr \\
+  --overwrite
 
 rm -rf \\
   "$NO_HRRR_RUNTIME/wunderground_history" \\
@@ -159,8 +158,7 @@ rm -rf \\
   "$NO_HRRR_RUNTIME/nbm" \\
   "$NO_HRRR_RUNTIME/polymarket" \\
   "$NO_HRRR_RUNTIME/prediction_features" \\
-  "$HRRR_RUN_ROOT" \\
-  "$WITH_HRRR_RUNTIME/prediction_features"
+  "$HRRR_RUN_ROOT"
 
 .venv/bin/python - <<'PY'
 import json

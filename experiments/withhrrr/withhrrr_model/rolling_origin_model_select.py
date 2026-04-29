@@ -205,6 +205,28 @@ def default_candidate_specs(model_candidates: list[dict[str, object]]) -> list[d
             feature_profile=weight_profile,
             weight_profile=weight_profile,
         )
+        add_spec(
+            model_candidate_id=DEFAULT_MODEL_CANDIDATE_ID,
+            anchor_policy="equal_3way",
+            feature_profile=f"{weight_profile}_nearby",
+            weight_profile=weight_profile,
+        )
+
+    add_spec(
+        model_candidate_id=DEFAULT_MODEL_CANDIDATE_ID,
+        anchor_policy="equal_3way",
+        feature_profile="source_trust_nearby_features",
+        weight_profile="unweighted",
+    )
+
+    for candidate_id in model_candidate_ids:
+        if candidate_id.startswith("nearby_"):
+            add_spec(
+                model_candidate_id=candidate_id,
+                anchor_policy="equal_3way",
+                feature_profile="high_disagreement_weighted_nearby",
+                weight_profile="high_disagreement_weighted",
+            )
 
     add_spec(
         model_candidate_id=DEFAULT_MODEL_CANDIDATE_ID,

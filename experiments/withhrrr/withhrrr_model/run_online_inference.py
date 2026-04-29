@@ -20,6 +20,7 @@ NY_TZ = ZoneInfo("America/New_York")
 DEFAULT_RUNTIME_ROOT = pathlib.Path("experiments/withhrrr/data/runtime/online_inference")
 CANDIDATE_LAMP_CYCLES = ("0230", "0330", "0430")
 AUTO_POLYMARKET_EVENT_SLUG = "__auto__"
+DEFAULT_NEARBY_STATIONS = ("KJRB", "KJFK", "KEWR", "KTEB")
 LAMP_NOMADS_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/lmp/prod"
 LAMP_ARCHIVE_BASE = "https://lamp.mdl.nws.noaa.gov/lamp/Data/archives"
 IEM_AFOS_BASE = "https://mesonet.agron.iastate.edu/p.php"
@@ -36,6 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lamp-root", type=pathlib.Path, help="Use existing LAMP overnight summaries instead of the runtime-root default.")
     parser.add_argument("--nbm-root", type=pathlib.Path, help="Use existing NBM overnight summaries instead of the runtime-root default.")
     parser.add_argument("--hrrr-root", type=pathlib.Path, help="Use existing HRRR overnight summaries instead of the runtime-root default.")
+    parser.add_argument(
+        "--nearby-station-id",
+        action="append",
+        dest="nearby_station_ids",
+        default=None,
+        help="Nearby Wunderground station to fetch for source-trust features. Can be repeated. Defaults to KJRB/KJFK/KEWR/KTEB.",
+    )
+    parser.add_argument("--skip-nearby-wunderground", action="store_true")
     parser.add_argument("--lamp-source", choices=("auto", "live", "archive", "iem"), default="auto")
     parser.add_argument("--event-bin", action="append", default=[])
     parser.add_argument("--event-bins-path", type=pathlib.Path)
@@ -271,6 +280,51 @@ def fetch_wunderground(args: argparse.Namespace, target_date: dt.date) -> pathli
     return tables_dir
 
 
+def fetch_nearby_wunderground(args: argparse.Namespace, target_date: dt.date) -> dict[str, pathlib.Path]:
+    date_token = target_date_token(target_date)
+    start_date = target_date - dt.timedelta(days=1)
+    station_ids = [station.upper() for station in (args.nearby_station_ids or DEFAULT_NEARBY_STATIONS)]
+    obs_paths: dict[str, pathlib.Path] = {}
+    for station_id in station_ids:
+        history_dir = args.runtime_root / "nearby_wunderground_history" / date_token / station_id
+        tables_dir = args.runtime_root / "nearby_wunderground_tables" / date_token / station_id
+        command = [
+            sys.executable,
+            "wunderground/fetch_daily_history.py",
+            "--location-id",
+            f"{station_id}:9:US",
+            "--start-date",
+            start_date.isoformat(),
+            "--end-date",
+            target_date.isoformat(),
+            "--output-dir",
+            str(history_dir),
+            "--skip-http-status",
+            "400",
+            "--skip-http-status",
+            "404",
+        ]
+        if args.overwrite:
+            command.append("--force")
+        run(command)
+        run(
+            [
+                sys.executable,
+                "wunderground/build_training_tables.py",
+                "--history-dir",
+                str(history_dir),
+                "--station-id",
+                station_id,
+                "--output-dir",
+                str(tables_dir),
+            ]
+        )
+        obs_path = tables_dir / "wu_obs_intraday.parquet"
+        if obs_path.exists():
+            obs_paths[station_id] = obs_path
+    return obs_paths
+
+
 def fetch_lamp(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
     date_token = target_date_token(target_date)
     raw_dir = args.runtime_root / "lamp_raw" / date_token
@@ -470,6 +524,16 @@ def main() -> int:
                     args.runtime_root / "wunderground_tables" / date_token,
                 ]
             )
+        nearby_obs_paths: dict[str, pathlib.Path] = {}
+        if not args.skip_nearby_wunderground:
+            nearby_obs_paths = fetch_nearby_wunderground(args, target_date)
+            paths["nearby_wunderground_obs_paths"] = json.dumps({station: str(path) for station, path in nearby_obs_paths.items()}, sort_keys=True)
+            cleanup_candidates.extend(
+                [
+                    args.runtime_root / "nearby_wunderground_history" / date_token,
+                    args.runtime_root / "nearby_wunderground_tables" / date_token,
+                ]
+            )
         if not args.skip_lamp:
             lamp_overnight_dir = fetch_lamp(args, target_date)
             paths["lamp_overnight_dir"] = str(lamp_overnight_dir)
@@ -533,6 +597,7 @@ def main() -> int:
                 "--output-dir",
                 str(features_dir),
             ]
+            + [item for station, path in sorted(nearby_obs_paths.items()) for item in ("--nearby-obs-path", f"{station}={path}")]
         )
 
         normalized_path = features_dir / f"target_date_local={target_date.isoformat()}" / "withhrrr.inference_features_normalized.parquet"

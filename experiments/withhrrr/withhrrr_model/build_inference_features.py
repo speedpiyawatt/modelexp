@@ -21,6 +21,7 @@ from tools.weather.build_training_features_overnight_normalized import (
 )
 
 from .prepare_training_features import build_training_table
+from .source_trust import feature_profile_requires_nearby, is_nearby_feature_column
 
 
 DEFAULT_LABEL_HISTORY_PATH = pathlib.Path("wunderground/output/tables/labels_daily.parquet")
@@ -32,6 +33,7 @@ DEFAULT_FEATURE_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/
 DEFAULT_VOCAB_PATH = pathlib.Path("tools/weather/training_feature_vocabularies.json")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/predictions/features")
 DEFAULT_CUTOFF_LOCAL_TIME = "00:05"
+DEFAULT_NEARBY_MAX_OBS_AGE_HOURS = 12.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +45,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nbm-root", type=pathlib.Path, default=DEFAULT_NBM_ROOT)
     parser.add_argument("--lamp-root", type=pathlib.Path, default=DEFAULT_LAMP_ROOT)
     parser.add_argument("--hrrr-root", type=pathlib.Path, default=DEFAULT_HRRR_ROOT)
+    parser.add_argument(
+        "--nearby-obs-path",
+        action="append",
+        default=[],
+        help="Nearby station obs parquet in STATION=PATH form. Can be repeated.",
+    )
+    parser.add_argument("--nearby-max-obs-age-hours", type=float, default=DEFAULT_NEARBY_MAX_OBS_AGE_HOURS)
     parser.add_argument("--feature-manifest-path", type=pathlib.Path, default=DEFAULT_FEATURE_MANIFEST_PATH)
     parser.add_argument("--vocab-path", type=pathlib.Path, default=DEFAULT_VOCAB_PATH)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
@@ -87,6 +96,24 @@ def source_available(df: pd.DataFrame, column: str) -> bool:
     return bool(df[column].astype("boolean").fillna(False).iloc[0]) if column in df.columns and not df.empty else False
 
 
+def load_nearby_obs_from_args(values: list[str]) -> dict[str, pd.DataFrame]:
+    nearby: dict[str, pd.DataFrame] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"--nearby-obs-path must be STATION=PATH, got {value!r}")
+        station_id, path_text = value.split("=", 1)
+        station_id = station_id.strip().upper()
+        if not station_id:
+            raise ValueError(f"--nearby-obs-path has empty station id: {value!r}")
+        path = pathlib.Path(path_text)
+        if not path.exists():
+            raise FileNotFoundError(f"nearby obs path for {station_id} does not exist: {path}")
+        frame = pd.read_parquet(path)
+        if not frame.empty:
+            nearby[station_id] = frame
+    return nearby
+
+
 def prediction_available(model_ready: pd.DataFrame) -> pd.Series:
     return (
         model_ready["meta_nbm_available"].astype("boolean").fillna(False)
@@ -99,10 +126,19 @@ def prediction_available(model_ready: pd.DataFrame) -> pd.Series:
     )
 
 
+def nearby_available(model_ready: pd.DataFrame) -> bool:
+    columns = [column for column in model_ready.columns if column.startswith("meta_nearby_") and column.endswith("_obs_available")]
+    if not columns:
+        return False
+    flags = model_ready.loc[:, columns].astype("boolean").fillna(False)
+    return bool(flags.any(axis=1).iloc[0])
+
+
 def main() -> int:
     args = parse_args()
     feature_manifest = load_json(args.feature_manifest_path)
     anchor_policy = str(feature_manifest.get("anchor_policy", "equal_3way"))
+    feature_profile = str(feature_manifest.get("feature_profile", "global_all_features"))
     ridge_metadata = feature_manifest.get("ridge_anchor_metadata") if isinstance(feature_manifest.get("ridge_anchor_metadata"), dict) else None
     label_history_df = filter_label_history_for_inference(
         _read_parquet(args.label_history_path),
@@ -140,8 +176,21 @@ def main() -> int:
         raise ValueError(f"failed to build inference row for {args.station_id} {args.target_date_local}")
 
     normalized = normalize_training_features_overnight(unnormalized, load_vocabularies(args.vocab_path))
-    model_ready = build_training_table(normalized, hrrr=None, anchor_policy=anchor_policy, ridge_metadata=ridge_metadata)
+    nearby_obs_by_station = load_nearby_obs_from_args(args.nearby_obs_path)
+    model_ready = build_training_table(
+        normalized,
+        hrrr=None,
+        anchor_policy=anchor_policy,
+        ridge_metadata=ridge_metadata,
+        nearby_obs_by_station=nearby_obs_by_station,
+        nearby_max_obs_age_hours=args.nearby_max_obs_age_hours,
+    )
     model_ready["model_prediction_available"] = prediction_available(model_ready)
+    if feature_profile_requires_nearby(feature_profile) and not nearby_available(model_ready):
+        raise ValueError(
+            f"selected feature_profile={feature_profile!r} requires nearby station observations, "
+            "but no nearby station was available for the inference row"
+        )
     if not bool(model_ready["model_prediction_available"].iloc[0]):
         availability = {
             "meta_nbm_available": source_available(model_ready, "meta_nbm_available"),
@@ -151,6 +200,13 @@ def main() -> int:
         raise ValueError(f"with-HRRR prediction sources unavailable for {args.station_id} {args.target_date_local}: {availability}")
 
     feature_columns = list(feature_manifest["feature_columns"])
+    if feature_profile_requires_nearby(feature_profile):
+        missing_nearby = [column for column in feature_columns if is_nearby_feature_column(column) and column not in model_ready.columns]
+        if missing_nearby:
+            raise ValueError(
+                "selected nearby feature profile is missing generated nearby feature columns: "
+                f"{missing_nearby[:20]} count={len(missing_nearby)}"
+            )
     for column in feature_columns:
         if column not in model_ready.columns:
             model_ready[column] = pd.NA
@@ -176,8 +232,10 @@ def main() -> int:
         "unnormalized_path": str(unnormalized_path),
         "normalized_path": str(normalized_path),
         "feature_count": len(feature_columns),
+        "nearby_station_ids": sorted(nearby_obs_by_station),
+        "nearby_feature_count": int(sum(1 for column in model_ready.columns if column.startswith("nearby_"))),
         "anchor_policy": anchor_policy,
-        "feature_profile": feature_manifest.get("feature_profile"),
+        "feature_profile": feature_profile,
         "weight_profile": feature_manifest.get("weight_profile"),
         "meta_residual": feature_manifest.get("meta_residual"),
     }

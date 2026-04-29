@@ -18,13 +18,14 @@ HRRR-only is not good enough to be the whole model. On the 2025 holdout, HRRR-on
 
 ## Current Defaults
 
-- Model candidate: `very_regularized_min_leaf70_lgbm_350`
+- Model candidate: `nearby_vreg_leaf100_lgbm_350`
 - Anchor policy: `equal_3way`
-- Feature/weight profile: `high_disagreement_weighted`
-- Quantile calibration: `conformal_intervals`
+- Feature/weight profile: `high_disagreement_weighted_nearby` / `high_disagreement_weighted`
+- Nearby stations: `KJRB`, `KJFK`, `KEWR`, `KTEB`
+- Quantile calibration: `global_offsets`
 - Distribution method: `normal_iqr`
 - Ladder reliability calibration: `bucket_reliability_s1_00`
-- Feature count: `350`
+- Feature count: `467`
 - Training rows: `1,094` eligible rows from `2023-01-01` through `2025-12-31`
 
 Source-trust upgrade status:
@@ -34,15 +35,23 @@ Source-trust upgrade status:
 - Full rolling-origin validation selected the high-disagreement-weighted profile on the existing equal-3way anchor. Dynamic 4-way, median, trimmed, ridge, and meta residual variants were evaluated but not promoted.
 - Deployed 2026-04-29: code was pushed in commit `20330a1` and pulled on `/root/modelexp` at `root@198.199.64.163`. Ignored runtime artifacts for models, model selection, quantile calibration, distribution diagnostics, and ladder calibration were synced separately because `experiments/withhrrr/data/runtime/` is gitignored.
 
+Nearby-station upgrade status:
+
+- Implemented and validated 2026-04-30.
+- Added cutoff-safe Wunderground observation features for `KJRB`, `KJFK`, `KEWR`, and `KTEB`. Nearby observations are only used if they are available by `00:05 America/New_York` and within the configured stale-observation guard.
+- Online inference fetches/builds those nearby Wunderground station rows by default and removes their downloaded/intermediate artifacts after a successful prediction unless `--keep-artifacts` is set.
+- Full rolling-origin validation evaluated `47` candidate specs including nearby feature profiles and focused nearby LightGBM candidates. It selected `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
+- Dynamic 4-way, median, trimmed, ridge, meta residual, non-nearby source-trust, and disagreement-widening variants remain evaluated fallbacks but are not the current production default.
+
 ## Current Metrics
 
 Single holdout, `2025-05-27..2025-12-31`, `219` rows:
 
 | Metric | Value |
 | --- | ---: |
-| q50 MAE/RMSE | `1.2522 / 1.6512` |
-| degree NLL/Brier/RPS | `2.149011 / 0.820223 / 0.010002` |
-| event-bin NLL/Brier | `1.372809 / 0.619639` |
+| q50 MAE/RMSE | `1.2612 / 1.6395` |
+| degree NLL/Brier/RPS | `2.099877 / 0.819929 / 0.010060` |
+| event-bin NLL/Brier | `1.345150 / 0.612207` |
 
 Rolling 2025 calibration test, `365` rows:
 
@@ -52,10 +61,11 @@ Rolling 2025 calibration test, `365` rows:
 | conformal quantiles + interpolation | `1.274655` | `0.615411` | `2.071875` | `0.010205` |
 | conformal quantiles + `normal_iqr` | `1.261539` | `0.616776` | `2.024162` | `0.009516` |
 | selected source-trust quantiles + `normal_iqr` + ladder reliability | `1.250237` | `0.607134` | `2.008158` | `0.009521` |
+| selected nearby source-trust quantiles + `normal_iqr` + ladder reliability | `1.244989` | `0.608950` | `2.000670` | `0.009480` |
 
 Source-disagreement robustness, rolling 2025 calibration test:
 
-- `source_disagreement_regime_offsets` was evaluated but not promoted; event-bin NLL/Brier was `1.370733/0.616891`, worse than the selected `hrrr_nbm_direction_offsets`.
+- `source_disagreement_regime_offsets` was evaluated but not promoted; after the nearby-station upgrade, `global_offsets` won quantile calibration by event-bin NLL.
 - Source-disagreement ladder widening was evaluated at `0.5F`, `1.0F`, and `1.5F`; none beat `bucket_reliability_s1_00`, so no widening is enabled by default.
 - Diagnostics are written to `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
 

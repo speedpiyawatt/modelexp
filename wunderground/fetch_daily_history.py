@@ -34,6 +34,7 @@ class Config:
     delay_seconds: float
     max_retries: int
     timeout_seconds: int
+    skip_http_statuses: frozenset[int]
     force: bool
 
 
@@ -88,6 +89,13 @@ def parse_args() -> Config:
         help="HTTP timeout per request. Default: 30",
     )
     parser.add_argument(
+        "--skip-http-status",
+        type=int,
+        action="append",
+        default=[],
+        help="HTTP status to save as an empty no-data day instead of aborting. Can be repeated.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing daily files instead of skipping them.",
@@ -114,6 +122,7 @@ def parse_args() -> Config:
         delay_seconds=args.delay_seconds,
         max_retries=args.max_retries,
         timeout_seconds=args.timeout_seconds,
+        skip_http_statuses=frozenset(args.skip_http_status),
         force=args.force,
     )
 
@@ -164,6 +173,16 @@ def request_with_retries(config: Config, day: date) -> dict[str, Any]:
             return fetch_json(url, config.timeout_seconds)
         except HTTPError as exc:
             status = exc.code
+            if status in config.skip_http_statuses:
+                log(f"{day} got HTTP {status}, writing empty no-data payload")
+                return {
+                    "observations": [],
+                    "fetch_error": {
+                        "http_status": status,
+                        "reason": str(exc.reason),
+                        "url": url,
+                    },
+                }
             retryable = status == 429 or 500 <= status <= 599
             if retryable and attempt < config.max_retries:
                 wait_seconds = backoff_delay(config.delay_seconds, attempt, exc.headers.get("Retry-After"))

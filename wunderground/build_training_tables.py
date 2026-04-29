@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-dir", type=pathlib.Path, default=DEFAULT_HISTORY_DIR)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--station-id", default=DEFAULT_STATION_ID)
+    parser.add_argument(
+        "--file-glob",
+        default=None,
+        help="Optional JSON filename glob. Defaults to '<station_id>_9_US_*.json' and falls back to '*.json'.",
+    )
     return parser.parse_args()
 
 
@@ -72,11 +77,21 @@ def _load_history_file(path: pathlib.Path, *, station_id: str) -> pd.DataFrame:
     return frame
 
 
-def build_wu_obs_intraday(history_dir: pathlib.Path, *, station_id: str = DEFAULT_STATION_ID) -> pd.DataFrame:
-    frames = [
-        _load_history_file(path, station_id=station_id)
-        for path in sorted(history_dir.glob("KLGA_9_US_*.json"))
-    ]
+def history_files(history_dir: pathlib.Path, *, station_id: str = DEFAULT_STATION_ID, file_glob: str | None = None) -> list[pathlib.Path]:
+    if file_glob is not None:
+        return sorted(history_dir.glob(file_glob))
+    station_glob = f"{station_id}_9_US_*.json"
+    paths = sorted(history_dir.glob(station_glob))
+    return paths if paths else sorted(history_dir.glob("*.json"))
+
+
+def build_wu_obs_intraday(
+    history_dir: pathlib.Path,
+    *,
+    station_id: str = DEFAULT_STATION_ID,
+    file_glob: str | None = None,
+) -> pd.DataFrame:
+    frames = [_load_history_file(path, station_id=station_id) for path in history_files(history_dir, station_id=station_id, file_glob=file_glob)]
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame(
@@ -165,8 +180,13 @@ def build_labels_daily(obs_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame.from_records(labels)
 
 
-def build_training_tables(history_dir: pathlib.Path, *, station_id: str = DEFAULT_STATION_ID) -> tuple[pd.DataFrame, pd.DataFrame]:
-    obs_df = build_wu_obs_intraday(history_dir, station_id=station_id)
+def build_training_tables(
+    history_dir: pathlib.Path,
+    *,
+    station_id: str = DEFAULT_STATION_ID,
+    file_glob: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    obs_df = build_wu_obs_intraday(history_dir, station_id=station_id, file_glob=file_glob)
     labels_df = build_labels_daily(obs_df)
     return labels_df, obs_df
 
@@ -182,7 +202,7 @@ def write_outputs(*, output_dir: pathlib.Path, labels_df: pd.DataFrame, obs_df: 
 
 def main() -> int:
     args = parse_args()
-    labels_df, obs_df = build_training_tables(args.history_dir, station_id=args.station_id)
+    labels_df, obs_df = build_training_tables(args.history_dir, station_id=args.station_id, file_glob=args.file_glob)
     labels_path, obs_path = write_outputs(output_dir=args.output_dir, labels_df=labels_df, obs_df=obs_df)
     print(f"Wrote {labels_path}")
     print(f"Wrote {obs_path}")

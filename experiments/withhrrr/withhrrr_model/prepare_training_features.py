@@ -7,6 +7,7 @@ import pathlib
 
 import pandas as pd
 
+from .nearby_observations import add_nearby_station_feature_blocks
 from .source_disagreement import add_source_disagreement_features
 from .source_trust import SOURCE_TRUST_FEATURE_COLUMNS, add_source_trust_features, apply_anchor_policy
 
@@ -21,6 +22,9 @@ DEFAULT_OUTPUT_PATH = pathlib.Path(
 DEFAULT_MANIFEST_PATH = pathlib.Path(
     "experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.manifest.json"
 )
+DEFAULT_NEARBY_ROOT = pathlib.Path("experiments/withhrrr/data/runtime/source/wunderground_nearby")
+DEFAULT_LEGACY_KJRB_OBS_PATH = pathlib.Path("experiments/withhrrr/data/runtime/source/wunderground_kjrb/wu_obs_intraday.parquet")
+DEFAULT_NEARBY_STATIONS = ("KJRB", "KJFK", "KEWR", "KTEB")
 DEFAULT_ANCHOR_POLICY = "equal_3way"
 ANCHOR_POLICIES = (
     "current_50_50",
@@ -37,6 +41,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare the with-HRRR model training table.")
     parser.add_argument("--base-path", type=pathlib.Path, default=DEFAULT_BASE_PATH)
     parser.add_argument("--hrrr-root", type=pathlib.Path, default=DEFAULT_HRRR_ROOT)
+    parser.add_argument(
+        "--nearby-root",
+        type=pathlib.Path,
+        default=DEFAULT_NEARBY_ROOT,
+        help="Optional root containing per-station Wunderground tables under <station>/wu_obs_intraday.parquet.",
+    )
+    parser.add_argument(
+        "--nearby-station-id",
+        action="append",
+        dest="nearby_station_ids",
+        default=None,
+        help="Nearby station to load from --nearby-root. Can be repeated. Defaults to KJRB/KJFK/KEWR/KTEB.",
+    )
+    parser.add_argument(
+        "--legacy-kjrb-obs-path",
+        type=pathlib.Path,
+        default=DEFAULT_LEGACY_KJRB_OBS_PATH,
+        help="Fallback KJRB obs parquet path used when --nearby-root/KJRB is absent.",
+    )
+    parser.add_argument("--disable-nearby-obs", action="store_true")
+    parser.add_argument("--nearby-max-obs-age-hours", type=float, default=12.0)
     parser.add_argument("--output-path", type=pathlib.Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--manifest-output-path", type=pathlib.Path, default=DEFAULT_MANIFEST_PATH)
     parser.add_argument(
@@ -198,6 +223,8 @@ def build_training_table(
     *,
     anchor_policy: str = DEFAULT_ANCHOR_POLICY,
     ridge_metadata: dict[str, object] | None = None,
+    nearby_obs_by_station: dict[str, pd.DataFrame] | None = None,
+    nearby_max_obs_age_hours: float = 12.0,
 ) -> pd.DataFrame:
     if base.empty:
         raise ValueError("base normalized training table is empty")
@@ -225,6 +252,13 @@ def build_training_table(
             merged["meta_hrrr_available"] = True
     merged["meta_hrrr_available"] = merged["meta_hrrr_available"].astype("boolean").fillna(False)
     merged = _prepare_hrrr_disagreement_columns(merged)
+    if nearby_obs_by_station:
+        merged = add_nearby_station_feature_blocks(
+            merged,
+            nearby_obs_by_station,
+            cutoff_local_time="00:05",
+            max_obs_age_hours=nearby_max_obs_age_hours,
+        )
     merged = apply_anchor_policy(merged, anchor_policy=anchor_policy, ridge_metadata=ridge_metadata)
 
     label = pd.to_numeric(merged["label_final_tmax_f"], errors="coerce")
@@ -259,7 +293,7 @@ def build_training_table(
 
 
 def prefix_counts(columns: list[str]) -> dict[str, int]:
-    prefixes = ("label_", "meta_", "wu_", "nbm_", "lamp_", "hrrr_")
+    prefixes = ("label_", "meta_", "wu_", "nbm_", "lamp_", "hrrr_", "nearby_")
     counts: dict[str, int] = {}
     for prefix in prefixes:
         counts[prefix] = sum(1 for column in columns if column.startswith(prefix))
@@ -271,9 +305,11 @@ def build_manifest(
     *,
     base_path: pathlib.Path,
     hrrr_root: pathlib.Path,
+    nearby_obs_paths: dict[str, pathlib.Path],
     output_path: pathlib.Path,
     df: pd.DataFrame,
     anchor_policy: str,
+    nearby_station_ids: list[str],
 ) -> dict[str, object]:
     dates = df["target_date_local"].astype(str)
     eligible = df["model_training_eligible"].astype("boolean").fillna(False)
@@ -283,6 +319,8 @@ def build_manifest(
         "built_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "base_path": str(base_path),
         "hrrr_root": str(hrrr_root),
+        "nearby_obs_paths": {station_id: str(path) for station_id, path in nearby_obs_paths.items()},
+        "nearby_station_ids": nearby_station_ids,
         "output_path": str(output_path),
         "anchor_policy": anchor_policy,
         "anchor_columns": sorted(column for column in df.columns if column.startswith("anchor_") and column.endswith("_tmax_f")),
@@ -294,23 +332,71 @@ def build_manifest(
         "target_date_unique_count": int(dates.nunique()),
         "model_training_eligible_count": int(eligible.sum()),
         "hrrr_available_count": int(hrrr_available.sum()),
+        "nearby_feature_count": int(sum(1 for column in df.columns if column.startswith("nearby_"))),
         "column_prefix_counts": prefix_counts(list(df.columns)),
     }
+
+
+def load_nearby_obs(
+    *,
+    nearby_root: pathlib.Path,
+    station_ids: list[str],
+    legacy_kjrb_obs_path: pathlib.Path,
+) -> tuple[dict[str, pd.DataFrame], dict[str, pathlib.Path]]:
+    frames: dict[str, pd.DataFrame] = {}
+    paths: dict[str, pathlib.Path] = {}
+    for station_id in station_ids:
+        station = station_id.upper()
+        candidate_paths = [nearby_root / station / "wu_obs_intraday.parquet"]
+        if station == "KJRB":
+            candidate_paths.append(legacy_kjrb_obs_path)
+        candidates: list[tuple[int, pathlib.Path, pd.DataFrame]] = []
+        for path in candidate_paths:
+            if not path.exists():
+                continue
+            frame = pd.read_parquet(path)
+            if frame.empty:
+                continue
+            unique_dates = int(frame["date_local"].astype(str).nunique()) if "date_local" in frame.columns else int(len(frame))
+            candidates.append((unique_dates, path, frame))
+        if not candidates:
+            continue
+        _, path, frame = max(candidates, key=lambda item: item[0])
+        frames[station] = frame
+        paths[station] = path
+    return frames, paths
 
 
 def main() -> int:
     args = parse_args()
     base = pd.read_parquet(args.base_path)
     hrrr = None if any(column.startswith("hrrr_") for column in base.columns) else read_hrrr_summaries(args.hrrr_root)
-    output = build_training_table(base, hrrr, anchor_policy=args.anchor_policy)
+    nearby_station_ids = [station.upper() for station in (args.nearby_station_ids or list(DEFAULT_NEARBY_STATIONS))]
+    nearby_obs_by_station: dict[str, pd.DataFrame] = {}
+    nearby_obs_paths: dict[str, pathlib.Path] = {}
+    if not args.disable_nearby_obs:
+        nearby_obs_by_station, nearby_obs_paths = load_nearby_obs(
+            nearby_root=args.nearby_root,
+            station_ids=nearby_station_ids,
+            legacy_kjrb_obs_path=args.legacy_kjrb_obs_path,
+        )
+    output = build_training_table(
+        base,
+        hrrr,
+        anchor_policy=args.anchor_policy,
+        nearby_obs_by_station=nearby_obs_by_station,
+        nearby_max_obs_age_hours=args.nearby_max_obs_age_hours,
+    )
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     output.to_parquet(args.output_path, index=False)
     manifest = build_manifest(
         base_path=args.base_path,
         hrrr_root=args.hrrr_root,
+        nearby_obs_paths=nearby_obs_paths,
         output_path=args.output_path,
         df=output,
         anchor_policy=args.anchor_policy,
+        nearby_station_ids=nearby_station_ids,
     )
     args.manifest_output_path.parent.mkdir(parents=True, exist_ok=True)
     args.manifest_output_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

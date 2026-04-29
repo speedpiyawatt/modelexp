@@ -20,11 +20,12 @@ from experiments.withhrrr.withhrrr_model.calibrate_ladder import (
     widen_ladder_records,
 )
 from experiments.withhrrr.withhrrr_model.calibrate_rolling_origin import calibration_sort_key, fit_shrunk_segmented_offsets
-from experiments.withhrrr.withhrrr_model.build_inference_features import prediction_available
+from experiments.withhrrr.withhrrr_model.build_inference_features import nearby_available, prediction_available
 from experiments.withhrrr.withhrrr_model.distribution import degree_ladder_from_quantiles
 from experiments.withhrrr.withhrrr_model.event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from experiments.withhrrr.withhrrr_model.hrrr_ablation_diagnostics import drop_hrrr_feature_columns
 from experiments.withhrrr.withhrrr_model.model_config import DEFAULT_CANDIDATES, DEFAULT_MODEL_CANDIDATE_ID, HRRR_CANDIDATES, candidate_by_id
+from experiments.withhrrr.withhrrr_model.nearby_observations import build_nearby_station_features
 from experiments.withhrrr.withhrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
 from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration, calibration_offsets, selected_distribution_method
 from experiments.withhrrr.withhrrr_model.prepare_training_features import build_training_table
@@ -40,6 +41,7 @@ from experiments.withhrrr.withhrrr_model.source_disagreement import source_disag
 from experiments.withhrrr.withhrrr_model.source_trust import (
     add_source_trust_features,
     apply_anchor_policy,
+    feature_profile_requires_nearby,
     fit_ridge_4way_anchor,
     source_trust_feature_subset,
     training_weights,
@@ -132,6 +134,70 @@ def test_training_table_source_trust_anchor_policy_variants() -> None:
     assert bool(median.loc[0, "source_native_warmest"]) is True
 
 
+def test_kjrb_nearby_features_are_cutoff_safe_and_merged() -> None:
+    base = pd.DataFrame(
+        [
+            {
+                "target_date_local": "2025-04-11",
+                "station_id": "KLGA",
+                "label_final_tmax_f": 70.0,
+                "final_tmax_f": 70.0,
+                "nbm_tmax_open_f": 68.0,
+                "nbm_native_tmax_2m_day_max_f": 71.0,
+                "lamp_tmax_open_f": 65.0,
+                "hrrr_tmax_open_f": 72.0,
+                "wu_last_temp_f": 55.0,
+                "wu_temp_change_3h_f": -1.0,
+                "meta_nbm_available": True,
+                "meta_lamp_available": True,
+                "meta_hrrr_available": True,
+            }
+        ]
+    )
+    nearby_obs = pd.DataFrame(
+        [
+            {
+                "station_id": "KJRB",
+                "valid_time_local": "2025-04-10T21:00:00-04:00",
+                "temp_f": 54.0,
+                "dewpoint_f": 40.0,
+                "pressure_in": 30.0,
+                "wind_speed_mph": 6.0,
+            },
+            {
+                "station_id": "KJRB",
+                "valid_time_local": "2025-04-11T00:00:00-04:00",
+                "temp_f": 57.0,
+                "dewpoint_f": 41.0,
+                "pressure_in": 29.9,
+                "wind_speed_mph": 8.0,
+            },
+            {
+                "station_id": "KJRB",
+                "valid_time_local": "2025-04-11T00:10:00-04:00",
+                "temp_f": 99.0,
+                "dewpoint_f": 99.0,
+                "pressure_in": 28.0,
+                "wind_speed_mph": 99.0,
+            },
+        ]
+    )
+
+    features = build_nearby_station_features(pd.Series(["2025-04-11"]), nearby_obs, station_id="KJRB")
+    assert float(features.loc[0, "nearby_kjrb_last_temp_f"]) == 57.0
+    assert float(features.loc[0, "nearby_kjrb_temp_change_3h_f"]) == 3.0
+
+    out = build_training_table(base, nearby_obs_by_station={"KJRB": nearby_obs})
+    assert float(out.loc[0, "nearby_kjrb_last_temp_f"]) == 57.0
+    assert float(out.loc[0, "nearby_kjrb_minus_klga_last_temp_f"]) == 2.0
+    assert float(out.loc[0, "nearby_kjrb_last_temp_minus_hrrr_tmax_f"]) == -15.0
+    assert float(out.loc[0, "nearby_kjrb_minus_klga_temp_change_3h_f"]) == 4.0
+
+    stale = build_nearby_station_features(pd.Series(["2025-04-12"]), nearby_obs, station_id="KJRB")
+    assert bool(stale.loc[0, "meta_nearby_kjrb_obs_available"]) is False
+    assert pd.isna(stale.loc[0, "nearby_kjrb_last_temp_f"])
+
+
 def test_source_disagreement_regime_precedence() -> None:
     rows = pd.DataFrame(
         [
@@ -184,10 +250,35 @@ def test_source_trust_feature_profiles_filter_columns() -> None:
         "target_month",
         "hrrr_tmax_open_f",
         "source_hrrr_coldest",
+        "nearby_kjfk_last_temp_f",
+        "meta_nearby_kjfk_obs_available",
+        "nearby_station_available_count",
+        "klga_minus_nearby_kjfk_last_temp_f",
+        "klga_warmest_vs_nearby_last_temp",
+    ]
+    no_nearby = [
+        "nbm_tmax_open_f",
+        "native_minus_lamp_tmax_f",
+        "target_month",
+        "hrrr_tmax_open_f",
+        "source_hrrr_coldest",
     ]
     assert source_trust_feature_subset(columns, "global_all_features") == ["nbm_tmax_open_f", "hrrr_tmax_open_f"]
-    assert source_trust_feature_subset(columns, "source_trust_all_features") == columns
-    assert source_trust_feature_subset(columns, "high_disagreement_weighted") == columns
+    assert source_trust_feature_subset(columns, "source_trust_all_features") == no_nearby
+    assert source_trust_feature_subset(columns, "high_disagreement_weighted") == no_nearby
+    assert source_trust_feature_subset(columns, "high_disagreement_weighted_nearby") == columns
+    assert feature_profile_requires_nearby("high_disagreement_weighted_nearby") is True
+    assert feature_profile_requires_nearby("high_disagreement_weighted") is False
+
+
+def test_nearby_selected_inference_requires_available_nearby_station() -> None:
+    without_nearby = pd.DataFrame([{"meta_nbm_available": True, "meta_lamp_available": True, "meta_hrrr_available": True}])
+    assert nearby_available(without_nearby) is False
+    with_one_nearby = without_nearby.assign(
+        meta_nearby_kjrb_obs_available=False,
+        meta_nearby_kjfk_obs_available=True,
+    )
+    assert nearby_available(with_one_nearby) is True
 
 
 def test_rolling_selector_keeps_legacy_model_candidate_config_compatibility(tmp_path) -> None:

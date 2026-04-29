@@ -62,8 +62,9 @@ The folder `experiments/withhrrr/` is the HRRR-inclusive version of the no-HRRR 
 - it keeps the same model family as `experiments/no_hrrr_model`: residual LightGBM quantile models, calibrated final-Tmax quantiles, a 1F temperature ladder, and an event-bin adapter
 - it learns from Wunderground, NBM, LAMP, and HRRR source blocks; HRRR is both a learned input and part of the selected equal 3-way source anchor
 - the current selected anchor is `equal_3way`: `(nbm_tmax_open_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 3`; HRRR-only was not promoted because holdout metrics were worse than the residual model
-- the current selected with-HRRR model uses the Source-Trust upgrade: model candidate `very_regularized_min_leaf70_lgbm_350`, feature profile `high_disagreement_weighted`, weight profile `high_disagreement_weighted`, quantile calibration `conformal_intervals`, distribution `normal_iqr`, and ladder reliability `bucket_reliability_s1_00`
+- the current selected with-HRRR model uses the Source-Trust plus nearby-station upgrade: model candidate `nearby_vreg_leaf100_lgbm_350`, feature profile `high_disagreement_weighted_nearby`, weight profile `high_disagreement_weighted`, quantile calibration `global_offsets`, distribution `normal_iqr`, and ladder reliability `bucket_reliability_s1_00`
 - HRRR/source disagreement diagnostics are promoted as features, including HRRR-vs-LAMP/NBM deltas, native-NBM deltas, source ranks, warmest/coldest flags, WU-last-temp-vs-source deltas, and disagreement regimes
+- nearby-station Wunderground context for `KJRB`, `KJFK`, `KEWR`, and `KTEB` is now part of the selected with-HRRR feature profile; nearby observations must be cutoff-safe at `00:05 America/New_York` and guarded against stale reports
 - current selected with-HRRR defaults are documented in `experiments/withhrrr/README.md`, `TODO.md`, and `IMPLEMENTATION_TODO.md`
 - future agents must update both `experiments/withhrrr/TODO.md` and `experiments/withhrrr/IMPLEMENTATION_TODO.md` when changing selected model behavior, inference behavior, or reported metrics
 
@@ -144,7 +145,7 @@ Anchor planning and implementation to what already exists in this repo:
 - `tools/hrrr` already uses an overnight local-day summary design with a `00:05` cutoff and retained-cycle revision logic
 - `tools/weather` already provides canonical normalization contracts for downstream training
 - `experiments/no_hrrr_model/no_hrrr_model/run_online_inference.py` runs one-date no-HRRR online inference from Wunderground, LAMP, NBM, and Polymarket bins
-- `experiments/withhrrr/withhrrr_model/run_online_inference.py` runs one-date with-HRRR online inference from Wunderground, LAMP, NBM, HRRR, and Polymarket bins
+- `experiments/withhrrr/withhrrr_model/run_online_inference.py` runs one-date with-HRRR online inference from Wunderground, nearby Wunderground stations, LAMP, NBM, HRRR, and Polymarket bins
 - `tools/weather/run_server_dual_inference.py` is the local one-argument command for asking the DigitalOcean server to run both no-HRRR and with-HRRR inference and print a comparison
 
 Do not promise datasets or pipelines that are not currently present.
@@ -163,7 +164,6 @@ For `KLGA`, focus on:
 
 Potential later upgrades can include:
 
-- nearby-station temperature gradients
 - cloud products or satellite-derived timing features
 
 Those are later extensions, not overnight-model blockers.
@@ -186,7 +186,6 @@ Do not drift into these unless explicitly asked:
 
 - building a weather simulator from scratch
 - RTMA or URMA ingestion
-- nearby-station datasets
 - satellite or cloud-imagery pipelines
 - market microstructure or orderbook features in the overnight baseline
 - premature feature-store or infra complexity
@@ -217,7 +216,7 @@ For download-heavy or long-running network steps:
 
 - the server runner assumes SSH access to `root@198.199.64.163` and repo path `/root/modelexp`; override with `MODELEXP_SERVER`, `MODELEXP_REMOTE_REPO`, or `MODELEXP_REMOTE_OUTPUT_ROOT` only when needed
 - as of 2026-04-29, `/root/modelexp` is expected to include commit `20330a1` or newer plus synced ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/`; a plain Git pull is not enough to refresh those ignored artifacts
-- the server runner runs no-HRRR and HRRR source work in parallel, reuses the no-HRRR Wunderground/LAMP/NBM artifacts to build the with-HRRR prediction, then returns a local text comparison
+- the server runner runs no-HRRR and HRRR source work in parallel, reuses the no-HRRR KLGA Wunderground/LAMP/NBM artifacts to build the with-HRRR prediction, fetches nearby Wunderground station context for the with-HRRR source-trust features, then returns a local text comparison
 - server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, and logs
 - the server runner deletes downloaded/intermediate source artifacts after producing the predictions
 
@@ -266,7 +265,7 @@ Online inference artifact policy:
 Server dual inference:
 
 - use `.venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD` from the local repo when the user wants one-date production-style inference and comparison
-- the script starts no-HRRR online inference and HRRR source build concurrently on `root@198.199.64.163`, then builds the with-HRRR row from no-HRRR WU/LAMP/NBM artifacts plus HRRR summary
+- the script starts no-HRRR online inference and HRRR source build concurrently on `root@198.199.64.163`, then builds the with-HRRR row from no-HRRR WU/LAMP/NBM artifacts plus HRRR summary and nearby Wunderground station context
 - the script prints expected Tmax, anchor, distribution method, event-bin probabilities, and with-HRRR minus no-HRRR probability differences
 - a 2026-04-29 validation run for `2026-04-28` returned no-HRRR expected `65.07F`, with-HRRR expected `64.63F`, and finalized Wunderground/Synoptic peak near `64F`; with-HRRR was closer for that date
 - if the script fails, inspect `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/no_hrrr.log` and `hrrr.log`

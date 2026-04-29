@@ -39,6 +39,13 @@ SOURCE_TRUST_FEATURE_COLUMNS = {
     "target_dayofyear_sin",
     "target_dayofyear_cos",
 }
+NEARBY_FEATURE_PROFILES = {
+    "source_trust_nearby_features",
+    "high_disagreement_weighted_nearby",
+    "native_warm_hrrr_cold_specialist_nearby",
+    "native_cold_hrrr_warm_specialist_nearby",
+    "hrrr_outlier_specialist_nearby",
+}
 SOURCE_TRUST_FEATURE_PROFILES = {
     "global_all_features",
     "source_trust_all_features",
@@ -46,7 +53,22 @@ SOURCE_TRUST_FEATURE_PROFILES = {
     "native_warm_hrrr_cold_specialist",
     "native_cold_hrrr_warm_specialist",
     "hrrr_outlier_specialist",
+    *NEARBY_FEATURE_PROFILES,
 }
+
+
+def is_nearby_feature_column(column: str) -> bool:
+    return (
+        column.startswith("nearby_")
+        or column.startswith("meta_nearby_")
+        or "_nearby_" in column
+        or "nearby_station" in column
+        or "vs_nearby" in column
+    )
+
+
+def feature_profile_requires_nearby(profile: str) -> bool:
+    return profile in NEARBY_FEATURE_PROFILES
 
 
 def _numeric(df: pd.DataFrame, column: str) -> pd.Series:
@@ -254,8 +276,12 @@ def training_weights(df: pd.DataFrame, profile: str) -> pd.Series | None:
 
 
 def source_trust_feature_subset(feature_columns: list[str], profile: str) -> list[str]:
+    nearby_columns = {column for column in feature_columns if is_nearby_feature_column(column)}
     if profile == "global_all_features":
-        return [column for column in feature_columns if column not in SOURCE_TRUST_FEATURE_COLUMNS]
-    if profile in SOURCE_TRUST_FEATURE_PROFILES:
+        excluded = SOURCE_TRUST_FEATURE_COLUMNS | nearby_columns
+        return [column for column in feature_columns if column not in excluded]
+    if profile in NEARBY_FEATURE_PROFILES:
         return list(feature_columns)
+    if profile in SOURCE_TRUST_FEATURE_PROFILES:
+        return [column for column in feature_columns if column not in nearby_columns]
     raise ValueError(f"unknown feature_profile: {profile}")

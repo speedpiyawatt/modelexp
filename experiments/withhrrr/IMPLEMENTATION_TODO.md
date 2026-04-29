@@ -160,6 +160,59 @@ Result:
 - Refreshed holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.372809/0.619639`, degree NLL/RPS `2.149011/0.010002`, q50 MAE/RMSE `1.252238/1.651186`.
 - Deployed to production server: code commit `20330a1` is pulled on `/root/modelexp` at `root@198.199.64.163`; ignored runtime artifacts were synced separately for `models`, `model_selection`, `calibration_selection`, `distribution_diagnostics`, and `ladder_calibration`. Server-side verification confirmed selected training spec `equal_3way`, feature profile `high_disagreement_weighted`, weight profile `high_disagreement_weighted`, no meta residual.
 
+### Nearby-Station Source-Trust Upgrade
+
+Status: done
+
+Goal:
+
+- Add nearby airport/harbor observation context without leaking past the `00:05 America/New_York` cutoff.
+- Use Wunderground history for `KJRB`, `KJFK`, `KEWR`, and `KTEB`.
+- Rerun the complete selection, calibration, ladder, final training, and holdout stack before promotion.
+
+Implemented 2026-04-30:
+
+- Added `withhrrr_model/nearby_observations.py`.
+- Added optional nearby observation loading to `prepare_training_features.py`, including `--nearby-root`, repeatable `--nearby-station-id`, `--legacy-kjrb-obs-path`, `--disable-nearby-obs`, and `--nearby-max-obs-age-hours`.
+- Added stale-observation protection: each nearby station feature block only uses observations at or before cutoff and not older than the configured max age.
+- Added nearby feature profiles and focused nearby LightGBM candidates to `source_trust.py`, `model_config.py`, and `rolling_origin_model_select.py`.
+- Updated `build_inference_features.py` and `run_online_inference.py` so production inference can fetch, build, pass, and clean up nearby Wunderground observation features instead of filling the selected nearby columns as all missing.
+- Generalized Wunderground table building to station-specific file globs and added fetch-time HTTP skip handling for missing/no-data days.
+
+Verification 2026-04-30:
+
+```bash
+.venv/bin/python wunderground/build_training_tables.py \
+  --history-dir experiments/withhrrr/data/runtime/source/wunderground_kjrb/history \
+  --station-id KJRB \
+  --output-dir experiments/withhrrr/data/runtime/source/wunderground_kjrb
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.prepare_training_features
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.rolling_origin_model_select
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_rolling_origin
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.distribution_diagnostics
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_ladder
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.evaluate --output-dir experiments/withhrrr/data/runtime/evaluation/full_holdout_local
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.build_inference_features --target-date-local 2025-12-31 ...
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.predict --features-path /tmp/withhrrr_nearby_inference_smoke/.../withhrrr.inference_features_normalized.parquet ...
+.venv/bin/python -m py_compile wunderground/*.py experiments/withhrrr/withhrrr_model/*.py
+.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py
+```
+
+Result:
+
+- Training table: `1,096` rows, `508` columns, `467` selected features, `106` nearby-derived columns in the preparation manifest.
+- Coverage: `meta_nearby_kjrb_obs_available=1086`, `meta_nearby_kjfk_obs_available=1092`, `meta_nearby_kewr_obs_available=1092`, `meta_nearby_kteb_obs_available=1091`.
+- Leakage/label checks: `0` cutoff violations found; `label_final_tmax_f` matched `final_tmax_f` with max absolute diff `0.0`.
+- Rolling selection evaluated `47` candidate specs and selected `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
+- Selected model metadata: anchor `equal_3way`, model candidate `nearby_vreg_leaf100_lgbm_350`, feature profile `high_disagreement_weighted_nearby`, weight profile `high_disagreement_weighted`, no meta residual.
+- Rolling selection metrics: event-bin NLL `1.459584`, degree-ladder NLL `2.281087`, q50 MAE/RMSE `1.443267/1.996376`.
+- Refreshed selected downstream defaults: `global_offsets`, `normal_iqr`, `bucket_reliability_s1_00`.
+- Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.244989/0.608950`, degree NLL/RPS `2.000670/0.009480`.
+- Refreshed holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.345150/0.612207`, degree NLL/RPS `2.099877/0.010060`, q50 MAE/RMSE `1.261223/1.639528`.
+- Local inference smoke for `2025-12-31` produced an inference row with all four nearby stations available, `nearby_feature_count=106`, `feature_count=467`, and a valid prediction JSON.
+- Unit suite passed with `27` tests.
+
 ### 1. Stage HRRR Overnight Summary Data
 
 Status: done
