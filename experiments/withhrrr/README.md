@@ -10,17 +10,17 @@ The model predicts final KLGA temperature first. Polymarket bins are parsed and 
 - Target day: `America/New_York` local date.
 - Cutoff: `00:05 America/New_York`.
 - Row grain: one row per `target_date_local` and `station_id`.
-- Anchor: 4-way blend, `(nbm_tmax_open_f + nbm_native_tmax_2m_day_max_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 4`.
+- Anchor: equal 3-way blend, `(nbm_tmax_open_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 3`.
 - Residual target: `label_final_tmax_f - anchor_tmax_f`.
-- HRRR role: direct model features, calibration/evaluation regimes, and the selected 4-way anchor.
+- HRRR role: direct model features, calibration/evaluation regimes, and the selected equal 3-way anchor.
 
-HRRR-only is not good enough to be the whole model. On the 2025 holdout, HRRR-only remains materially worse than the final residual model, but rolling anchor-policy diagnostics showed HRRR-inclusive anchors beat the old 50/50 NBM/LAMP anchor.
+HRRR-only is not good enough to be the whole model. On the 2025 holdout, HRRR-only remains materially worse than the final residual model, but rolling anchor-policy diagnostics selected the equal NBM/LAMP/HRRR anchor by calibrated event-bin NLL.
 
 ## Current Defaults
 
 - Model candidate: `very_regularized_min_leaf70_lgbm_350`
-- Anchor policy: `hourly_native_lamp_hrrr`
-- Quantile calibration: `global_offsets`
+- Anchor policy: `equal_3way`
+- Quantile calibration: `hrrr_nbm_direction_offsets`
 - Distribution method: `normal_iqr`
 - Ladder reliability calibration: `bucket_reliability_s1_00`
 - Feature count: `304`
@@ -32,9 +32,9 @@ Single holdout, `2025-05-27..2025-12-31`, `219` rows:
 
 | Metric | Value |
 | --- | ---: |
-| q50 MAE/RMSE | `1.2433 / 1.6244` |
-| degree NLL/Brier/RPS | `2.148048 / 0.826190 / 0.010101` |
-| event-bin NLL/Brier | `1.336912 / 0.610830` |
+| q50 MAE/RMSE | `1.2589 / 1.6305` |
+| degree NLL/Brier/RPS | `2.182397 / 0.822290 / 0.010258` |
+| event-bin NLL/Brier | `1.411969 / 0.620390` |
 
 Rolling 2025 calibration test, `365` rows:
 
@@ -43,7 +43,7 @@ Rolling 2025 calibration test, `365` rows:
 | uncalibrated quantiles + interpolation | `1.370969` | `0.622307` | `2.233741` | `0.010356` |
 | conformal quantiles + interpolation | `1.274655` | `0.615411` | `2.071875` | `0.010205` |
 | conformal quantiles + `normal_iqr` | `1.261539` | `0.616776` | `2.024162` | `0.009516` |
-| selected 4-way-anchor quantiles + `normal_iqr` + ladder reliability | `1.250025` | `0.606569` | `2.000163` | `0.009593` |
+| selected equal-3-way-anchor quantiles + `normal_iqr` + ladder reliability | `1.240912` | `0.603902` | `1.999327` | `0.009510` |
 
 HRRR ablation, rolling `729` validation rows:
 

@@ -41,11 +41,11 @@ Selected target contract:
 nbm_tmax_open_f = fahrenheit(nbm_temp_2m_day_max_k)
 lamp_tmax_open_f = lamp_day_temp_max_f or canonical LAMP equivalent
 hrrr_tmax_open_f = fahrenheit(hrrr_temp_2m_day_max_k)
-anchor_tmax_f = (nbm_tmax_open_f + nbm_native_tmax_2m_day_max_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 4
+anchor_tmax_f = (nbm_tmax_open_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 3
 target_residual_f = label_final_tmax_f - anchor_tmax_f
 ```
 
-Important: HRRR enters as both the selected 4-way anchor component and model input features. Do not replace the model with an HRRR-only anchor or staged HRRR ensemble unless a later evaluation proves that is better and the user approves it.
+Important: HRRR enters as both the selected equal 3-way anchor component and model input features. Do not replace the model with an HRRR-only anchor or staged HRRR ensemble unless a later evaluation proves that is better and the user approves it.
 
 ## Latest Optimization Pass: Anchor Policy Selection
 
@@ -53,7 +53,7 @@ Important: HRRR enters as both the selected 4-way anchor component and model inp
   - Done 2026-04-29: `prepare_training_features.py` now supports `--anchor-policy` with `current_50_50`, `hourly_native_lamp`, `hourly_native_lamp_hrrr`, `native_lamp`, and `equal_3way`. It also derives native-NBM disagreement features such as `nbm_native_tmax_minus_anchor_f`, `nbm_native_tmax_minus_nbm_tmax_f`, and 2F direction flags.
   - Eval 2026-04-29: raw rolling-origin comparison across 729 validation rows wrote `experiments/withhrrr/data/runtime/anchor_experiments/anchor_policy_comparison.csv`. Event-bin NLL ranked: `equal_3way=1.486443`, `hourly_native_lamp_hrrr=1.497680`, `hourly_native_lamp=1.504711`, `native_lamp=1.516323`, `current_50_50=1.518486`.
   - Eval 2026-04-29: calibrated top-two comparison selected `equal_3way`. With `hrrr_nbm_direction_offsets`, `normal_iqr`, and `bucket_reliability_s1_00`, 2025 event-bin NLL/Brier is `1.240912/0.603902`; degree NLL/RPS is `1.999327/0.009510`. The HRRR+native blend was second with event-bin NLL/Brier `1.250025/0.606569`.
-  - Decision 2026-04-29: `equal_3way` had the best calibrated event-bin NLL, but a real April 26, 2026 replay showed it worsened the specific HRRR-cold/native-NBM-warm miss. Promoted the second-best `hourly_native_lamp_hrrr` anchor instead because it still improves calibrated event-bin NLL over old production while keeping native NBM TMAX in the anchor. Selected candidate remains `very_regularized_min_leaf70_lgbm_350`.
+  - Decision 2026-04-29: promoted `equal_3way` as the default anchor and `very_regularized_min_leaf70_lgbm_350` as the default candidate because it has the best calibrated historical probability metrics. A real April 26, 2026 replay showed this can worsen a specific HRRR-cold/native-NBM-warm miss, but one live miss is not enough evidence to override the stronger 2025 rolling validation result. Native NBM TMAX remains a model feature and diagnostic, and the 4-way `hourly_native_lamp_hrrr` anchor remains the best fallback if later regime testing proves it generalizes better.
 
 ## Latest Optimization Pass: HRRR Disagreement Regimes
 
