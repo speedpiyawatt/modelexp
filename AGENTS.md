@@ -215,8 +215,8 @@ For download-heavy or long-running network steps:
 ```
 
 - the server runner assumes SSH access to `root@198.199.64.163` and repo path `/root/modelexp`; override with `MODELEXP_SERVER`, `MODELEXP_REMOTE_REPO`, or `MODELEXP_REMOTE_OUTPUT_ROOT` only when needed
-- as of 2026-04-30, GitHub `origin/main` includes commit `dbaff9a` with the nearby/source-trust implementation and server-dual inference fix; `/root/modelexp` on `root@198.199.64.163` still needs `git pull` plus synced ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/` before the server can be treated as current
-- the server runner runs no-HRRR and HRRR source work in parallel, reuses the no-HRRR KLGA Wunderground/LAMP/NBM artifacts to build the with-HRRR prediction, fetches nearby Wunderground station context for the with-HRRR source-trust features, then returns a local text comparison
+- as of 2026-04-30, `/root/modelexp` on `root@198.199.64.163` has been pulled/synced through commit `dbe7eaf` plus ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/`; later model artifact rebuilds still require explicit artifact sync because Git does not track those runtime outputs
+- the server runner runs no-HRRR, HRRR source work, and nearby Wunderground station prefetch concurrently, reuses the no-HRRR KLGA Wunderground/LAMP/NBM artifacts plus the prefetched nearby context to build the with-HRRR prediction, then returns a local text comparison
 - server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, and logs
 - the server runner deletes downloaded/intermediate source artifacts after producing the predictions
 
@@ -253,6 +253,7 @@ Online inference worker defaults:
 - no-HRRR online inference NBM uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
 - with-HRRR online inference NBM uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
 - with-HRRR online inference HRRR uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
+- `tools/weather/run_server_dual_inference.py` overrides the server run to use more download parallelism by default: no-HRRR NBM `download-workers=6`, HRRR `max-workers=6 download-workers=6`, with reduce/extract still `2/2` and `wgrib2-threads=1`; tune with `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_MAX_WORKERS`, and model-specific env vars when benchmarking
 - keep `wgrib2-threads=1` unless benchmarking proves otherwise; process-level parallelism has been more useful than multi-threading individual `wgrib2` calls
 
 Online inference artifact policy:
@@ -265,7 +266,7 @@ Online inference artifact policy:
 Server dual inference:
 
 - use `.venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD` from the local repo when the user wants one-date production-style inference and comparison
-- the script starts no-HRRR online inference and HRRR source build concurrently on `root@198.199.64.163`, then builds the with-HRRR row from no-HRRR WU/LAMP/NBM artifacts plus HRRR summary and nearby Wunderground station context
+- the script starts no-HRRR online inference, HRRR source build, and KJRB/KJFK/KEWR/KTEB nearby Wunderground prefetch concurrently on `root@198.199.64.163`, then builds the with-HRRR row from no-HRRR WU/LAMP/NBM artifacts plus HRRR summary and nearby Wunderground station context
 - the script prints expected Tmax, anchor, distribution method, event-bin probabilities, and with-HRRR minus no-HRRR probability differences
 - a 2026-04-29 validation run for `2026-04-28` returned no-HRRR expected `65.07F`, with-HRRR expected `64.63F`, and finalized Wunderground/Synoptic peak near `64F`; with-HRRR was closer for that date
 - if the script fails, inspect `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/no_hrrr.log` and `hrrr.log`

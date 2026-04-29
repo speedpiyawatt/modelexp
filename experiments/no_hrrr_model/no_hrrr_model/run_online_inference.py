@@ -45,6 +45,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-wunderground", action="store_true")
     parser.add_argument("--skip-lamp", action="store_true")
     parser.add_argument("--skip-nbm", action="store_true")
+    parser.add_argument("--nbm-download-workers", type=int, default=4)
+    parser.add_argument("--nbm-reduce-workers", type=int, default=2)
+    parser.add_argument("--nbm-extract-workers", type=int, default=2)
+    parser.add_argument("--nbm-wgrib2-threads", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--continue-on-lamp-fetch-error", action="store_true")
     parser.add_argument(
@@ -357,17 +361,17 @@ def fetch_nbm(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
         "--day-workers",
         "1",
         "--download-workers",
-        "4",
+        str(args.nbm_download_workers),
         "--reduce-workers",
-        "2",
+        str(args.nbm_reduce_workers),
         "--extract-workers",
-        "2",
+        str(args.nbm_extract_workers),
         "--reduce-queue-size",
         "2",
         "--extract-queue-size",
         "2",
         "--wgrib2-threads",
-        "1",
+        str(args.nbm_wgrib2_threads),
         "--batch-reduce-mode",
         "cycle",
         "--progress-mode",

@@ -88,7 +88,9 @@ Production-style one-date inference should use the server dual runner from the l
 .venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD
 ```
 
-The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs both Git commit `dbaff9a` or newer and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts.
+The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs both Git commit `dbaff9a` or newer and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts. As of 2026-04-30, the server has been pulled/synced through commit `dbe7eaf`.
+
+The server runner overlaps no-HRRR source work, HRRR source work, and nearby Wunderground station prefetch. Its default server tuning uses extra download parallelism while keeping `wgrib2` threads at `1`; override with environment variables such as `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, and `MODELEXP_HRRR_MAX_WORKERS` when benchmarking.
 
 Prepare the model table:
 

@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nbm-root", type=pathlib.Path, help="Use existing NBM overnight summaries instead of the runtime-root default.")
     parser.add_argument("--hrrr-root", type=pathlib.Path, help="Use existing HRRR overnight summaries instead of the runtime-root default.")
     parser.add_argument(
+        "--nearby-obs-path",
+        action="append",
+        default=[],
+        help="Existing nearby station obs parquet in STATION=PATH form. Can be repeated. Suppresses fetching for supplied stations.",
+    )
+    parser.add_argument(
         "--nearby-station-id",
         action="append",
         dest="nearby_station_ids",
@@ -59,6 +65,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-lamp", action="store_true")
     parser.add_argument("--skip-nbm", action="store_true")
     parser.add_argument("--skip-hrrr", action="store_true")
+    parser.add_argument("--nbm-download-workers", type=int, default=4)
+    parser.add_argument("--nbm-reduce-workers", type=int, default=2)
+    parser.add_argument("--nbm-extract-workers", type=int, default=2)
+    parser.add_argument("--nbm-wgrib2-threads", type=int, default=1)
+    parser.add_argument("--hrrr-max-workers", type=int, default=4)
+    parser.add_argument("--hrrr-download-workers", type=int, default=4)
+    parser.add_argument("--hrrr-reduce-workers", type=int, default=2)
+    parser.add_argument("--hrrr-extract-workers", type=int, default=2)
+    parser.add_argument("--hrrr-wgrib2-threads", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--continue-on-lamp-fetch-error", action="store_true")
     parser.add_argument(
@@ -325,6 +340,22 @@ def fetch_nearby_wunderground(args: argparse.Namespace, target_date: dt.date) ->
     return obs_paths
 
 
+def parse_nearby_obs_paths(values: list[str]) -> dict[str, pathlib.Path]:
+    obs_paths: dict[str, pathlib.Path] = {}
+    for value in values:
+        if "=" not in value:
+            raise SystemExit(f"--nearby-obs-path must be STATION=PATH, got {value!r}")
+        station_id, path_text = value.split("=", 1)
+        station_id = station_id.strip().upper()
+        path = pathlib.Path(path_text)
+        if not station_id:
+            raise SystemExit(f"--nearby-obs-path has empty station id: {value!r}")
+        if not path.exists():
+            raise SystemExit(f"nearby obs path for {station_id} does not exist: {path}")
+        obs_paths[station_id] = path
+    return obs_paths
+
+
 def fetch_lamp(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
     date_token = target_date_token(target_date)
     raw_dir = args.runtime_root / "lamp_raw" / date_token
@@ -415,17 +446,17 @@ def fetch_nbm(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
         "--day-workers",
         "1",
         "--download-workers",
-        "4",
+        str(args.nbm_download_workers),
         "--reduce-workers",
-        "2",
+        str(args.nbm_reduce_workers),
         "--extract-workers",
-        "2",
+        str(args.nbm_extract_workers),
         "--reduce-queue-size",
         "2",
         "--extract-queue-size",
         "2",
         "--wgrib2-threads",
-        "1",
+        str(args.nbm_wgrib2_threads),
         "--batch-reduce-mode",
         "cycle",
         "--progress-mode",
@@ -455,13 +486,13 @@ def fetch_hrrr(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
         "--day-workers",
         "1",
         "--max-workers",
-        "4",
+        str(args.hrrr_max_workers),
         "--download-workers",
-        "4",
+        str(args.hrrr_download_workers),
         "--reduce-workers",
-        "2",
+        str(args.hrrr_reduce_workers),
         "--extract-workers",
-        "2",
+        str(args.hrrr_extract_workers),
         "--reduce-queue-size",
         "2",
         "--extract-queue-size",
@@ -473,7 +504,7 @@ def fetch_hrrr(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
         "--crop-grib-type",
         "same",
         "--wgrib2-threads",
-        "1",
+        str(args.hrrr_wgrib2_threads),
         "--extract-method",
         "wgrib2-bin",
         "--summary-profile",
@@ -524,9 +555,10 @@ def main() -> int:
                     args.runtime_root / "wunderground_tables" / date_token,
                 ]
             )
-        nearby_obs_paths: dict[str, pathlib.Path] = {}
+        nearby_obs_paths: dict[str, pathlib.Path] = parse_nearby_obs_paths(args.nearby_obs_path)
         if not args.skip_nearby_wunderground:
-            nearby_obs_paths = fetch_nearby_wunderground(args, target_date)
+            fetched_nearby_paths = fetch_nearby_wunderground(args, target_date)
+            nearby_obs_paths = {**fetched_nearby_paths, **nearby_obs_paths}
             paths["nearby_wunderground_obs_paths"] = json.dumps({station: str(path) for station, path in nearby_obs_paths.items()}, sort_keys=True)
             cleanup_candidates.extend(
                 [
@@ -534,6 +566,8 @@ def main() -> int:
                     args.runtime_root / "nearby_wunderground_tables" / date_token,
                 ]
             )
+        elif nearby_obs_paths:
+            paths["nearby_wunderground_obs_paths"] = json.dumps({station: str(path) for station, path in nearby_obs_paths.items()}, sort_keys=True)
         if not args.skip_lamp:
             lamp_overnight_dir = fetch_lamp(args, target_date)
             paths["lamp_overnight_dir"] = str(lamp_overnight_dir)

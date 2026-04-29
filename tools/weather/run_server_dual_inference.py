@@ -52,6 +52,13 @@ def remote_script(*, target_date: dt.date, remote_repo: str, output_root: str) -
     with_hrrr_prediction_dir = f"{run_root}/predictions/with_hrrr"
     no_hrrr_prediction = prediction_path(run_root, "no_hrrr", target_date)
     with_hrrr_prediction = prediction_path(run_root, "with_hrrr", target_date)
+    no_hrrr_nbm_download_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_DOWNLOAD_WORKERS", os.environ.get("MODELEXP_NBM_DOWNLOAD_WORKERS", "6"))
+    no_hrrr_nbm_reduce_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_REDUCE_WORKERS", os.environ.get("MODELEXP_NBM_REDUCE_WORKERS", "2"))
+    no_hrrr_nbm_extract_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_EXTRACT_WORKERS", os.environ.get("MODELEXP_NBM_EXTRACT_WORKERS", "2"))
+    hrrr_max_workers = os.environ.get("MODELEXP_HRRR_MAX_WORKERS", "6")
+    hrrr_download_workers = os.environ.get("MODELEXP_HRRR_DOWNLOAD_WORKERS", "6")
+    hrrr_reduce_workers = os.environ.get("MODELEXP_HRRR_REDUCE_WORKERS", "2")
+    hrrr_extract_workers = os.environ.get("MODELEXP_HRRR_EXTRACT_WORKERS", "2")
     return f"""
 set -euo pipefail
 cd {shlex.quote(remote_repo)}
@@ -65,10 +72,38 @@ NO_HRRR_PRED_DIR={shlex.quote(no_hrrr_prediction_dir)}
 WITH_HRRR_PRED_DIR={shlex.quote(with_hrrr_prediction_dir)}
 NO_HRRR_PRED={shlex.quote(no_hrrr_prediction)}
 WITH_HRRR_PRED={shlex.quote(with_hrrr_prediction)}
+NEARBY_PREFETCH_ROOT="$WITH_HRRR_RUNTIME/nearby_prefetch"
+NEARBY_STATIONS=(KJRB KJFK KEWR KTEB)
 
 mkdir -p "$NO_HRRR_PRED_DIR" "$WITH_HRRR_PRED_DIR"
 rm -rf "$NO_HRRR_RUNTIME" "$WITH_HRRR_RUNTIME"
 rm -f "$NO_HRRR_PRED" "$WITH_HRRR_PRED"
+
+NEARBY_PIDS=()
+for STATION in "${{NEARBY_STATIONS[@]}}"; do
+  (
+    set -euo pipefail
+    HISTORY_DIR="$NEARBY_PREFETCH_ROOT/history/$STATION"
+    TABLES_DIR="$NEARBY_PREFETCH_ROOT/tables/$STATION"
+    .venv/bin/python wunderground/fetch_daily_history.py \\
+      --location-id "$STATION:9:US" \\
+      --start-date "$(python3 - <<PY
+import datetime as dt
+print((dt.date.fromisoformat("$DATE") - dt.timedelta(days=1)).isoformat())
+PY
+)" \\
+      --end-date "$DATE" \\
+      --output-dir "$HISTORY_DIR" \\
+      --skip-http-status 400 \\
+      --skip-http-status 404 \\
+      --force
+    .venv/bin/python wunderground/build_training_tables.py \\
+      --history-dir "$HISTORY_DIR" \\
+      --station-id "$STATION" \\
+      --output-dir "$TABLES_DIR"
+  ) > "$RUN_ROOT/nearby_$STATION.log" 2>&1 &
+  NEARBY_PIDS+=("$!")
+done
 
 (
   set -euo pipefail
@@ -77,6 +112,9 @@ rm -f "$NO_HRRR_PRED" "$WITH_HRRR_PRED"
     --runtime-root "$NO_HRRR_RUNTIME" \\
     --prediction-output-dir "$NO_HRRR_PRED_DIR" \\
     --polymarket-event-slug \\
+    --nbm-download-workers {shlex.quote(no_hrrr_nbm_download_workers)} \\
+    --nbm-reduce-workers {shlex.quote(no_hrrr_nbm_reduce_workers)} \\
+    --nbm-extract-workers {shlex.quote(no_hrrr_nbm_extract_workers)} \\
     --overwrite \\
     --keep-artifacts
 ) > "$RUN_ROOT/no_hrrr.log" 2>&1 &
@@ -91,10 +129,10 @@ NO_HRRR_PID=$!
     --selection-mode overnight_0005 \\
     --batch-reduce-mode cycle \\
     --day-workers 1 \\
-    --max-workers 4 \\
-    --download-workers 4 \\
-    --reduce-workers 2 \\
-    --extract-workers 2 \\
+    --max-workers {shlex.quote(hrrr_max_workers)} \\
+    --download-workers {shlex.quote(hrrr_download_workers)} \\
+    --reduce-workers {shlex.quote(hrrr_reduce_workers)} \\
+    --extract-workers {shlex.quote(hrrr_extract_workers)} \\
     --reduce-queue-size 2 \\
     --extract-queue-size 2 \\
     --range-merge-gap-bytes 65536 \\
@@ -113,6 +151,15 @@ wait "$NO_HRRR_PID"
 NO_HRRR_STATUS=$?
 wait "$HRRR_PID"
 HRRR_STATUS=$?
+NEARBY_STATUS=0
+for idx in "${{!NEARBY_PIDS[@]}}"; do
+  if ! wait "${{NEARBY_PIDS[$idx]}}"; then
+    STATION="${{NEARBY_STATIONS[$idx]}}"
+    echo "[warn] nearby Wunderground prefetch failed for $STATION; log follows" >&2
+    tail -80 "$RUN_ROOT/nearby_$STATION.log" >&2 || true
+    NEARBY_STATUS=1
+  fi
+done
 set -e
 
 if [ "$NO_HRRR_STATUS" -ne 0 ]; then
@@ -125,6 +172,10 @@ if [ "$HRRR_STATUS" -ne 0 ]; then
   tail -200 "$RUN_ROOT/hrrr.log" >&2 || true
   exit "$HRRR_STATUS"
 fi
+if [ "$NEARBY_STATUS" -ne 0 ]; then
+  echo "[error] one or more nearby Wunderground prefetches failed" >&2
+  exit "$NEARBY_STATUS"
+fi
 
 EVENT_BINS_PATH=$(find "$NO_HRRR_RUNTIME/polymarket" -path '*/event_bins.json' -print -quit)
 if [ -z "$EVENT_BINS_PATH" ]; then
@@ -132,6 +183,14 @@ if [ -z "$EVENT_BINS_PATH" ]; then
   tail -100 "$RUN_ROOT/no_hrrr.log" >&2 || true
   exit 1
 fi
+
+NEARBY_OBS_ARGS=()
+for STATION in "${{NEARBY_STATIONS[@]}}"; do
+  OBS_PATH="$NEARBY_PREFETCH_ROOT/tables/$STATION/wu_obs_intraday.parquet"
+  if [ -f "$OBS_PATH" ]; then
+    NEARBY_OBS_ARGS+=(--nearby-obs-path "$STATION=$OBS_PATH")
+  fi
+done
 
 .venv/bin/python -m experiments.withhrrr.withhrrr_model.run_online_inference \\
   --target-date-local "$DATE" \\
@@ -147,6 +206,8 @@ fi
   --skip-lamp \\
   --skip-nbm \\
   --skip-hrrr \\
+  --skip-nearby-wunderground \\
+  "${{NEARBY_OBS_ARGS[@]}}" \\
   --overwrite
 
 rm -rf \\
@@ -158,6 +219,7 @@ rm -rf \\
   "$NO_HRRR_RUNTIME/nbm" \\
   "$NO_HRRR_RUNTIME/polymarket" \\
   "$NO_HRRR_RUNTIME/prediction_features" \\
+  "$NEARBY_PREFETCH_ROOT" \\
   "$HRRR_RUN_ROOT"
 
 .venv/bin/python - <<'PY'
