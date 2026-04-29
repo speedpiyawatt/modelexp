@@ -14,6 +14,11 @@ from typing import Any
 DEFAULT_SERVER = "root@198.199.64.163"
 DEFAULT_REMOTE_REPO = "/root/modelexp"
 DEFAULT_REMOTE_OUTPUT_ROOT = "data/runtime/server_dual_inference"
+ANSI_RESET = "\033[0m"
+HIGHLIGHT_STYLES = {
+    "no_hrrr": {1: "1;34", 2: "36"},
+    "with_hrrr": {1: "1;35", 2: "33"},
+}
 
 
 def parse_date(value: str) -> dt.date:
@@ -223,11 +228,49 @@ def fmt(value: Any, digits: int = 2) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def color_enabled() -> bool:
+    override = os.environ.get("MODELEXP_COLOR", "").strip().lower()
+    if override in {"1", "always", "true", "yes", "on"}:
+        return True
+    if override in {"0", "never", "false", "no", "off"}:
+        return False
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def colorize(text: str, style: str, *, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\033[{style}m{text}{ANSI_RESET}"
+
+
+def top_bin_ranks(bin_probs: dict[str, float], *, count: int = 2) -> dict[str, int]:
+    ranked = sorted(bin_probs.items(), key=lambda item: (-item[1], item[0]))
+    return {label: rank for rank, (label, _) in enumerate(ranked[:count], start=1)}
+
+
+def format_probability(
+    model_name: str,
+    probability: float,
+    ranks: dict[str, int],
+    label: str,
+    *,
+    enabled: bool,
+) -> str:
+    rank = ranks.get(label)
+    text = f"{probability:6.4f}"
+    if rank is None:
+        return text
+    marker = "1st" if rank == 1 else "2nd"
+    text = f"{text} {marker}"
+    return colorize(text, HIGHLIGHT_STYLES[model_name][rank], enabled=enabled)
+
+
 def print_summary(result: dict[str, Any]) -> None:
     predictions = result["predictions"]
     no_hrrr = predictions["no_hrrr"]
     with_hrrr = predictions["with_hrrr"]
     diff = result["diff_with_hrrr_minus_no_hrrr"]
+    use_color = color_enabled()
     print(f"date: {result['target_date_local']}")
     print(f"remote_run_root: {result['remote_run_root']}")
     print()
@@ -239,11 +282,22 @@ def print_summary(result: dict[str, Any]) -> None:
     print("event bins")
     no_bins = {row["bin"]: float(row["probability"]) for row in no_hrrr["event_bins"]}
     with_bins = {row["bin"]: float(row["probability"]) for row in with_hrrr["event_bins"]}
+    no_ranks = top_bin_ranks(no_bins)
+    with_ranks = top_bin_ranks(with_bins)
+    print(
+        "highlight: "
+        f"{colorize('no_hrrr 1st', HIGHLIGHT_STYLES['no_hrrr'][1], enabled=use_color)}, "
+        f"{colorize('no_hrrr 2nd', HIGHLIGHT_STYLES['no_hrrr'][2], enabled=use_color)}, "
+        f"{colorize('with_hrrr 1st', HIGHLIGHT_STYLES['with_hrrr'][1], enabled=use_color)}, "
+        f"{colorize('with_hrrr 2nd', HIGHLIGHT_STYLES['with_hrrr'][2], enabled=use_color)}"
+    )
     for label, no_prob in no_bins.items():
         if label not in with_bins:
             continue
         with_prob = with_bins[label]
-        print(f"{label:<18} no_hrrr={no_prob:6.4f}  with_hrrr={with_prob:6.4f}  diff={with_prob - no_prob:+7.4f}")
+        no_text = format_probability("no_hrrr", no_prob, no_ranks, label, enabled=use_color)
+        with_text = format_probability("with_hrrr", with_prob, with_ranks, label, enabled=use_color)
+        print(f"{label:<18} no_hrrr={no_text:<10}  with_hrrr={with_text:<10}  diff={with_prob - no_prob:+7.4f}")
 
 
 def main() -> int:
