@@ -31,7 +31,7 @@ from experiments.withhrrr.withhrrr_model.hrrr_ablation_diagnostics import drop_h
 from experiments.withhrrr.withhrrr_model.model_config import DEFAULT_CANDIDATES, DEFAULT_MODEL_CANDIDATE_ID, HRRR_CANDIDATES, candidate_by_id
 from experiments.withhrrr.withhrrr_model.nearby_observations import build_nearby_station_features
 from experiments.withhrrr.withhrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
-from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration, calibration_offsets, selected_distribution_method
+from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration, calibration_metadata, calibration_offsets, selected_distribution_method
 from experiments.withhrrr.withhrrr_model.prepare_training_features import build_training_table
 from experiments.withhrrr.withhrrr_model.rolling_origin_model_select import (
     leakage_findings,
@@ -513,6 +513,32 @@ def test_prediction_reads_source_disagreement_segmented_calibration() -> None:
     }
     row = pd.DataFrame([{"source_disagreement_regime": "native_warm_hrrr_cold"}])
     assert calibration_offsets(payload, row=row) == {"q50": 1.25}
+
+
+def test_prediction_reports_conditional_calibration_branch_metadata() -> None:
+    payload = {
+        "selected_method_id": "conditional_global_high_no_offsets_consensus",
+        "methods": {
+            "conditional_global_high_no_offsets_consensus": {
+                "config": {
+                    "segment_name": "source_disagreement_regime",
+                    "default_method_id": "global_offsets",
+                    "consensus_method_id": "no_offsets",
+                    "consensus_regimes": ["tight_consensus", "moderate_disagreement"],
+                    "method_configs": {
+                        "global_offsets": {"offsets_f": {"q50": 1.5}},
+                        "no_offsets": {"offsets_f": {"q50": 0.0}},
+                    },
+                }
+            }
+        },
+    }
+    row = pd.DataFrame([{"source_disagreement_regime": "moderate_disagreement"}])
+    metadata = calibration_metadata(payload, row=row)
+    assert metadata["segment_value"] == "moderate_disagreement"
+    assert metadata["branch"] == "consensus"
+    assert metadata["branch_method_id"] == "no_offsets"
+    assert metadata["branch_offsets_f"] == {"q50": 0.0}
 
 
 def test_distribution_and_ladder_calibration_are_manifest_driven(tmp_path) -> None:

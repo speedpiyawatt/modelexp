@@ -210,7 +210,7 @@ Result:
 - Refreshed selected downstream defaults: `global_offsets`, `normal_iqr`, `bucket_reliability_s1_00`.
 - Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.244989/0.608950`, degree NLL/RPS `2.000670/0.009480`.
 - Calibration robustness update 2026-04-30: added candidate comparison for `global_offsets`, `conformal_intervals`, `no_offsets`, `global_offsets_no_upper_tail`, `global_offsets_shrunk_50pct`, and conditional source-disagreement methods. Promotion now rejects candidates that reduce observed-bin probability by more than `0.02` in `tight_consensus` or `moderate_disagreement`; selected quantile calibration changed to `global_offsets_no_upper_tail`. Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.241810/0.606852`, degree NLL/RPS `2.000715/0.009475`.
-- Refreshed holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.345150/0.612207`, degree NLL/RPS `2.099877/0.010060`, q50 MAE/RMSE `1.261223/1.639528`.
+- Refreshed production-calibrated holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.133178/0.603449`, degree NLL/RPS `1.861432/0.009238`, raw q50 MAE/RMSE `1.261223/1.639528`, scored q50 MAE/RMSE `1.265688/1.642842`.
 - Local inference smoke for `2025-12-31` produced an inference row with all four nearby stations available, `nearby_feature_count=106`, `feature_count=467`, and a valid prediction JSON.
 - Unit suite passed with `27` tests.
 
@@ -220,9 +220,9 @@ Review fixes 2026-04-30:
 - Fixed `source_trust.py` so non-nearby profiles exclude all nearby-derived columns, including `klga_minus_nearby_*` and `*_vs_nearby_*`.
 - Fixed `build_inference_features.py` so a selected nearby feature profile requires at least one available nearby station and generated nearby columns; it no longer silently predicts with all nearby features missing.
 - Reran rolling-origin model selection after the feature-filter fix. The selected candidate remained `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
-- Reran calibration, distribution diagnostics, ladder calibration, final training, and holdout evaluation. Final holdout remained event-bin NLL/Brier `1.345150/0.612207` and q50 MAE `1.261223`.
+- Reran calibration, distribution diagnostics, ladder calibration, final training, and holdout evaluation. After fixing the evaluator to score the production calibrated stack, final holdout event-bin NLL/Brier is `1.133178/0.603449`; raw q50 MAE remains `1.261223`.
 - Verification: py_compile passed; `.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py` passed with `28` tests; all-nearby inference smoke passed; no-nearby inference smoke failed explicitly as intended.
-- Deploy status: commit `dbaff9a` was pushed to GitHub `origin/main`. The DigitalOcean server `/root/modelexp` still needs `git pull` plus ignored runtime artifact sync before server dual inference is current.
+- Deploy status: code was pushed to GitHub `origin/main` and synced to the DigitalOcean server with ignored runtime artifacts. Later code commits or runtime artifact rebuilds still need explicit server sync before server dual inference is current.
 
 ### 1. Stage HRRR Overnight Summary Data
 

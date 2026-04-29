@@ -40,20 +40,21 @@ Nearby-station upgrade status:
 - Implemented and validated 2026-04-30.
 - Added cutoff-safe Wunderground observation features for `KJRB`, `KJFK`, `KEWR`, and `KTEB`. Nearby observations are only used if they are available by `00:05 America/New_York` and within the configured stale-observation guard.
 - Online inference fetches/builds those nearby Wunderground station rows by default and removes their downloaded/intermediate artifacts after a successful prediction unless `--keep-artifacts` is set.
-- Review fixes pushed 2026-04-30 as commit `dbaff9a`: server dual inference now uses the with-HRRR online wrapper so nearby station features are fetched, non-nearby feature profiles exclude all nearby-derived columns, and nearby-selected inference fails instead of silently predicting with all nearby features missing.
-- Server deployment status 2026-04-30: commit `dbaff9a` is on GitHub `origin/main`, but `/root/modelexp` still needs `git pull` and ignored runtime artifact sync before server dual inference can be treated as current.
+- Review fixes pushed 2026-04-30: server dual inference now uses the with-HRRR online wrapper so nearby station features are fetched, non-nearby feature profiles exclude all nearby-derived columns, nearby-selected inference fails instead of silently predicting with all nearby features missing, guarded calibration selection is the current production default, and holdout evaluation scores the production calibrated stack.
+- Server deployment status 2026-04-30: `/root/modelexp` has been synced with the latest pushed with-HRRR inference/evaluation fixes plus ignored with-HRRR runtime model/evaluation artifacts. Any later model artifact rebuild or code commit still needs an explicit server sync because Git does not track runtime artifacts.
 - Full rolling-origin validation evaluated `47` candidate specs including nearby feature profiles and focused nearby LightGBM candidates. It selected `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
 - Dynamic 4-way, median, trimmed, ridge, meta residual, non-nearby source-trust, and disagreement-widening variants remain evaluated fallbacks but are not the current production default.
 
 ## Current Metrics
 
-Single holdout, `2025-05-27..2025-12-31`, `219` rows:
+Production-calibrated single holdout, `2025-05-27..2025-12-31`, `219` rows:
 
 | Metric | Value |
 | --- | ---: |
-| q50 MAE/RMSE | `1.2612 / 1.6395` |
-| degree NLL/Brier/RPS | `2.099877 / 0.819929 / 0.010060` |
-| event-bin NLL/Brier | `1.345150 / 0.612207` |
+| raw q50 MAE/RMSE | `1.2612 / 1.6395` |
+| scored q50 MAE/RMSE | `1.2657 / 1.6428` |
+| degree NLL/Brier/RPS | `1.861432 / 0.811339 / 0.009238` |
+| event-bin NLL/Brier | `1.133178 / 0.603449` |
 
 Rolling 2025 calibration test, `365` rows:
 
@@ -89,7 +90,7 @@ Production-style one-date inference should use the server dual runner from the l
 .venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD
 ```
 
-The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs both Git commit `dbaff9a` or newer and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts. As of 2026-04-30, the server has been pulled/synced through commit `dbe7eaf`.
+The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs the latest pushed with-HRRR inference/evaluation fixes and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts. As of 2026-04-30, the server has been pulled/synced with both code and runtime artifacts.
 
 The server runner overlaps no-HRRR source work, HRRR source work, and nearby Wunderground station prefetch. Its default server tuning uses per-lead NBM parallelism for one-date latency (`batch-reduce-mode=off`, `lead-workers=8`, `download-workers=6`, `reduce-workers=4`, `extract-workers=4`, `wgrib2-threads=1`) while keeping HRRR in optimized batch mode. On the server, a `2026-04-28` NBM benchmark took `27.91s` in per-lead mode versus `53.16s` in batch-cycle mode with material output parity. Override with environment variables such as `MODELEXP_NBM_BATCH_REDUCE_MODE`, `MODELEXP_NBM_LEAD_WORKERS`, `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, and `MODELEXP_HRRR_MAX_WORKERS` when benchmarking.
 

@@ -9,7 +9,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from .distribution import quantiles_to_degree_ladder
+from .distribution import degree_ladder_from_quantiles
 from .event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from .source_disagreement import DISAGREEMENT_WIDENING_REGIMES, add_source_disagreement_features
 from .source_trust import apply_anchor_and_residual
@@ -19,6 +19,11 @@ from .train_quantile_models import DEFAULT_QUANTILES, pinball_loss
 DEFAULT_FEATURES_PATH = pathlib.Path("experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.parquet")
 DEFAULT_MODELS_DIR = pathlib.Path("experiments/withhrrr/data/runtime/models")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/evaluation")
+DEFAULT_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json")
+DEFAULT_DISTRIBUTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json")
+DEFAULT_LADDER_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/ladder_calibration/ladder_calibration_manifest.json")
+FALLBACK_DISTRIBUTION_METHOD_ID = "interpolation_tail"
+DISTRIBUTION_METHOD_IDS = ["auto", "interpolation_tail", "interpolation_no_tail", "smoothed_interpolation_tail", "normal_iqr"]
 EPSILON = 1e-12
 DEFAULT_REPRESENTATIVE_EVENT_BINS: tuple[str, ...] = (
     "35F or below",
@@ -61,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models-dir", type=pathlib.Path, default=DEFAULT_MODELS_DIR)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--representative-event-bins-path", type=pathlib.Path, default=None)
+    parser.add_argument("--calibration-path", type=pathlib.Path, default=None, help="Optional selected quantile calibration manifest.")
+    parser.add_argument("--no-calibration", action="store_true", help="Evaluate raw model quantiles without selected quantile calibration.")
+    parser.add_argument("--distribution-method", choices=DISTRIBUTION_METHOD_IDS, default="auto")
+    parser.add_argument("--distribution-manifest-path", type=pathlib.Path, default=None)
+    parser.add_argument("--ladder-calibration-path", type=pathlib.Path, default=None)
+    parser.add_argument("--no-ladder-calibration", action="store_true", help="Evaluate without selected ladder reliability calibration.")
     return parser.parse_args()
 
 
@@ -197,12 +208,31 @@ def ordered_ladder_bounds(prediction_df: pd.DataFrame) -> tuple[int, int]:
     return int(np.floor(np.nanmin(combined) - 8.0)), int(np.ceil(np.nanmax(combined) + 8.0))
 
 
-def ladder_for_prediction(row: pd.Series, *, min_temp_f: int, max_temp_f: int) -> pd.DataFrame:
-    return quantiles_to_degree_ladder(
+def ladder_for_prediction(
+    row: pd.Series,
+    *,
+    min_temp_f: int,
+    max_temp_f: int,
+    distribution_method: str = FALLBACK_DISTRIBUTION_METHOD_ID,
+    ladder_calibration_path: pathlib.Path | None = None,
+) -> pd.DataFrame:
+    ladder = degree_ladder_from_quantiles(
         prediction_quantiles(row),
+        method_id=distribution_method,
         min_temp_f=min_temp_f,
         max_temp_f=max_temp_f,
     )
+    if ladder_calibration_path is None:
+        return ladder
+    from .predict import apply_ladder_calibration
+
+    regime = str(row.get("source_disagreement_regime", "unknown") or "unknown")
+    calibrated, _metadata = apply_ladder_calibration(
+        ladder,
+        ladder_calibration_path,
+        source_disagreement_regime=regime,
+    )
+    return calibrated
 
 
 def ranked_probability_score(ladder: pd.DataFrame, observed_temp_f: int) -> float:
@@ -227,13 +257,24 @@ def row_numeric(row: pd.Series, column: str) -> float:
     return float(value) if pd.notna(value) else float("nan")
 
 
-def build_degree_ladder_diagnostics(prediction_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+def build_degree_ladder_diagnostics(
+    prediction_df: pd.DataFrame,
+    *,
+    distribution_method: str = FALLBACK_DISTRIBUTION_METHOD_ID,
+    ladder_calibration_path: pathlib.Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     min_temp_f, max_temp_f = ordered_ladder_bounds(prediction_df)
     rows: list[dict[str, object]] = []
     reliability_rows: list[dict[str, object]] = []
     per_degree_rows: list[dict[str, object]] = []
     for _, row in prediction_df.iterrows():
-        ladder = ladder_for_prediction(row, min_temp_f=min_temp_f, max_temp_f=max_temp_f)
+        ladder = ladder_for_prediction(
+            row,
+            min_temp_f=min_temp_f,
+            max_temp_f=max_temp_f,
+            distribution_method=distribution_method,
+            ladder_calibration_path=ladder_calibration_path,
+        )
         observed_temp = int(round(float(row["final_tmax_f"])))
         probabilities = pd.to_numeric(ladder["probability"], errors="coerce").fillna(0.0)
         degrees = pd.to_numeric(ladder["temp_f"]).astype(int)
@@ -403,13 +444,25 @@ def observed_event_bin_name(observed_temp_f: int, bins: list[EventBin]) -> str:
     return matches[0]
 
 
-def build_event_bin_diagnostics(prediction_df: pd.DataFrame, *, bins: list[EventBin] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
+def build_event_bin_diagnostics(
+    prediction_df: pd.DataFrame,
+    *,
+    bins: list[EventBin] | None = None,
+    distribution_method: str = FALLBACK_DISTRIBUTION_METHOD_ID,
+    ladder_calibration_path: pathlib.Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     min_temp_f, max_temp_f = ordered_ladder_bounds(prediction_df)
     bins = bins if bins is not None else representative_event_bins()
     score_rows: list[dict[str, object]] = []
     probability_rows: list[dict[str, object]] = []
     for _, row in prediction_df.iterrows():
-        ladder = ladder_for_prediction(row, min_temp_f=min_temp_f, max_temp_f=max_temp_f)
+        ladder = ladder_for_prediction(
+            row,
+            min_temp_f=min_temp_f,
+            max_temp_f=max_temp_f,
+            distribution_method=distribution_method,
+            ladder_calibration_path=ladder_calibration_path,
+        )
         mapped = map_ladder_to_bins(ladder, bins)
         observed_temp = int(round(float(row["final_tmax_f"])))
         observed_bin = observed_event_bin_name(observed_temp, bins)
@@ -476,6 +529,66 @@ def build_event_bin_diagnostics(prediction_df: pd.DataFrame, *, bins: list[Event
         "mean_observed_bin_probability": float(scores["observed_bin_probability"].mean()),
     }
     return scores, bin_metrics, reliability, metrics
+
+
+def resolve_calibration(args: argparse.Namespace) -> tuple[str, pathlib.Path | None, dict[str, object]]:
+    if args.no_calibration:
+        return "none", None, {}
+    calibration_path = args.calibration_path
+    if calibration_path is None and DEFAULT_CALIBRATION_PATH.exists():
+        calibration_path = DEFAULT_CALIBRATION_PATH
+    if calibration_path is None:
+        return "none", None, {}
+    from .predict import selected_calibration_config
+
+    payload = load_json(calibration_path)
+    method_id, config = selected_calibration_config(payload)
+    return method_id, calibration_path, config
+
+
+def apply_selected_quantile_calibration(
+    prediction_df: pd.DataFrame,
+    *,
+    method_id: str,
+    config: dict[str, object],
+) -> pd.DataFrame:
+    if method_id in {"none", "uncalibrated"}:
+        return prediction_df.copy()
+    from .calibrate_rolling_origin import apply_method_config
+
+    calibrated = apply_method_config(prediction_df, method_id, config)
+    out = prediction_df.copy()
+    for quantile in DEFAULT_QUANTILES:
+        tag = quantile_tag(quantile)
+        out[f"calibrated_pred_tmax_{tag}_f"] = calibrated[f"calibrated_pred_tmax_{tag}_f"]
+        out[f"pred_tmax_{tag}_f"] = calibrated[f"calibrated_pred_tmax_{tag}_f"]
+    return out
+
+
+def resolve_distribution(args: argparse.Namespace) -> tuple[str, pathlib.Path | None]:
+    if args.distribution_method != "auto":
+        return str(args.distribution_method), None
+    manifest_path = args.distribution_manifest_path
+    if manifest_path is None and DEFAULT_DISTRIBUTION_MANIFEST_PATH.exists():
+        manifest_path = DEFAULT_DISTRIBUTION_MANIFEST_PATH
+    if manifest_path is None:
+        return FALLBACK_DISTRIBUTION_METHOD_ID, None
+    payload = load_json(manifest_path)
+    method_id = payload.get("selected_distribution_method_id")
+    if not isinstance(method_id, str):
+        raise ValueError(f"distribution manifest does not contain selected_distribution_method_id: {manifest_path}")
+    if method_id not in DISTRIBUTION_METHOD_IDS or method_id == "auto":
+        raise ValueError(f"unsupported selected distribution method {method_id!r} in {manifest_path}")
+    return method_id, manifest_path
+
+
+def resolve_ladder_calibration(args: argparse.Namespace) -> pathlib.Path | None:
+    if args.no_ladder_calibration:
+        return None
+    ladder_path = args.ladder_calibration_path
+    if ladder_path is None and DEFAULT_LADDER_CALIBRATION_PATH.exists():
+        ladder_path = DEFAULT_LADDER_CALIBRATION_PATH
+    return ladder_path
 
 
 def main() -> int:
@@ -695,13 +808,28 @@ def main() -> int:
             if not subset.empty:
                 rows.append({"direction_slice": name, "row_count": int(len(subset)), **summarize_point_metrics(subset, "pred_tmax_q50_f")})
 
-    degree_scores, modal_reliability, degree_reliability, pit_diagnostics, degree_metrics = build_degree_ladder_diagnostics(prediction_df)
+    calibration_method_id, calibration_path, calibration_config = resolve_calibration(args)
+    scoring_prediction_df = apply_selected_quantile_calibration(
+        prediction_df,
+        method_id=calibration_method_id,
+        config=calibration_config,
+    )
+    distribution_method, distribution_manifest_path = resolve_distribution(args)
+    ladder_calibration_path = resolve_ladder_calibration(args)
+
+    degree_scores, modal_reliability, degree_reliability, pit_diagnostics, degree_metrics = build_degree_ladder_diagnostics(
+        scoring_prediction_df,
+        distribution_method=distribution_method,
+        ladder_calibration_path=ladder_calibration_path,
+    )
     representative_bin_labels = load_event_bin_labels(args.representative_event_bins_path) if args.representative_event_bins_path is not None else list(DEFAULT_REPRESENTATIVE_EVENT_BINS)
     event_scores, event_bin_metrics, event_reliability, event_metrics = build_event_bin_diagnostics(
-        prediction_df,
+        scoring_prediction_df,
         bins=representative_event_bins(representative_bin_labels),
+        distribution_method=distribution_method,
+        ladder_calibration_path=ladder_calibration_path,
     )
-    score_regimes = prediction_df[["target_date_local", "station_id", "source_disagreement_regime"]].copy()
+    score_regimes = scoring_prediction_df[["target_date_local", "station_id", "source_disagreement_regime"]].copy()
     degree_with_regime = degree_scores.merge(score_regimes, on=["target_date_local", "station_id"], how="left")
     event_with_regime = event_scores.merge(score_regimes, on=["target_date_local", "station_id"], how="left")
     source_regime_rows = []
@@ -717,7 +845,7 @@ def main() -> int:
             continue
         keys = degree_subset[["target_date_local", "station_id"]].drop_duplicates()
         event_subset = event_with_regime.merge(keys, on=["target_date_local", "station_id"], how="inner")
-        pred_subset = prediction_df.merge(keys, on=["target_date_local", "station_id"], how="inner")
+        pred_subset = scoring_prediction_df.merge(keys, on=["target_date_local", "station_id"], how="inner")
         source_regime_rows.append(
             {
                 "slice": slice_name,
@@ -742,11 +870,18 @@ def main() -> int:
         "residual_q50_rmse_f": rmse(prediction_df["target_residual_f"], prediction_df["pred_residual_q50_f"]),
         "final_tmax_q50_mae_f": mae(prediction_df["final_tmax_f"], prediction_df["pred_tmax_q50_f"]),
         "final_tmax_q50_rmse_f": rmse(prediction_df["final_tmax_f"], prediction_df["pred_tmax_q50_f"]),
+        "scored_final_tmax_q50_mae_f": mae(scoring_prediction_df["final_tmax_f"], scoring_prediction_df["pred_tmax_q50_f"]),
+        "scored_final_tmax_q50_rmse_f": rmse(scoring_prediction_df["final_tmax_f"], scoring_prediction_df["pred_tmax_q50_f"]),
         "degree_ladder_mean_negative_log_likelihood": degree_metrics["mean_negative_log_likelihood"],
         "degree_ladder_mean_brier_score": degree_metrics["mean_brier_score"],
         "degree_ladder_mean_ranked_probability_score": degree_metrics["mean_ranked_probability_score"],
         "event_bin_mean_negative_log_likelihood": event_metrics["mean_negative_log_likelihood"],
         "event_bin_mean_brier_score": event_metrics["mean_brier_score"],
+        "calibration_method_id": calibration_method_id,
+        "calibration_path": str(calibration_path) if calibration_path is not None else None,
+        "distribution_method": distribution_method,
+        "distribution_manifest_path": str(distribution_manifest_path) if distribution_manifest_path is not None else None,
+        "ladder_calibration_path": str(ladder_calibration_path) if ladder_calibration_path is not None else None,
     }
 
     write_json(args.output_dir / "metrics_overall.json", metrics_overall)
@@ -770,7 +905,8 @@ def main() -> int:
     event_reliability.to_csv(args.output_dir / "event_bin_reliability.csv", index=False)
     write_json(args.output_dir / "degree_ladder_metrics.json", degree_metrics)
     write_json(args.output_dir / "event_bin_metrics.json", event_metrics)
-    prediction_df.to_parquet(args.output_dir / "validation_predictions.parquet", index=False)
+    prediction_df.to_parquet(args.output_dir / "validation_predictions_raw.parquet", index=False)
+    scoring_prediction_df.to_parquet(args.output_dir / "validation_predictions.parquet", index=False)
     evaluation_manifest = {
         "status": "ok",
         "built_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -781,6 +917,11 @@ def main() -> int:
         "representative_event_bin_labels": representative_bin_labels,
         "linear_blend_coefficients": [float(value) for value in linear_coef],
         "linear_three_way_blend_coefficients": [float(value) for value in linear_three_way_coef],
+        "calibration_method_id": calibration_method_id,
+        "calibration_path": str(calibration_path) if calibration_path is not None else None,
+        "distribution_method": distribution_method,
+        "distribution_manifest_path": str(distribution_manifest_path) if distribution_manifest_path is not None else None,
+        "ladder_calibration_path": str(ladder_calibration_path) if ladder_calibration_path is not None else None,
         "outputs": [
             "metrics_overall.json",
             "baseline_comparison.csv",
@@ -803,6 +944,7 @@ def main() -> int:
             "event_bin_metrics.csv",
             "event_bin_metrics.json",
             "event_bin_reliability.csv",
+            "validation_predictions_raw.parquet",
             "validation_predictions.parquet",
         ],
     }

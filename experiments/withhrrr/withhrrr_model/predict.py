@@ -198,6 +198,48 @@ def calibration_offsets(payload: dict[str, object], row: pd.DataFrame | None = N
     return {}
 
 
+def calibration_metadata(payload: dict[str, object], row: pd.DataFrame | None = None) -> dict[str, object]:
+    selected_method_id = str(payload.get("selected_method_id") or payload.get("method") or "none")
+    offsets = calibration_offsets(payload, row=row)
+    metadata: dict[str, object] = {
+        "method_id": selected_method_id,
+        "offsets_f": offsets,
+    }
+    methods = payload.get("methods")
+    if not isinstance(methods, dict):
+        return metadata
+    selected = methods.get(selected_method_id)
+    if not isinstance(selected, dict):
+        return metadata
+    config = selected.get("config")
+    if not isinstance(config, dict):
+        return metadata
+    if selected_method_id.startswith("conditional_"):
+        consensus_regimes = {str(value) for value in config.get("consensus_regimes", [])}
+        row_regime = _calibration_segment(row, str(config.get("segment_name", "source_disagreement_regime")))
+        branch = "consensus" if row_regime in consensus_regimes else "default"
+        branch_method_id = str(config.get("consensus_method_id" if branch == "consensus" else "default_method_id", "none"))
+        branch_config = config.get("method_configs", {}).get(branch_method_id) if isinstance(config.get("method_configs"), dict) else None
+        branch_payload = {"selected_method_id": branch_method_id, "methods": {branch_method_id: {"config": branch_config}}}
+        metadata.update(
+            {
+                "segment_name": config.get("segment_name"),
+                "segment_value": row_regime,
+                "branch": branch,
+                "branch_method_id": branch_method_id,
+                "branch_offsets_f": calibration_offsets(branch_payload, row=row) if isinstance(branch_config, dict) else {},
+            }
+        )
+    elif "segment_name" in config:
+        metadata.update(
+            {
+                "segment_name": config.get("segment_name"),
+                "segment_value": _calibration_segment(row, str(config.get("segment_name"))),
+            }
+        )
+    return metadata
+
+
 def selected_calibration_config(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
     selected_method_id = str(payload.get("selected_method_id") or payload.get("method") or "none")
     if selected_method_id in {"none", "uncalibrated"}:
@@ -359,11 +401,13 @@ def main() -> int:
     elif calibration_path is None and DEFAULT_CALIBRATION_PATH.exists():
         calibration_path = DEFAULT_CALIBRATION_PATH
     offsets: dict[str, float] = {}
+    calibration_details: dict[str, object] = {"method_id": "none", "offsets_f": {}}
     calibration_method_id = "none"
     calibration_config: dict[str, object] = {}
     if calibration_path is not None:
         calibration_payload = load_json(calibration_path)
         offsets = calibration_offsets(calibration_payload, row=row)
+        calibration_details = calibration_metadata(calibration_payload, row=row)
         calibration_method_id, calibration_config = selected_calibration_config(calibration_payload)
     distribution_method, distribution_manifest_path = selected_distribution_method(
         args.distribution_method,
@@ -456,6 +500,7 @@ def main() -> int:
         "calibration_enabled": calibration_path is not None,
         "calibration_method_id": calibration_method_id if calibration_path is not None else "none",
         "calibration_offsets_f": offsets,
+        "calibration": calibration_details if calibration_path is not None else {"method_id": "none", "offsets_f": {}},
         "distribution_method": distribution_method,
         "distribution_manifest_path": str(distribution_manifest_path) if distribution_manifest_path is not None else None,
         "ladder_calibration": ladder_calibration,
