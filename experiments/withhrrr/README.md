@@ -90,7 +90,7 @@ Production-style one-date inference should use the server dual runner from the l
 
 The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs both Git commit `dbaff9a` or newer and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts. As of 2026-04-30, the server has been pulled/synced through commit `dbe7eaf`.
 
-The server runner overlaps no-HRRR source work, HRRR source work, and nearby Wunderground station prefetch. Its default server tuning uses extra download parallelism while keeping `wgrib2` threads at `1`; override with environment variables such as `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, and `MODELEXP_HRRR_MAX_WORKERS` when benchmarking.
+The server runner overlaps no-HRRR source work, HRRR source work, and nearby Wunderground station prefetch. Its default server tuning uses per-lead NBM parallelism for one-date latency (`batch-reduce-mode=off`, `lead-workers=8`, `download-workers=6`, `reduce-workers=4`, `extract-workers=4`, `wgrib2-threads=1`) while keeping HRRR in optimized batch mode. On the server, a `2026-04-28` NBM benchmark took `27.91s` in per-lead mode versus `53.16s` in batch-cycle mode with material output parity. Override with environment variables such as `MODELEXP_NBM_BATCH_REDUCE_MODE`, `MODELEXP_NBM_LEAD_WORKERS`, `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, and `MODELEXP_HRRR_MAX_WORKERS` when benchmarking.
 
 Prepare the model table:
 

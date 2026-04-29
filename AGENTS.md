@@ -253,7 +253,8 @@ Online inference worker defaults:
 - no-HRRR online inference NBM uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
 - with-HRRR online inference NBM uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
 - with-HRRR online inference HRRR uses `--download-workers 4 --reduce-workers 2 --extract-workers 2 --wgrib2-threads 1`
-- `tools/weather/run_server_dual_inference.py` overrides the server run to use more download parallelism by default: no-HRRR NBM `download-workers=6`, HRRR `max-workers=6 download-workers=6`, with reduce/extract still `2/2` and `wgrib2-threads=1`; tune with `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, `MODELEXP_HRRR_MAX_WORKERS`, and model-specific env vars when benchmarking
+- `tools/weather/run_server_dual_inference.py` overrides the server run for one-date latency: no-HRRR NBM uses per-lead parallel mode by default (`batch-reduce-mode=off`, `lead-workers=8`, `download-workers=6`, `reduce-workers=4`, `extract-workers=4`, `wgrib2-threads=1`) because server benchmarking on `2026-04-28` showed `27.91s` versus `53.16s` for batch-cycle with material output parity; HRRR uses `max-workers=6 download-workers=6 reduce-workers=2 extract-workers=2 wgrib2-threads=1`
+- tune server one-date inference with `MODELEXP_NBM_BATCH_REDUCE_MODE`, `MODELEXP_NBM_LEAD_WORKERS`, `MODELEXP_NBM_DOWNLOAD_WORKERS`, `MODELEXP_NBM_REDUCE_WORKERS`, `MODELEXP_NBM_EXTRACT_WORKERS`, `MODELEXP_HRRR_DOWNLOAD_WORKERS`, and `MODELEXP_HRRR_MAX_WORKERS` when benchmarking
 - keep `wgrib2-threads=1` unless benchmarking proves otherwise; process-level parallelism has been more useful than multi-threading individual `wgrib2` calls
 
 Online inference artifact policy:

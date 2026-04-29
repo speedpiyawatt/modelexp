@@ -53,8 +53,10 @@ def remote_script(*, target_date: dt.date, remote_repo: str, output_root: str) -
     no_hrrr_prediction = prediction_path(run_root, "no_hrrr", target_date)
     with_hrrr_prediction = prediction_path(run_root, "with_hrrr", target_date)
     no_hrrr_nbm_download_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_DOWNLOAD_WORKERS", os.environ.get("MODELEXP_NBM_DOWNLOAD_WORKERS", "6"))
-    no_hrrr_nbm_reduce_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_REDUCE_WORKERS", os.environ.get("MODELEXP_NBM_REDUCE_WORKERS", "2"))
-    no_hrrr_nbm_extract_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_EXTRACT_WORKERS", os.environ.get("MODELEXP_NBM_EXTRACT_WORKERS", "2"))
+    no_hrrr_nbm_reduce_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_REDUCE_WORKERS", os.environ.get("MODELEXP_NBM_REDUCE_WORKERS", "4"))
+    no_hrrr_nbm_extract_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_EXTRACT_WORKERS", os.environ.get("MODELEXP_NBM_EXTRACT_WORKERS", "4"))
+    no_hrrr_nbm_lead_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_LEAD_WORKERS", os.environ.get("MODELEXP_NBM_LEAD_WORKERS", "8"))
+    no_hrrr_nbm_batch_reduce_mode = os.environ.get("MODELEXP_NO_HRRR_NBM_BATCH_REDUCE_MODE", os.environ.get("MODELEXP_NBM_BATCH_REDUCE_MODE", "off"))
     hrrr_max_workers = os.environ.get("MODELEXP_HRRR_MAX_WORKERS", "6")
     hrrr_download_workers = os.environ.get("MODELEXP_HRRR_DOWNLOAD_WORKERS", "6")
     hrrr_reduce_workers = os.environ.get("MODELEXP_HRRR_REDUCE_WORKERS", "2")
@@ -112,6 +114,8 @@ done
     --runtime-root "$NO_HRRR_RUNTIME" \\
     --prediction-output-dir "$NO_HRRR_PRED_DIR" \\
     --polymarket-event-slug \\
+    --nbm-batch-reduce-mode {shlex.quote(no_hrrr_nbm_batch_reduce_mode)} \\
+    --nbm-lead-workers {shlex.quote(no_hrrr_nbm_lead_workers)} \\
     --nbm-download-workers {shlex.quote(no_hrrr_nbm_download_workers)} \\
     --nbm-reduce-workers {shlex.quote(no_hrrr_nbm_reduce_workers)} \\
     --nbm-extract-workers {shlex.quote(no_hrrr_nbm_extract_workers)} \\
