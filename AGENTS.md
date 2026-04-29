@@ -215,7 +215,7 @@ For download-heavy or long-running network steps:
 ```
 
 - the server runner assumes SSH access to `root@198.199.64.163` and repo path `/root/modelexp`; override with `MODELEXP_SERVER`, `MODELEXP_REMOTE_REPO`, or `MODELEXP_REMOTE_OUTPUT_ROOT` only when needed
-- as of 2026-04-29, `/root/modelexp` is expected to include commit `20330a1` or newer plus synced ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/`; a plain Git pull is not enough to refresh those ignored artifacts
+- as of 2026-04-30, GitHub `origin/main` includes commit `dbaff9a` with the nearby/source-trust implementation and server-dual inference fix; `/root/modelexp` on `root@198.199.64.163` still needs `git pull` plus synced ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/` before the server can be treated as current
 - the server runner runs no-HRRR and HRRR source work in parallel, reuses the no-HRRR KLGA Wunderground/LAMP/NBM artifacts to build the with-HRRR prediction, fetches nearby Wunderground station context for the with-HRRR source-trust features, then returns a local text comparison
 - server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, and logs
 - the server runner deletes downloaded/intermediate source artifacts after producing the predictions

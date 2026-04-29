@@ -213,6 +213,16 @@ Result:
 - Local inference smoke for `2025-12-31` produced an inference row with all four nearby stations available, `nearby_feature_count=106`, `feature_count=467`, and a valid prediction JSON.
 - Unit suite passed with `27` tests.
 
+Review fixes 2026-04-30:
+
+- Fixed `tools/weather/run_server_dual_inference.py` so the remote with-HRRR side calls `experiments.withhrrr.withhrrr_model.run_online_inference` with reused KLGA WU/LAMP/NBM/HRRR artifacts. This lets the wrapper fetch/build nearby Wunderground station features instead of calling `build_inference_features.py` without nearby inputs.
+- Fixed `source_trust.py` so non-nearby profiles exclude all nearby-derived columns, including `klga_minus_nearby_*` and `*_vs_nearby_*`.
+- Fixed `build_inference_features.py` so a selected nearby feature profile requires at least one available nearby station and generated nearby columns; it no longer silently predicts with all nearby features missing.
+- Reran rolling-origin model selection after the feature-filter fix. The selected candidate remained `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
+- Reran calibration, distribution diagnostics, ladder calibration, final training, and holdout evaluation. Final holdout remained event-bin NLL/Brier `1.345150/0.612207` and q50 MAE `1.261223`.
+- Verification: py_compile passed; `.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py` passed with `28` tests; all-nearby inference smoke passed; no-nearby inference smoke failed explicitly as intended.
+- Deploy status: commit `dbaff9a` was pushed to GitHub `origin/main`. The DigitalOcean server `/root/modelexp` still needs `git pull` plus ignored runtime artifact sync before server dual inference is current.
+
 ### 1. Stage HRRR Overnight Summary Data
 
 Status: done

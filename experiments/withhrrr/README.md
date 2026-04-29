@@ -33,13 +33,15 @@ Source-trust upgrade status:
 - Implemented and validated 2026-04-29.
 - Rolling model selection can now evaluate dynamic anchors (`equal_3way`, 4-way native/NBM/LAMP/HRRR, median 4-way, trimmed-mean 4-way, fold-local ridge 4-way), source-trust feature profiles, weighted disagreement specialists, and an optional meta residual correction.
 - Full rolling-origin validation selected the high-disagreement-weighted profile on the existing equal-3way anchor. Dynamic 4-way, median, trimmed, ridge, and meta residual variants were evaluated but not promoted.
-- Deployed 2026-04-29: code was pushed in commit `20330a1` and pulled on `/root/modelexp` at `root@198.199.64.163`. Ignored runtime artifacts for models, model selection, quantile calibration, distribution diagnostics, and ladder calibration were synced separately because `experiments/withhrrr/data/runtime/` is gitignored.
+- Prior deployment 2026-04-29: code was pushed in commit `20330a1` and pulled on `/root/modelexp` at `root@198.199.64.163` with ignored runtime artifacts synced separately.
 
 Nearby-station upgrade status:
 
 - Implemented and validated 2026-04-30.
 - Added cutoff-safe Wunderground observation features for `KJRB`, `KJFK`, `KEWR`, and `KTEB`. Nearby observations are only used if they are available by `00:05 America/New_York` and within the configured stale-observation guard.
 - Online inference fetches/builds those nearby Wunderground station rows by default and removes their downloaded/intermediate artifacts after a successful prediction unless `--keep-artifacts` is set.
+- Review fixes pushed 2026-04-30 as commit `dbaff9a`: server dual inference now uses the with-HRRR online wrapper so nearby station features are fetched, non-nearby feature profiles exclude all nearby-derived columns, and nearby-selected inference fails instead of silently predicting with all nearby features missing.
+- Server deployment status 2026-04-30: commit `dbaff9a` is on GitHub `origin/main`, but `/root/modelexp` still needs `git pull` and ignored runtime artifact sync before server dual inference can be treated as current.
 - Full rolling-origin validation evaluated `47` candidate specs including nearby feature profiles and focused nearby LightGBM candidates. It selected `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
 - Dynamic 4-way, median, trimmed, ridge, meta residual, non-nearby source-trust, and disagreement-widening variants remain evaluated fallbacks but are not the current production default.
 
@@ -86,7 +88,7 @@ Production-style one-date inference should use the server dual runner from the l
 .venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD
 ```
 
-The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the Source-Trust model, the server needs both the Git code and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`.
+The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs both Git commit `dbaff9a` or newer and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts.
 
 Prepare the model table:
 
