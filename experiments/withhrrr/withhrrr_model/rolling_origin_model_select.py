@@ -177,18 +177,30 @@ def evaluate_candidate_split(
     valid_y_final = pd.to_numeric(valid_df["final_tmax_f"], errors="coerce")
     anchor = pd.to_numeric(valid_df["anchor_tmax_f"], errors="coerce").to_numpy(float)
 
-    predictions = valid_df[
-        [
-            "target_date_local",
-            "station_id",
-            "final_tmax_f",
-            "target_residual_f",
-            "anchor_tmax_f",
-            "nbm_tmax_open_f",
-            "lamp_tmax_open_f",
-            "nbm_minus_lamp_tmax_f",
-        ]
-    ].copy()
+    prediction_columns = [
+        "target_date_local",
+        "station_id",
+        "final_tmax_f",
+        "target_residual_f",
+        "anchor_tmax_f",
+        "nbm_tmax_open_f",
+        "lamp_tmax_open_f",
+        "hrrr_tmax_open_f",
+        "anchor_equal_3way_tmax_f",
+        "nbm_minus_lamp_tmax_f",
+        "hrrr_minus_lamp_tmax_f",
+        "hrrr_minus_nbm_tmax_f",
+        "abs_hrrr_minus_lamp_tmax_f",
+        "abs_hrrr_minus_nbm_tmax_f",
+        "hrrr_above_nbm_lamp_range_f",
+        "hrrr_below_nbm_lamp_range_f",
+        "hrrr_outside_nbm_lamp_range_f",
+        "hrrr_hotter_than_lamp_3f",
+        "hrrr_colder_than_lamp_3f",
+        "hrrr_hotter_than_nbm_3f",
+        "hrrr_colder_than_nbm_3f",
+    ]
+    predictions = valid_df[[column for column in prediction_columns if column in valid_df.columns]].copy()
     predictions["candidate_id"] = str(candidate["candidate_id"])
     predictions["train_end"] = train_end
     predictions["valid_start"] = valid_start
@@ -236,6 +248,10 @@ def evaluate_candidate_split(
         "residual_q50_rmse_f": rmse(valid_y_residual, residual_predictions["q50"]),
         "fixed_anchor_mae_f": mae(valid_y_final, valid_df["anchor_tmax_f"]),
         "fixed_anchor_rmse_f": rmse(valid_y_final, valid_df["anchor_tmax_f"]),
+        "fixed_equal_3way_anchor_mae_f": mae(valid_y_final, valid_df["anchor_equal_3way_tmax_f"]),
+        "fixed_equal_3way_anchor_rmse_f": rmse(valid_y_final, valid_df["anchor_equal_3way_tmax_f"]),
+        "hrrr_only_mae_f": mae(valid_y_final, valid_df["hrrr_tmax_open_f"]),
+        "hrrr_only_rmse_f": rmse(valid_y_final, valid_df["hrrr_tmax_open_f"]),
         "q05_q95_coverage": float(np.mean((valid_y_final.to_numpy(float) >= q05) & (valid_y_final.to_numpy(float) <= q95))),
         "q05_q95_mean_width_f": float(np.mean(q95 - q05)),
         "degree_ladder_nll": degree_metrics["mean_negative_log_likelihood"],
@@ -274,6 +290,9 @@ def summarize_candidates(metrics_df: pd.DataFrame) -> pd.DataFrame:
         "event_bin_brier",
         "final_tmax_q50_mae_f",
         "final_tmax_q50_rmse_f",
+        "fixed_anchor_mae_f",
+        "fixed_equal_3way_anchor_mae_f",
+        "hrrr_only_mae_f",
         "q05_q95_coverage",
         *[f"{quantile_tag(quantile)}_pinball_loss" for quantile in DEFAULT_QUANTILES],
     ]

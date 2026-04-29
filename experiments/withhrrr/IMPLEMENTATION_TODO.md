@@ -44,7 +44,7 @@ Use `America/New_York` for the target local station day and the `00:05` local ov
 
 ## Target Layout
 
-Status: partially done
+Status: done
 
 Create this experiment-local layout as needed:
 
@@ -222,6 +222,13 @@ nbm_tmax_open_f
 lamp_tmax_open_f
 anchor_tmax_f
 nbm_minus_lamp_tmax_f
+hrrr_tmax_open_f
+hrrr_minus_lamp_tmax_f
+hrrr_minus_nbm_tmax_f
+abs_hrrr_minus_lamp_tmax_f
+abs_hrrr_minus_nbm_tmax_f
+anchor_equal_3way_tmax_f
+hrrr_outside_nbm_lamp_range_f
 target_residual_f
 model_training_eligible
 ```
@@ -249,6 +256,10 @@ experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_
 Done 2026-04-29: updated `prepare_training_features.py` so the default base input is `experiments/withhrrr/data/runtime/training/training_features_overnight_normalized.parquet`; it derives no-HRRR-style residual target columns from canonical normalized NBM/LAMP columns and only joins raw HRRR summaries when the base table does not already contain HRRR columns.
 
 Eval 2026-04-29: prepared model table has `1,096` rows, `324` columns, `1,094` eligible rows, `1,096` HRRR-available rows, and `105` HRRR columns. Output manifest: `experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.manifest.json`.
+
+Optimization 2026-04-29: added HRRR disagreement and direction features to `prepare_training_features.py`: `hrrr_tmax_open_f`, HRRR-vs-LAMP/NBM deltas, absolute deltas, equal 3-way anchor diagnostic, HRRR-outside-NBM/LAMP-range diagnostics, and 3F hotter/colder boolean flags.
+
+Eval 2026-04-29: rebuilt prepared model table. Output now has `1,096` rows, `337` columns, `1,094` eligible rows, and `304` selected model features after retraining.
 
 ### 5. Port Train/Evaluate/Prediction Modules
 
@@ -286,6 +297,8 @@ Eval 2026-04-29: canonical rerun selected `291` features, including `105` `hrrr_
 
 Note 2026-04-29: ported `evaluate.py`, `distribution.py`, `event_bins.py`, `calibrate_quantiles.py`, `calibrate_rolling_origin.py`, `rolling_origin_model_select.py`, and `predict.py` into `experiments/withhrrr/withhrrr_model/`. The rolling-origin selector was adjusted so HRRR feature prefixes are allowed.
 
+Optimization 2026-04-29: after rolling-origin selection with HRRR disagreement features, promoted the with-HRRR default candidate to `regularized_shallow_lgbm_300` in `model_config.py`. This is now intentionally different from the no-HRRR default.
+
 ### 6. Train First With-HRRR Quantile Model
 
 Status: done
@@ -319,6 +332,15 @@ experiments/withhrrr/data/runtime/models/
 
 Note 2026-04-29: ran `.venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models` against the canonical prepared table. Outputs written under `experiments/withhrrr/data/runtime/models/`. The selected feature set has `291` features, including `105` `hrrr_` features. Prefix counts: `hrrr_=105`, `lamp_=82`, `nbm_=59`, `wu_=23`, `meta_=21`. Single chronological validation starts `2025-05-27` with `219` rows. Validation pinball losses: q05 `0.173021`, q10 `0.290295`, q25 `0.503113`, q50 `0.636131`, q75 `0.497551`, q90 `0.279705`, q95 `0.170042`.
 
+Optimization 2026-04-29: retrained production artifacts with selected candidate `regularized_shallow_lgbm_300` after adding HRRR disagreement features. Command:
+
+```bash
+rm -rf experiments/withhrrr/data/runtime/models
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models
+```
+
+Eval 2026-04-29: selected feature count `304`; validation pinball losses q05 `0.172547`, q10 `0.294406`, q25 `0.493671`, q50 `0.620629`, q75 `0.502329`, q90 `0.284522`, q95 `0.165234`.
+
 ### 7. Evaluate Against No-HRRR
 
 Status: partially done
@@ -350,6 +372,17 @@ Progress 2026-04-29: reused `experiments.no_hrrr_model.no_hrrr_model.evaluate` w
 Eval 2026-04-29: with-HRRR validation metrics on `2025-05-27..2025-12-31`: degree-ladder NLL/Brier/RPS `2.147962/0.822671/0.010102`, event-bin NLL/Brier `1.344095/0.620545`, q50 MAE/RMSE `1.2723/1.6497`. No-HRRR reference on the same slice: degree-ladder NLL/Brier/RPS `2.141472/0.833441/0.010164`, event-bin NLL/Brier `1.320356/0.630038`, q50 MAE/RMSE `1.3063/1.6855`. HRRR improves Brier and q50 error in this uncalibrated holdout, but not NLL yet.
 
 Done 2026-04-29: verified the local with-HRRR evaluator with `.venv/bin/python -m experiments.withhrrr.withhrrr_model.evaluate --output-dir experiments/withhrrr/data/runtime/evaluation/full_holdout_local`.
+
+Optimization 2026-04-29: evaluator now reports HRRR anchor diagnostics and HRRR disagreement slices:
+
+```text
+metrics_by_hrrr_lamp_disagreement.csv
+metrics_by_hrrr_nbm_disagreement.csv
+metrics_by_hrrr_lamp_direction.csv
+metrics_by_hrrr_nbm_direction.csv
+```
+
+Eval 2026-04-29: after retraining the selected candidate with HRRR disagreement features, validation `2025-05-27..2025-12-31` produced q50 MAE/RMSE `1.2413/1.6092`, degree-ladder NLL/Brier/RPS `2.114456/0.824174/0.010029`, and event-bin NLL/Brier `1.321593/0.618214`. Baseline q50 MAE/RMSE on the same slice: NBM-only `1.5735/2.0401`, LAMP-only `1.3744/1.8245`, HRRR-only `1.9757/2.5496`, 50/50 anchor `1.3734/1.7833`, equal 3-way anchor `1.3726/1.7806`, linear NBM/LAMP/HRRR blend `1.3990/1.7922`.
 
 ### 8. Rolling-Origin Selection And Calibration
 
@@ -387,6 +420,29 @@ experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_mode
 
 Eval 2026-04-29: selected candidate is `very_regularized_min_leaf70_lgbm_350`; leakage check passed with `291` selected features and HRRR included. Weighted rolling metrics across `729` validation rows: event-bin NLL `1.508995`, degree-ladder NLL `2.362184`, q50 MAE/RMSE `1.4410/2.0163`.
 
+Optimization 2026-04-29: reran rolling-origin selection after adding HRRR disagreement features and promoting HRRR diagnostics. Command:
+
+```bash
+rm -rf experiments/withhrrr/data/runtime/evaluation/model_selection
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.rolling_origin_model_select
+```
+
+Eval 2026-04-29: selected/default candidate is now `regularized_shallow_lgbm_300`; feature count `304`. Outputs refreshed under `experiments/withhrrr/data/runtime/evaluation/model_selection/`.
+
+Optimization 2026-04-29: added HRRR-specific candidates to `model_config.py` and reran rolling-origin selection over `19` candidates. Added:
+
+```text
+hrrr_shallow_stronger_l2_lgbm_350
+hrrr_shallow_min_leaf45_lgbm_350
+hrrr_medium_min_leaf60_lgbm_300
+```
+
+Eval 2026-04-29: selected/default candidate remained `regularized_shallow_lgbm_300`; the HRRR-specific variants were evaluated but did not improve weighted event-bin NLL.
+
+Optimization 2026-04-29: added and ran `hrrr_ablation_diagnostics.py`.
+
+Eval 2026-04-29: rolling `729` validation rows. With HRRR features: event-bin NLL/Brier `1.515909/0.653115`, degree NLL/RPS `2.367784/0.011048`, q50 MAE/RMSE `1.4042/1.9819`. HRRR columns dropped: event-bin NLL/Brier `1.594013/0.666865`, degree NLL/RPS `2.469751/0.011270`, q50 MAE/RMSE `1.4261/2.0042`.
+
 Done 2026-04-29: ran rolling-origin calibration with `.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_rolling_origin`. Outputs:
 
 ```text
@@ -396,6 +452,38 @@ experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origi
 ```
 
 Eval 2026-04-29: selected method is `season_offsets`. On the 2025 test split, event-bin NLL/Brier improved from uncalibrated `1.412542/0.632488` to `1.291832/0.616072`; degree-ladder NLL/Brier/RPS improved from `2.284547/0.846069/0.010629` to `2.132255/0.829765/0.010389`.
+
+Optimization 2026-04-29: added HRRR-LAMP disagreement, HRRR-NBM disagreement, HRRR-LAMP direction, and HRRR-NBM direction offset candidates to `calibrate_rolling_origin.py`; updated `predict.py` so online inference can apply those segment names if selected. Reran calibration selection:
+
+```bash
+rm -rf experiments/withhrrr/data/runtime/evaluation/calibration_selection
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_rolling_origin
+```
+
+Eval 2026-04-29: selected method is `conformal_intervals`. On the 2025 test split, event-bin NLL/Brier improved from uncalibrated `1.370969/0.622307` to `1.274655/0.615411`; degree-ladder NLL/Brier/RPS improved from `2.233741/0.836850/0.010356` to `2.071875/0.827982/0.010205`. HRRR-aware segmented offsets were evaluated but did not beat conformal intervals by event-bin NLL.
+
+Optimization 2026-04-29: ported `distribution_diagnostics.py` and `calibrate_ladder.py`, then selected the final distribution and ladder defaults.
+
+Commands:
+
+```bash
+rm -rf experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.distribution_diagnostics
+
+rm -rf experiments/withhrrr/data/runtime/evaluation/ladder_calibration
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_ladder
+```
+
+Eval 2026-04-29: distribution selection chose `normal_iqr`; 2025 event-bin NLL/Brier `1.261539/0.616776`, degree NLL/RPS `2.024162/0.009516`, beating interpolation-tail event-bin NLL `1.274655`. Ladder reliability was revalidated using selected `normal_iqr` and selected `bucket_reliability_s1_00`; event-bin NLL/Brier improved to `1.259265/0.615309`, degree NLL/RPS improved to `2.016883/0.009493`.
+
+Optimization 2026-04-29: wired `predict.py` to auto-load and apply:
+
+```text
+experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json
+experiments/withhrrr/data/runtime/evaluation/ladder_calibration/ladder_calibration_manifest.json
+```
+
+when present.
 
 Done 2026-04-29: ported and smoke-tested prediction CLI. Command:
 
@@ -409,9 +497,36 @@ Done 2026-04-29: ported and smoke-tested prediction CLI. Command:
 
 Eval 2026-04-29: prediction artifact written to `experiments/withhrrr/data/runtime/predictions/prediction_KLGA_2025-12-31.json`; calibrated expected final high `33.18F`.
 
+Optimization smoke 2026-04-29: after the HRRR disagreement/calibration pass, ran:
+
+```bash
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.predict \
+  --target-date-local 2025-12-31 \
+  --event-bin '30F or below' \
+  --event-bin '31-35F' \
+  --event-bin '36F or higher' \
+  --output-dir experiments/withhrrr/data/runtime/predictions/smoke_optimized
+```
+
+Eval 2026-04-29: prediction succeeded; expected final high `33.08F`, q05/q10/q25/q50/q75/q90/q95 `29.67/31.14/31.90/32.96/34.09/35.64/36.91`, event-bin probabilities `0.0783/0.8082/0.1135`.
+
+Optimization 2026-04-29: ported `polymarket_event.py`, updated `run_online_inference.py` to call the with-HRRR adapter, and smoke-tested a real event:
+
+```bash
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.polymarket_event \
+  --event-slug highest-temperature-in-nyc-on-april-11-2026
+
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.predict \
+  --target-date-local 2025-12-31 \
+  --event-bins-path experiments/withhrrr/data/runtime/polymarket/event_slug=highest-temperature-in-nyc-on-april-11-2026/event_bins.json \
+  --output-dir experiments/withhrrr/data/runtime/predictions/polymarket_smoke
+```
+
+Eval 2026-04-29: Polymarket fetch wrote `event_bins.json` with bins `59F or below` through `78F or higher`; prediction used `distribution_method=normal_iqr` and ladder calibration `bucket_reliability_s1_00`.
+
 ### 9. Tests And README
 
-Status: not done
+Status: done
 
 Goal:
 
@@ -432,9 +547,15 @@ Preferred command:
 .venv/bin/python -m pytest -q experiments/withhrrr/tests
 ```
 
+Done 2026-04-29: rewrote `README.md` with current defaults, metrics, command runbook, and artifact paths.
+
+Done 2026-04-29: added focused tests in `experiments/withhrrr/tests/test_withhrrr_model.py`.
+
+Eval 2026-04-29: `.venv/bin/python -m pytest -q experiments/withhrrr/tests` passed, `11` tests.
+
 ### 10. Keep TODO Current
 
-Status: not done
+Status: done
 
 Future agents must update:
 

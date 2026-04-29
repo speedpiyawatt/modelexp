@@ -51,17 +51,68 @@ def season_segments(df: pd.DataFrame) -> pd.Series:
 
 def disagreement_segments(df: pd.DataFrame) -> pd.Series:
     disagreement = pd.to_numeric(df["nbm_minus_lamp_tmax_f"], errors="coerce").abs()
-    return pd.Series(np.select([disagreement < 2.0, disagreement < 5.0], ["under_2f", "2_to_5f"], default="5f_or_more"), index=df.index, dtype="string")
+    return disagreement_bucket(disagreement, index=df.index)
+
+
+def disagreement_bucket(disagreement: pd.Series, *, index: pd.Index) -> pd.Series:
+    values = np.select(
+        [disagreement.isna(), disagreement < 2.0, disagreement < 5.0],
+        ["unknown", "under_2f", "2_to_5f"],
+        default="5f_or_more",
+    )
+    return pd.Series(values, index=index, dtype="string")
 
 
 def month_segments(df: pd.DataFrame) -> pd.Series:
     return date_month(df).map(lambda value: f"month_{int(value):02d}" if pd.notna(value) else "month_unknown").astype("string")
 
 
+def _numeric_difference(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce")
+
+
+def hrrr_lamp_disagreement_segments(df: pd.DataFrame) -> pd.Series:
+    return disagreement_bucket(_numeric_difference(df, "hrrr_minus_lamp_tmax_f").abs(), index=df.index)
+
+
+def hrrr_nbm_disagreement_segments(df: pd.DataFrame) -> pd.Series:
+    return disagreement_bucket(_numeric_difference(df, "hrrr_minus_nbm_tmax_f").abs(), index=df.index)
+
+
+def direction_segments(df: pd.DataFrame, column: str, *, hot_name: str, cold_name: str) -> pd.Series:
+    difference = _numeric_difference(df, column)
+    values = np.select([difference.isna(), difference >= 3.0, difference <= -3.0], ["unknown", hot_name, cold_name], default="within_3f")
+    return pd.Series(values, index=df.index, dtype="string")
+
+
+def hrrr_lamp_direction_segments(df: pd.DataFrame) -> pd.Series:
+    return direction_segments(
+        df,
+        "hrrr_minus_lamp_tmax_f",
+        hot_name="hrrr_hotter_than_lamp_3f",
+        cold_name="hrrr_colder_than_lamp_3f",
+    )
+
+
+def hrrr_nbm_direction_segments(df: pd.DataFrame) -> pd.Series:
+    return direction_segments(
+        df,
+        "hrrr_minus_nbm_tmax_f",
+        hot_name="hrrr_hotter_than_nbm_3f",
+        cold_name="hrrr_colder_than_nbm_3f",
+    )
+
+
 SEGMENTERS = {
     "season": season_segments,
     "disagreement": disagreement_segments,
     "month": month_segments,
+    "hrrr_lamp_disagreement": hrrr_lamp_disagreement_segments,
+    "hrrr_nbm_disagreement": hrrr_nbm_disagreement_segments,
+    "hrrr_lamp_direction": hrrr_lamp_direction_segments,
+    "hrrr_nbm_direction": hrrr_nbm_direction_segments,
 }
 
 
@@ -218,6 +269,10 @@ def calibration_methods(calibration_df: pd.DataFrame, *, min_segment_rows: int) 
         ("global_offsets", {"offsets_f": global_offsets}, lambda df: apply_offsets(df, global_offsets)),
         ("season_offsets", fit_segmented_offsets(calibration_df, segment_name="season", min_segment_rows=min_segment_rows), apply_segmented_offsets),
         ("disagreement_offsets", fit_segmented_offsets(calibration_df, segment_name="disagreement", min_segment_rows=min_segment_rows), apply_segmented_offsets),
+        ("hrrr_lamp_disagreement_offsets", fit_segmented_offsets(calibration_df, segment_name="hrrr_lamp_disagreement", min_segment_rows=min_segment_rows), apply_segmented_offsets),
+        ("hrrr_nbm_disagreement_offsets", fit_segmented_offsets(calibration_df, segment_name="hrrr_nbm_disagreement", min_segment_rows=min_segment_rows), apply_segmented_offsets),
+        ("hrrr_lamp_direction_offsets", fit_segmented_offsets(calibration_df, segment_name="hrrr_lamp_direction", min_segment_rows=min_segment_rows), apply_segmented_offsets),
+        ("hrrr_nbm_direction_offsets", fit_segmented_offsets(calibration_df, segment_name="hrrr_nbm_direction", min_segment_rows=min_segment_rows), apply_segmented_offsets),
         ("month_offsets", fit_segmented_offsets(calibration_df, segment_name="month", min_segment_rows=min_segment_rows), apply_segmented_offsets),
         ("conformal_intervals", fit_conformal_intervals(calibration_df), apply_conformal_intervals),
     ]
@@ -229,7 +284,7 @@ def apply_method_config(df: pd.DataFrame, method_id: str, config: dict[str, obje
         if not isinstance(offsets, dict):
             raise ValueError("global_offsets config must contain offsets_f")
         return apply_offsets(df, {str(key): float(value) for key, value in offsets.items()})
-    if method_id in {"season_offsets", "disagreement_offsets", "month_offsets"}:
+    if method_id.endswith("_offsets") and "segment_name" in config:
         return apply_segmented_offsets(df, config)
     if method_id == "conformal_intervals":
         return apply_conformal_intervals(df, config)

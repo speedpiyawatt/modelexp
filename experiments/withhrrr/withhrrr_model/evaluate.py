@@ -121,6 +121,35 @@ def predict_linear_blend(df: pd.DataFrame, coef: np.ndarray) -> np.ndarray:
     return x @ coef
 
 
+def fit_linear_three_way_blend(train_df: pd.DataFrame) -> np.ndarray:
+    x = np.column_stack(
+        [
+            np.ones(len(train_df)),
+            pd.to_numeric(train_df["nbm_tmax_open_f"], errors="coerce").to_numpy(float),
+            pd.to_numeric(train_df["lamp_tmax_open_f"], errors="coerce").to_numpy(float),
+            pd.to_numeric(train_df["hrrr_tmax_open_f"], errors="coerce").to_numpy(float),
+        ]
+    )
+    y = pd.to_numeric(train_df["final_tmax_f"], errors="coerce").to_numpy(float)
+    keep = np.isfinite(x).all(axis=1) & np.isfinite(y)
+    if int(keep.sum()) < 4:
+        raise ValueError("not enough rows to fit linear NBM/LAMP/HRRR blend")
+    coef, *_ = np.linalg.lstsq(x[keep], y[keep], rcond=None)
+    return coef
+
+
+def predict_linear_three_way_blend(df: pd.DataFrame, coef: np.ndarray) -> np.ndarray:
+    x = np.column_stack(
+        [
+            np.ones(len(df)),
+            pd.to_numeric(df["nbm_tmax_open_f"], errors="coerce").to_numpy(float),
+            pd.to_numeric(df["lamp_tmax_open_f"], errors="coerce").to_numpy(float),
+            pd.to_numeric(df["hrrr_tmax_open_f"], errors="coerce").to_numpy(float),
+        ]
+    )
+    return x @ coef
+
+
 def train_direct_absolute_lgbm(train_x: pd.DataFrame, train_y: pd.Series, valid_x: pd.DataFrame) -> np.ndarray:
     train_data = lgb.Dataset(train_x, label=train_y, free_raw_data=False)
     params = {
@@ -189,6 +218,13 @@ def interval_hit(row: pd.Series, lower_tag: str, upper_tag: str) -> bool:
     return float(row[f"pred_tmax_{lower_tag}_f"]) <= observed <= float(row[f"pred_tmax_{upper_tag}_f"])
 
 
+def row_numeric(row: pd.Series, column: str) -> float:
+    if column not in row.index:
+        return float("nan")
+    value = pd.to_numeric(row[column], errors="coerce")
+    return float(value) if pd.notna(value) else float("nan")
+
+
 def build_degree_ladder_diagnostics(prediction_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     min_temp_f, max_temp_f = ordered_ladder_bounds(prediction_df)
     rows: list[dict[str, object]] = []
@@ -227,6 +263,10 @@ def build_degree_ladder_diagnostics(prediction_df: pd.DataFrame) -> tuple[pd.Dat
                 "q10_q90_hit": interval_hit(row, "q10", "q90"),
                 "q25_q75_hit": interval_hit(row, "q25", "q75"),
                 "nbm_lamp_abs_disagreement_f": abs(float(row["nbm_minus_lamp_tmax_f"])),
+                "hrrr_lamp_abs_disagreement_f": abs(row_numeric(row, "hrrr_minus_lamp_tmax_f")),
+                "hrrr_nbm_abs_disagreement_f": abs(row_numeric(row, "hrrr_minus_nbm_tmax_f")),
+                "hrrr_minus_lamp_tmax_f": row_numeric(row, "hrrr_minus_lamp_tmax_f"),
+                "hrrr_minus_nbm_tmax_f": row_numeric(row, "hrrr_minus_nbm_tmax_f"),
             }
         )
         reliability_rows.append(
@@ -321,6 +361,10 @@ def build_pit_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
     work = diagnostics.copy()
     dates = pd.to_datetime(work["target_date_local"])
     abs_disagreement = pd.to_numeric(work["nbm_lamp_abs_disagreement_f"], errors="coerce")
+    hrrr_lamp_abs = pd.to_numeric(work.get("hrrr_lamp_abs_disagreement_f"), errors="coerce")
+    hrrr_nbm_abs = pd.to_numeric(work.get("hrrr_nbm_abs_disagreement_f"), errors="coerce")
+    hrrr_lamp_diff = pd.to_numeric(work.get("hrrr_minus_lamp_tmax_f"), errors="coerce")
+    hrrr_nbm_diff = pd.to_numeric(work.get("hrrr_minus_nbm_tmax_f"), errors="coerce")
     rows = [pit_summary(work, slice_name="overall")]
     for name, mask in (
         ("warm_apr_oct", dates.dt.month.between(4, 10)),
@@ -328,6 +372,16 @@ def build_pit_diagnostics(diagnostics: pd.DataFrame) -> pd.DataFrame:
         ("nbm_lamp_abs_disagreement_lt_2f", abs_disagreement < 2.0),
         ("nbm_lamp_abs_disagreement_2_to_5f", (abs_disagreement >= 2.0) & (abs_disagreement < 5.0)),
         ("nbm_lamp_abs_disagreement_gte_5f", abs_disagreement >= 5.0),
+        ("hrrr_lamp_abs_disagreement_lt_2f", hrrr_lamp_abs < 2.0),
+        ("hrrr_lamp_abs_disagreement_2_to_5f", (hrrr_lamp_abs >= 2.0) & (hrrr_lamp_abs < 5.0)),
+        ("hrrr_lamp_abs_disagreement_gte_5f", hrrr_lamp_abs >= 5.0),
+        ("hrrr_nbm_abs_disagreement_lt_2f", hrrr_nbm_abs < 2.0),
+        ("hrrr_nbm_abs_disagreement_2_to_5f", (hrrr_nbm_abs >= 2.0) & (hrrr_nbm_abs < 5.0)),
+        ("hrrr_nbm_abs_disagreement_gte_5f", hrrr_nbm_abs >= 5.0),
+        ("hrrr_hotter_than_lamp_3f", hrrr_lamp_diff >= 3.0),
+        ("hrrr_colder_than_lamp_3f", hrrr_lamp_diff <= -3.0),
+        ("hrrr_hotter_than_nbm_3f", hrrr_nbm_diff >= 3.0),
+        ("hrrr_colder_than_nbm_3f", hrrr_nbm_diff <= -3.0),
     ):
         subset = work.loc[mask]
         if not subset.empty:
@@ -441,7 +495,30 @@ def main() -> int:
     valid_y_final = pd.to_numeric(valid_df["final_tmax_f"], errors="coerce")
     valid_y_residual = pd.to_numeric(valid_df["target_residual_f"], errors="coerce")
 
-    prediction_df = valid_df[["target_date_local", "station_id", "final_tmax_f", "target_residual_f", "anchor_tmax_f", "nbm_tmax_open_f", "lamp_tmax_open_f", "nbm_minus_lamp_tmax_f"]].copy()
+    diagnostic_columns = [
+        "target_date_local",
+        "station_id",
+        "final_tmax_f",
+        "target_residual_f",
+        "anchor_tmax_f",
+        "nbm_tmax_open_f",
+        "lamp_tmax_open_f",
+        "hrrr_tmax_open_f",
+        "anchor_equal_3way_tmax_f",
+        "nbm_minus_lamp_tmax_f",
+        "hrrr_minus_lamp_tmax_f",
+        "hrrr_minus_nbm_tmax_f",
+        "abs_hrrr_minus_lamp_tmax_f",
+        "abs_hrrr_minus_nbm_tmax_f",
+        "hrrr_above_nbm_lamp_range_f",
+        "hrrr_below_nbm_lamp_range_f",
+        "hrrr_outside_nbm_lamp_range_f",
+        "hrrr_hotter_than_lamp_3f",
+        "hrrr_colder_than_lamp_3f",
+        "hrrr_hotter_than_nbm_3f",
+        "hrrr_colder_than_nbm_3f",
+    ]
+    prediction_df = valid_df[[column for column in diagnostic_columns if column in valid_df.columns]].copy()
     pinball_rows: list[dict[str, object]] = []
     for quantile in DEFAULT_QUANTILES:
         tag = quantile_tag(quantile)
@@ -481,9 +558,13 @@ def main() -> int:
         prediction_df[column] = rearranged[:, index]
     prediction_df["baseline_nbm_tmax_f"] = prediction_df["nbm_tmax_open_f"]
     prediction_df["baseline_lamp_tmax_f"] = prediction_df["lamp_tmax_open_f"]
+    prediction_df["baseline_hrrr_tmax_f"] = prediction_df["hrrr_tmax_open_f"]
     prediction_df["baseline_anchor_tmax_f"] = prediction_df["anchor_tmax_f"]
+    prediction_df["baseline_equal_3way_anchor_tmax_f"] = prediction_df["anchor_equal_3way_tmax_f"]
     linear_coef = fit_linear_blend(train_df)
     prediction_df["baseline_linear_blend_tmax_f"] = predict_linear_blend(valid_df, linear_coef)
+    linear_three_way_coef = fit_linear_three_way_blend(train_df)
+    prediction_df["baseline_linear_3way_blend_tmax_f"] = predict_linear_three_way_blend(valid_df, linear_three_way_coef)
     prediction_df["baseline_direct_lgbm_tmax_f"] = train_direct_absolute_lgbm(
         train_x,
         pd.to_numeric(train_df["final_tmax_f"], errors="coerce"),
@@ -494,8 +575,11 @@ def main() -> int:
     for name, column in (
         ("nbm_only", "baseline_nbm_tmax_f"),
         ("lamp_only", "baseline_lamp_tmax_f"),
+        ("hrrr_only", "baseline_hrrr_tmax_f"),
         ("fixed_50_50_anchor", "baseline_anchor_tmax_f"),
+        ("fixed_equal_3way_anchor", "baseline_equal_3way_anchor_tmax_f"),
         ("linear_nbm_lamp_blend", "baseline_linear_blend_tmax_f"),
+        ("linear_nbm_lamp_hrrr_blend", "baseline_linear_3way_blend_tmax_f"),
         ("direct_absolute_lgbm", "baseline_direct_lgbm_tmax_f"),
         ("residual_quantile_q50", "pred_tmax_q50_f"),
     ):
@@ -529,6 +613,51 @@ def main() -> int:
         if not subset.empty:
             disagreement_rows.append({"disagreement_bucket": name, "row_count": int(len(subset)), **summarize_point_metrics(subset, "pred_tmax_q50_f")})
 
+    hrrr_lamp_abs_disagreement = pd.to_numeric(prediction_df["hrrr_minus_lamp_tmax_f"], errors="coerce").abs()
+    hrrr_nbm_abs_disagreement = pd.to_numeric(prediction_df["hrrr_minus_nbm_tmax_f"], errors="coerce").abs()
+    hrrr_lamp_disagreement_rows = []
+    hrrr_nbm_disagreement_rows = []
+    for rows, disagreement in (
+        (hrrr_lamp_disagreement_rows, hrrr_lamp_abs_disagreement),
+        (hrrr_nbm_disagreement_rows, hrrr_nbm_abs_disagreement),
+    ):
+        for name, mask in (
+            ("lt_2f", disagreement < 2.0),
+            ("2_to_5f", (disagreement >= 2.0) & (disagreement < 5.0)),
+            ("gte_5f", disagreement >= 5.0),
+        ):
+            subset = prediction_df.loc[mask]
+            if not subset.empty:
+                rows.append({"disagreement_bucket": name, "row_count": int(len(subset)), **summarize_point_metrics(subset, "pred_tmax_q50_f")})
+
+    hrrr_lamp_direction_rows = []
+    hrrr_nbm_direction_rows = []
+    direction_specs = (
+        (
+            hrrr_lamp_direction_rows,
+            pd.to_numeric(prediction_df["hrrr_minus_lamp_tmax_f"], errors="coerce"),
+            (
+                ("hrrr_hotter_than_lamp_3f", lambda diff: diff >= 3.0),
+                ("hrrr_colder_than_lamp_3f", lambda diff: diff <= -3.0),
+                ("hrrr_lamp_within_3f", lambda diff: diff.abs() < 3.0),
+            ),
+        ),
+        (
+            hrrr_nbm_direction_rows,
+            pd.to_numeric(prediction_df["hrrr_minus_nbm_tmax_f"], errors="coerce"),
+            (
+                ("hrrr_hotter_than_nbm_3f", lambda diff: diff >= 3.0),
+                ("hrrr_colder_than_nbm_3f", lambda diff: diff <= -3.0),
+                ("hrrr_nbm_within_3f", lambda diff: diff.abs() < 3.0),
+            ),
+        ),
+    )
+    for rows, diff, specs in direction_specs:
+        for name, mask_fn in specs:
+            subset = prediction_df.loc[mask_fn(diff)]
+            if not subset.empty:
+                rows.append({"direction_slice": name, "row_count": int(len(subset)), **summarize_point_metrics(subset, "pred_tmax_q50_f")})
+
     degree_scores, modal_reliability, degree_reliability, pit_diagnostics, degree_metrics = build_degree_ladder_diagnostics(prediction_df)
     representative_bin_labels = load_event_bin_labels(args.representative_event_bins_path) if args.representative_event_bins_path is not None else list(DEFAULT_REPRESENTATIVE_EVENT_BINS)
     event_scores, event_bin_metrics, event_reliability, event_metrics = build_event_bin_diagnostics(
@@ -560,6 +689,10 @@ def main() -> int:
     pd.DataFrame(crossing_rows).to_csv(args.output_dir / "quantile_crossing.csv", index=False)
     pd.DataFrame(season_rows).to_csv(args.output_dir / "metrics_by_season.csv", index=False)
     pd.DataFrame(disagreement_rows).to_csv(args.output_dir / "metrics_by_nbm_lamp_disagreement.csv", index=False)
+    pd.DataFrame(hrrr_lamp_disagreement_rows).to_csv(args.output_dir / "metrics_by_hrrr_lamp_disagreement.csv", index=False)
+    pd.DataFrame(hrrr_nbm_disagreement_rows).to_csv(args.output_dir / "metrics_by_hrrr_nbm_disagreement.csv", index=False)
+    pd.DataFrame(hrrr_lamp_direction_rows).to_csv(args.output_dir / "metrics_by_hrrr_lamp_direction.csv", index=False)
+    pd.DataFrame(hrrr_nbm_direction_rows).to_csv(args.output_dir / "metrics_by_hrrr_nbm_direction.csv", index=False)
     degree_scores.to_csv(args.output_dir / "degree_ladder_scores.csv", index=False)
     modal_reliability.to_csv(args.output_dir / "degree_ladder_modal_reliability.csv", index=False)
     degree_reliability.to_csv(args.output_dir / "degree_ladder_reliability.csv", index=False)
@@ -579,6 +712,7 @@ def main() -> int:
         "validation_row_count": int(len(prediction_df)),
         "representative_event_bin_labels": representative_bin_labels,
         "linear_blend_coefficients": [float(value) for value in linear_coef],
+        "linear_three_way_blend_coefficients": [float(value) for value in linear_three_way_coef],
         "outputs": [
             "metrics_overall.json",
             "baseline_comparison.csv",
@@ -587,6 +721,10 @@ def main() -> int:
             "quantile_crossing.csv",
             "metrics_by_season.csv",
             "metrics_by_nbm_lamp_disagreement.csv",
+            "metrics_by_hrrr_lamp_disagreement.csv",
+            "metrics_by_hrrr_nbm_disagreement.csv",
+            "metrics_by_hrrr_lamp_direction.csv",
+            "metrics_by_hrrr_nbm_direction.csv",
             "degree_ladder_scores.csv",
             "degree_ladder_modal_reliability.csv",
             "degree_ladder_reliability.csv",

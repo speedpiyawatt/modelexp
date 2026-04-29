@@ -140,6 +140,36 @@ def _prepare_base_columns(base: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
+def _prepare_hrrr_disagreement_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "hrrr_tmax_open_f" not in out.columns:
+        if "hrrr_temp_2m_day_max_f" in out.columns:
+            out["hrrr_tmax_open_f"] = _numeric_column(out, "hrrr_temp_2m_day_max_f")
+        else:
+            out["hrrr_tmax_open_f"] = kelvin_to_f(_numeric_column(out, "hrrr_temp_2m_day_max_k"))
+
+    hrrr = _numeric_column(out, "hrrr_tmax_open_f")
+    lamp = _numeric_column(out, "lamp_tmax_open_f")
+    nbm = _numeric_column(out, "nbm_tmax_open_f")
+    out["hrrr_minus_lamp_tmax_f"] = hrrr - lamp
+    out["hrrr_minus_nbm_tmax_f"] = hrrr - nbm
+    out["abs_hrrr_minus_lamp_tmax_f"] = out["hrrr_minus_lamp_tmax_f"].abs()
+    out["abs_hrrr_minus_nbm_tmax_f"] = out["hrrr_minus_nbm_tmax_f"].abs()
+    out["anchor_equal_3way_tmax_f"] = (hrrr + lamp + nbm) / 3.0
+
+    lower_guidance = pd.concat([lamp, nbm], axis=1).min(axis=1)
+    upper_guidance = pd.concat([lamp, nbm], axis=1).max(axis=1)
+    out["hrrr_above_nbm_lamp_range_f"] = (hrrr - upper_guidance).clip(lower=0.0)
+    out["hrrr_below_nbm_lamp_range_f"] = (lower_guidance - hrrr).clip(lower=0.0)
+    out["hrrr_outside_nbm_lamp_range_f"] = out["hrrr_above_nbm_lamp_range_f"] + out["hrrr_below_nbm_lamp_range_f"]
+
+    out["hrrr_hotter_than_lamp_3f"] = (out["hrrr_minus_lamp_tmax_f"] >= 3.0).astype("boolean")
+    out["hrrr_colder_than_lamp_3f"] = (out["hrrr_minus_lamp_tmax_f"] <= -3.0).astype("boolean")
+    out["hrrr_hotter_than_nbm_3f"] = (out["hrrr_minus_nbm_tmax_f"] >= 3.0).astype("boolean")
+    out["hrrr_colder_than_nbm_3f"] = (out["hrrr_minus_nbm_tmax_f"] <= -3.0).astype("boolean")
+    return out
+
+
 def build_training_table(base: pd.DataFrame, hrrr: pd.DataFrame | None = None) -> pd.DataFrame:
     if base.empty:
         raise ValueError("base normalized training table is empty")
@@ -166,6 +196,7 @@ def build_training_table(base: pd.DataFrame, hrrr: pd.DataFrame | None = None) -
         if "meta_hrrr_available" not in merged.columns:
             merged["meta_hrrr_available"] = True
     merged["meta_hrrr_available"] = merged["meta_hrrr_available"].astype("boolean").fillna(False)
+    merged = _prepare_hrrr_disagreement_columns(merged)
 
     label = pd.to_numeric(merged["label_final_tmax_f"], errors="coerce")
     anchor = pd.to_numeric(merged["anchor_tmax_f"], errors="coerce")
@@ -188,6 +219,7 @@ def build_training_table(base: pd.DataFrame, hrrr: pd.DataFrame | None = None) -
         & pd.to_numeric(merged["anchor_tmax_f"], errors="coerce").notna()
         & pd.to_numeric(merged["nbm_tmax_open_f"], errors="coerce").notna()
         & pd.to_numeric(merged["lamp_tmax_open_f"], errors="coerce").notna()
+        & pd.to_numeric(merged["hrrr_tmax_open_f"], errors="coerce").notna()
     )
     if "model_training_eligible" in merged.columns:
         previous_eligible = merged["model_training_eligible"].astype("boolean").fillna(False)

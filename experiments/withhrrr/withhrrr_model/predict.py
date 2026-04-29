@@ -19,6 +19,7 @@ DEFAULT_MODELS_DIR = pathlib.Path("experiments/withhrrr/data/runtime/models")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/predictions")
 DEFAULT_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json")
 DEFAULT_DISTRIBUTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json")
+DEFAULT_LADDER_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/ladder_calibration/ladder_calibration_manifest.json")
 FALLBACK_DISTRIBUTION_METHOD_ID = "interpolation_tail"
 DISTRIBUTION_METHOD_IDS = ["auto", "interpolation_tail", "interpolation_no_tail", "smoothed_interpolation_tail", "normal_iqr"]
 ANCHOR_POLICY = "feature_anchor_tmax_f"
@@ -48,6 +49,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Phase 6 distribution manifest used when --distribution-method=auto.",
     )
+    parser.add_argument("--ladder-calibration-path", type=pathlib.Path, default=None, help="Optional ladder reliability calibration manifest.")
+    parser.add_argument("--no-ladder-calibration", action="store_true", help="Disable automatic ladder reliability calibration.")
     return parser.parse_args()
 
 
@@ -111,6 +114,35 @@ def _calibration_segment(row: pd.DataFrame | None, segment_name: str) -> str | N
         if disagreement < 5.0:
             return "2_to_5f"
         return "5f_or_more"
+    if segment_name in {"hrrr_lamp_disagreement", "hrrr_nbm_disagreement"}:
+        column = "hrrr_minus_lamp_tmax_f" if segment_name == "hrrr_lamp_disagreement" else "hrrr_minus_nbm_tmax_f"
+        value = pd.to_numeric(_single_row_value(row, column), errors="coerce")
+        if pd.isna(value):
+            return "unknown"
+        disagreement = abs(float(value))
+        if disagreement < 2.0:
+            return "under_2f"
+        if disagreement < 5.0:
+            return "2_to_5f"
+        return "5f_or_more"
+    if segment_name == "hrrr_lamp_direction":
+        value = pd.to_numeric(_single_row_value(row, "hrrr_minus_lamp_tmax_f"), errors="coerce")
+        if pd.isna(value):
+            return "unknown"
+        if float(value) >= 3.0:
+            return "hrrr_hotter_than_lamp_3f"
+        if float(value) <= -3.0:
+            return "hrrr_colder_than_lamp_3f"
+        return "within_3f"
+    if segment_name == "hrrr_nbm_direction":
+        value = pd.to_numeric(_single_row_value(row, "hrrr_minus_nbm_tmax_f"), errors="coerce")
+        if pd.isna(value):
+            return "unknown"
+        if float(value) >= 3.0:
+            return "hrrr_hotter_than_nbm_3f"
+        if float(value) <= -3.0:
+            return "hrrr_colder_than_nbm_3f"
+        return "within_3f"
     return None
 
 
@@ -178,6 +210,45 @@ def selected_distribution_method(
     return method_id, selected_path
 
 
+def _probability_bucket(probabilities: pd.Series, *, bucket_count: int) -> pd.Series:
+    bins = np.linspace(0.0, 1.0, bucket_count + 1)
+    return pd.cut(pd.to_numeric(probabilities, errors="coerce").fillna(0.0), bins=bins, include_lowest=True, right=True).astype(str)
+
+
+def _ladder_shrinkage(method_id: str) -> float:
+    if not method_id.startswith("bucket_reliability_s"):
+        return 0.0
+    return float(method_id.removeprefix("bucket_reliability_s").replace("_", "."))
+
+
+def apply_ladder_calibration(ladder: pd.DataFrame, manifest_path: pathlib.Path | None) -> tuple[pd.DataFrame, dict[str, object]]:
+    if manifest_path is None:
+        return ladder, {"enabled": False, "path": None, "method_id": "none"}
+    manifest = load_json(manifest_path)
+    method_id = str(manifest.get("selected_method_id", "quantile_calibrated_ladder"))
+    if method_id in {"none", "quantile_calibrated_ladder"}:
+        return ladder, {"enabled": False, "path": str(manifest_path), "method_id": method_id}
+    reliability_path = manifest.get("bucket_reliability_path")
+    bucket_count = int(manifest.get("bucket_count", 10))
+    if not isinstance(reliability_path, str):
+        raise ValueError(f"ladder calibration manifest is missing bucket_reliability_path: {manifest_path}")
+    reliability = pd.read_csv(reliability_path)
+    work = ladder.copy()
+    factors = reliability.copy()
+    shrinkage = _ladder_shrinkage(method_id)
+    factors["factor"] = 1.0 + shrinkage * (pd.to_numeric(factors["raw_factor"], errors="coerce").fillna(1.0) - 1.0)
+    factors["probability_bucket"] = factors["probability_bucket"].astype(str)
+    work["probability_bucket"] = _probability_bucket(work["probability"], bucket_count=bucket_count)
+    work = work.merge(factors[["probability_bucket", "factor"]], on="probability_bucket", how="left")
+    work["factor"] = pd.to_numeric(work["factor"], errors="coerce").fillna(1.0).clip(lower=0.0)
+    work["probability"] = pd.to_numeric(work["probability"], errors="coerce").fillna(0.0) * work["factor"]
+    total = float(work["probability"].sum())
+    if total > 0.0:
+        work["probability"] = work["probability"] / total
+    work = work.drop(columns=["probability_bucket", "factor"])
+    return work, {"enabled": True, "path": str(manifest_path), "method_id": method_id, "bucket_count": bucket_count, "shrinkage": shrinkage}
+
+
 def print_prediction_summary(payload: dict[str, object], output_path: pathlib.Path) -> None:
     print(f"prediction_path={output_path}")
     print(f"status={payload['status']} target_date_local={payload['target_date_local']} station_id={payload['station_id']}")
@@ -218,6 +289,11 @@ def main() -> int:
         args.distribution_method,
         manifest_path=args.distribution_manifest_path,
     )
+    ladder_calibration_path = args.ladder_calibration_path
+    if args.no_ladder_calibration:
+        ladder_calibration_path = None
+    elif ladder_calibration_path is None and DEFAULT_LADDER_CALIBRATION_PATH.exists():
+        ladder_calibration_path = DEFAULT_LADDER_CALIBRATION_PATH
 
     residual_quantiles: dict[float, float] = {}
     final_quantiles: dict[float, float] = {}
@@ -234,6 +310,7 @@ def main() -> int:
         final_quantiles[float(quantile)] = float(value)
 
     ladder = degree_ladder_from_quantiles(final_quantiles, method_id=distribution_method)
+    ladder, ladder_calibration = apply_ladder_calibration(ladder, ladder_calibration_path)
     bin_records: list[dict[str, object]] = []
     event_bin_labels = list(args.event_bin)
     if args.event_bins_path is not None:
@@ -261,6 +338,7 @@ def main() -> int:
         "calibration_offsets_f": offsets,
         "distribution_method": distribution_method,
         "distribution_manifest_path": str(distribution_manifest_path) if distribution_manifest_path is not None else None,
+        "ladder_calibration": ladder_calibration,
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = args.output_dir / f"prediction_{args.station_id}_{args.target_date_local}.json"

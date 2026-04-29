@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
 
-from experiments.no_hrrr_model.no_hrrr_model.polymarket_event import weather_event_slug_for_date
+from experiments.withhrrr.withhrrr_model.polymarket_event import weather_event_slug_for_date
 
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -457,7 +457,7 @@ def main() -> int:
                 [
                     sys.executable,
                     "-m",
-                    "experiments.no_hrrr_model.no_hrrr_model.polymarket_event",
+                    "experiments.withhrrr.withhrrr_model.polymarket_event",
                     "--event-slug",
                     polymarket_event_slug,
                     "--output-dir",
