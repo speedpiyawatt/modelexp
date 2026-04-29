@@ -200,6 +200,15 @@ def evaluate_candidate_split(
         "hrrr_colder_than_lamp_3f",
         "hrrr_hotter_than_nbm_3f",
         "hrrr_colder_than_nbm_3f",
+        "nbm_native_tmax_2m_day_max_f",
+        "source_spread_f",
+        "source_median_tmax_f",
+        "warmest_source",
+        "coldest_source",
+        "native_minus_hrrr_f",
+        "hrrr_minus_source_median_f",
+        "native_minus_source_median_f",
+        "source_disagreement_regime",
     ]
     predictions = valid_df[[column for column in prediction_columns if column in valid_df.columns]].copy()
     predictions["candidate_id"] = str(candidate["candidate_id"])

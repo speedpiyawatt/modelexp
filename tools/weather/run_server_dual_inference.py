@@ -189,6 +189,8 @@ comparison = {{
             "expected_final_tmax_f": payload.get("expected_final_tmax_f"),
             "anchor_tmax_f": payload.get("anchor_tmax_f"),
             "distribution_method": payload.get("distribution_method"),
+            "source_disagreement": payload.get("source_disagreement"),
+            "ladder_calibration": payload.get("ladder_calibration"),
             "final_tmax_quantiles_f": payload.get("final_tmax_quantiles_f"),
             "event_bins": payload.get("event_bins", []),
         }}
@@ -278,6 +280,16 @@ def print_summary(result: dict[str, Any]) -> None:
     print(f"no_hrrr      {fmt(no_hrrr['expected_final_tmax_f']):>10}  {fmt(no_hrrr['anchor_tmax_f']):>8}  {no_hrrr['distribution_method']}")
     print(f"with_hrrr    {fmt(with_hrrr['expected_final_tmax_f']):>10}  {fmt(with_hrrr['anchor_tmax_f']):>8}  {with_hrrr['distribution_method']}")
     print(f"diff         {fmt(diff['expected_final_tmax_f']):>10}  {fmt(diff['anchor_tmax_f']):>8}")
+    disagreement = with_hrrr.get("source_disagreement")
+    if isinstance(disagreement, dict):
+        regime = disagreement.get("source_disagreement_regime", "unknown")
+        spread = disagreement.get("source_spread_f")
+        warmest = disagreement.get("warmest_source", "unknown")
+        coldest = disagreement.get("coldest_source", "unknown")
+        print(f"with_hrrr regime={regime} spread_f={fmt(spread)} warmest={warmest} coldest={coldest}")
+    ladder_calibration = with_hrrr.get("ladder_calibration")
+    if isinstance(ladder_calibration, dict) and ladder_calibration.get("method_id"):
+        print(f"with_hrrr ladder_adjustment={ladder_calibration.get('method_id')} enabled={ladder_calibration.get('enabled')}")
     print()
     print("event bins")
     no_bins = {row["bin"]: float(row["probability"]) for row in no_hrrr["event_bins"]}

@@ -57,6 +57,14 @@ Important: HRRR enters as both the selected equal 3-way anchor component and mod
 
 ## Latest Optimization Pass: HRRR Disagreement Regimes
 
+- [x] Add source-disagreement robustness layer.
+  - Done 2026-04-29: added shared source-regime features for NBM hourly, native NBM TMAX, LAMP, and HRRR. Regimes include `native_warm_hrrr_cold`, `native_cold_hrrr_warm`, HRRR hot/cold outliers, broad/moderate disagreement, tight consensus, and unknown.
+  - Done 2026-04-29: `calibrate_rolling_origin.py` now evaluates `source_disagreement_regime_offsets` with hierarchical shrinkage: segment offsets require at least `30` rows and shrink toward global with weight `min(1, count/120)`.
+  - Done 2026-04-29: `calibrate_ladder.py` now evaluates source-disagreement widening candidates at `0.5F`, `1.0F`, and `1.5F`; `predict.py` can apply a selected widening method only on high-disagreement regimes.
+  - Eval 2026-04-29: rolling 2025 calibration did not promote the new source-regime quantile method. `source_disagreement_regime_offsets` had event-bin NLL/Brier `1.370733/0.616891`, worse than selected `hrrr_nbm_direction_offsets` at `1.305226/0.606479`.
+  - Eval 2026-04-29: widening did not promote. Best selected ladder remains `bucket_reliability_s1_00` with event-bin NLL/Brier `1.240912/0.603902`; widening candidates were `0.5F=1.244622`, `1.0F=1.248985`, `1.5F=1.257902` event-bin NLL.
+  - Eval 2026-04-29: source-regime diagnostics now write `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`. Holdout high-disagreement slice has event-bin NLL/Brier `1.519170/0.652170`; `native_warm_hrrr_cold` has `1.255661/0.684633`.
+
 - [x] Promote HRRR-vs-source disagreement into first-class model features.
   - Done 2026-04-29: `prepare_training_features.py` now derives `hrrr_tmax_open_f`, `hrrr_minus_lamp_tmax_f`, `hrrr_minus_nbm_tmax_f`, absolute disagreement columns, `anchor_equal_3way_tmax_f`, HRRR-outside-NBM/LAMP-range columns, and 3F hotter/colder boolean flags.
   - Eval 2026-04-29: rebuilt `experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.parquet`; table has `1,096` rows, `337` columns, and `1,094` eligible rows. Selected feature manifest now has `304` features.

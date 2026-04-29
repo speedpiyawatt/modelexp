@@ -12,6 +12,7 @@ from .calibrate_rolling_origin import apply_method_config, as_scoring_frame
 from .evaluate import EPSILON, observed_event_bin_name, ordered_ladder_bounds, ranked_probability_score, representative_event_bins
 from .event_bins import map_ladder_to_bins
 from .model_config import DEFAULT_MODEL_CANDIDATE_ID
+from .source_disagreement import DISAGREEMENT_WIDENING_REGIMES, source_disagreement_regime_series
 from .train_quantile_models import DEFAULT_QUANTILES, quantile_tag
 from .distribution import degree_ladder_from_quantiles
 
@@ -36,6 +37,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-valid-start", default="2025-01-01")
     parser.add_argument("--bucket-count", type=int, default=10)
     parser.add_argument("--shrinkage", default="0.25,0.50,0.75,1.00")
+    parser.add_argument("--disagreement-widening", default="0.0,0.5,1.0,1.5")
+    parser.add_argument("--widening-max-overall-event-nll-regression", type=float, default=0.005)
     return parser.parse_args()
 
 
@@ -45,6 +48,15 @@ def parse_shrinkage_grid(value: str) -> list[float]:
         raise ValueError("shrinkage grid must contain at least one value")
     if any(item < 0.0 or item > 1.0 for item in grid):
         raise ValueError("shrinkage values must be between 0 and 1")
+    return grid
+
+
+def parse_widening_grid(value: str) -> list[float]:
+    grid = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if not grid:
+        raise ValueError("widening grid must contain at least one value")
+    if any(item < 0.0 for item in grid):
+        raise ValueError("widening values must be non-negative")
     return grid
 
 
@@ -83,6 +95,7 @@ def selected_distribution_method(method_arg: str, manifest_path: pathlib.Path) -
 def ladder_records(prediction_df: pd.DataFrame, *, distribution_method: DistributionMethod) -> pd.DataFrame:
     min_temp_f, max_temp_f = ordered_ladder_bounds(prediction_df)
     records: list[dict[str, object]] = []
+    regimes = source_disagreement_regime_series(prediction_df)
     for _, row in prediction_df.iterrows():
         ladder = degree_ladder_from_quantiles(
             prediction_quantiles(row),
@@ -98,12 +111,44 @@ def ladder_records(prediction_df: pd.DataFrame, *, distribution_method: Distribu
                     "station_id": row["station_id"],
                     "final_tmax_f": float(row["final_tmax_f"]),
                     "observed_temp_f": observed_temp,
+                    "pred_tmax_q50_f": float(row["pred_tmax_q50_f"]),
+                    "source_disagreement_regime": str(regimes.loc[row.name]),
                     "temp_f": int(ladder_row.temp_f),
                     "probability": float(ladder_row.probability),
                     "observed": int(ladder_row.temp_f) == observed_temp,
                 }
             )
     return pd.DataFrame(records)
+
+
+def gaussian_kernel(width_f: float) -> np.ndarray:
+    width = float(width_f)
+    if width <= 0.0:
+        return np.asarray([1.0], dtype=float)
+    radius = max(1, int(np.ceil(width * 3.0)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / width) ** 2)
+    return kernel / kernel.sum()
+
+
+def widen_ladder_records(records: pd.DataFrame, *, widening_f: float) -> pd.DataFrame:
+    if widening_f <= 0.0:
+        return records.copy()
+    kernel = gaussian_kernel(widening_f)
+    out_frames: list[pd.DataFrame] = []
+    for (_target_date, _station_id), group in records.groupby(["target_date_local", "station_id"], sort=False, dropna=False):
+        work = group.copy()
+        regime = str(work["source_disagreement_regime"].iloc[0]) if "source_disagreement_regime" in work.columns else "unknown"
+        if regime in DISAGREEMENT_WIDENING_REGIMES:
+            probabilities = pd.to_numeric(work["probability"], errors="coerce").fillna(0.0).to_numpy(float)
+            radius = len(kernel) // 2
+            padded = np.pad(probabilities, (radius, radius), mode="edge")
+            widened = np.convolve(padded, kernel, mode="valid")
+            total = float(widened.sum())
+            if total > 0.0:
+                work["probability"] = widened / total
+        out_frames.append(work)
+    return pd.concat(out_frames, ignore_index=True) if out_frames else records.copy()
 
 
 def probability_bucket(probabilities: pd.Series, *, bucket_count: int) -> pd.Series:
@@ -200,6 +245,76 @@ def score_ladder_records(records: pd.DataFrame, *, method_id: str) -> dict[str, 
     }
 
 
+def metric_summary_for_records(records: pd.DataFrame, *, method_id: str, slice_name: str) -> dict[str, object]:
+    if records.empty:
+        return {
+            "method_id": method_id,
+            "slice": slice_name,
+            "row_count": 0,
+            "degree_ladder_nll": np.nan,
+            "degree_ladder_brier": np.nan,
+            "degree_ladder_rps": np.nan,
+            "event_bin_nll": np.nan,
+            "event_bin_brier": np.nan,
+            "q50_mae_f": np.nan,
+            "q50_rmse_f": np.nan,
+            "event_bin_observed_probability": np.nan,
+        }
+    scored = score_ladder_records(records, method_id=method_id)
+    per_row = records.groupby(["target_date_local", "station_id"], dropna=False).first().reset_index()
+    observed = pd.to_numeric(per_row["final_tmax_f"], errors="coerce").to_numpy(float)
+    predicted = pd.to_numeric(per_row["pred_tmax_q50_f"], errors="coerce").to_numpy(float)
+    return {
+        "method_id": method_id,
+        "slice": slice_name,
+        "row_count": scored["row_count"],
+        "degree_ladder_nll": scored["degree_ladder_nll"],
+        "degree_ladder_brier": scored["degree_ladder_brier"],
+        "degree_ladder_rps": scored["degree_ladder_rps"],
+        "event_bin_nll": scored["event_bin_nll"],
+        "event_bin_brier": scored["event_bin_brier"],
+        "q50_mae_f": float(np.mean(np.abs(predicted - observed))),
+        "q50_rmse_f": float(np.sqrt(np.mean((predicted - observed) ** 2))),
+        "event_bin_observed_probability": scored["event_bin_observed_probability"],
+    }
+
+
+def score_records_by_disagreement_slice(records: pd.DataFrame, *, method_id: str) -> pd.DataFrame:
+    rows = [metric_summary_for_records(records, method_id=method_id, slice_name="overall")]
+    if "source_disagreement_regime" in records.columns:
+        regimes = records["source_disagreement_regime"].astype(str)
+        high_mask = regimes.isin(DISAGREEMENT_WIDENING_REGIMES)
+        native_warm_mask = regimes == "native_warm_hrrr_cold"
+        rows.append(metric_summary_for_records(records.loc[high_mask].copy(), method_id=method_id, slice_name="high_disagreement"))
+        rows.append(metric_summary_for_records(records.loc[native_warm_mask].copy(), method_id=method_id, slice_name="native_warm_hrrr_cold"))
+        for regime in sorted(regimes.dropna().unique()):
+            rows.append(metric_summary_for_records(records.loc[regimes == regime].copy(), method_id=method_id, slice_name=f"regime:{regime}"))
+    return pd.DataFrame(rows)
+
+
+def select_ladder_method(summary: pd.DataFrame, slice_metrics: pd.DataFrame, *, max_overall_regression: float) -> str:
+    sorted_summary = summary.sort_values(["event_bin_nll", "degree_ladder_nll"]).reset_index(drop=True)
+    best_by_overall = str(sorted_summary.iloc[0]["method_id"])
+    if not best_by_overall.startswith("source_disagreement_widen_"):
+        return best_by_overall
+    baseline = sorted_summary.loc[sorted_summary["method_id"] == "quantile_calibrated_ladder"]
+    if baseline.empty:
+        baseline = sorted_summary.iloc[[0]]
+    baseline_event_nll = float(baseline.iloc[0]["event_bin_nll"])
+    high = slice_metrics.loc[slice_metrics["slice"] == "high_disagreement"].copy()
+    if high.empty:
+        return best_by_overall
+    baseline_high = high.loc[high["method_id"] == "quantile_calibrated_ladder"]
+    candidate_high = high.loc[high["method_id"] == best_by_overall]
+    if baseline_high.empty or candidate_high.empty:
+        return best_by_overall
+    candidate_event_nll = float(sorted_summary.loc[sorted_summary["method_id"] == best_by_overall, "event_bin_nll"].iloc[0])
+    high_improvement = float(baseline_high["event_bin_nll"].iloc[0]) - float(candidate_high["event_bin_nll"].iloc[0])
+    if candidate_event_nll <= baseline_event_nll + float(max_overall_regression) and high_improvement > 0.0:
+        return best_by_overall
+    return str(sorted_summary.loc[~sorted_summary["method_id"].astype(str).str.startswith("source_disagreement_widen_")].iloc[0]["method_id"])
+
+
 def main() -> int:
     args = parse_args()
     df = pd.read_parquet(args.predictions_path)
@@ -219,21 +334,38 @@ def main() -> int:
     test_records = ladder_records(test_frame, distribution_method=distribution_method)
     reliability = fit_bucket_reliability(calibration_records, bucket_count=args.bucket_count)
     summary_rows = [score_ladder_records(test_records, method_id="quantile_calibrated_ladder")]
+    slice_metric_frames = [score_records_by_disagreement_slice(test_records, method_id="quantile_calibrated_ladder")]
     calibrated_records: dict[str, pd.DataFrame] = {}
     for shrinkage in parse_shrinkage_grid(args.shrinkage):
         method_id = f"bucket_reliability_s{shrinkage:.2f}".replace(".", "_")
         adjusted = apply_bucket_reliability(test_records, reliability, bucket_count=args.bucket_count, shrinkage=shrinkage)
         calibrated_records[method_id] = adjusted
         summary_rows.append(score_ladder_records(adjusted, method_id=method_id))
+        slice_metric_frames.append(score_records_by_disagreement_slice(adjusted, method_id=method_id))
+    for widening in parse_widening_grid(args.disagreement_widening):
+        if widening <= 0.0:
+            continue
+        method_id = f"source_disagreement_widen_{widening:.2f}f".replace(".", "_")
+        widened = widen_ladder_records(test_records, widening_f=widening)
+        calibrated_records[method_id] = widened
+        summary_rows.append(score_ladder_records(widened, method_id=method_id))
+        slice_metric_frames.append(score_records_by_disagreement_slice(widened, method_id=method_id))
 
     summary = pd.DataFrame(summary_rows).sort_values(["event_bin_nll", "degree_ladder_nll"]).reset_index(drop=True)
-    selected_method_id = str(summary.iloc[0]["method_id"])
+    slice_metrics = pd.concat(slice_metric_frames, ignore_index=True) if slice_metric_frames else pd.DataFrame()
+    selected_method_id = select_ladder_method(
+        summary,
+        slice_metrics,
+        max_overall_regression=args.widening_max_overall_event_nll_regression,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = args.output_dir / "ladder_calibration_summary.csv"
+    slice_metrics_path = args.output_dir / "ladder_calibration_disagreement_slices.csv"
     reliability_path = args.output_dir / "ladder_calibration_bucket_reliability.csv"
     manifest_path = args.output_dir / "ladder_calibration_manifest.json"
     test_records_path = args.output_dir / "ladder_calibration_test_ladders.parquet"
     summary.to_csv(summary_path, index=False)
+    slice_metrics.to_csv(slice_metrics_path, index=False)
     reliability.to_csv(reliability_path, index=False)
     if selected_method_id in calibrated_records:
         output_records = calibrated_records[selected_method_id]
@@ -254,15 +386,24 @@ def main() -> int:
         "test_row_count": int(test_frame[["target_date_local", "station_id"]].drop_duplicates().shape[0]),
         "bucket_count": int(args.bucket_count),
         "shrinkage_grid": parse_shrinkage_grid(args.shrinkage),
+        "disagreement_widening_grid_f": parse_widening_grid(args.disagreement_widening),
+        "disagreement_widening_regimes": sorted(DISAGREEMENT_WIDENING_REGIMES),
+        "widening_max_overall_event_nll_regression": float(args.widening_max_overall_event_nll_regression),
         "selected_method_id": selected_method_id,
-        "selected_by": ["event_bin_nll", "degree_ladder_nll"],
+        "selected_by": [
+            "event_bin_nll",
+            "degree_ladder_nll",
+            "source_disagreement_widening_requires_high_disagreement_improvement_when_overall_regresses",
+        ],
         "summary_path": str(summary_path),
+        "disagreement_slice_metrics_path": str(slice_metrics_path),
         "bucket_reliability_path": str(reliability_path),
         "test_ladders_path": str(test_records_path),
     }
     manifest_path.write_text(json.dumps(output_manifest, indent=2, sort_keys=True) + "\n")
     print(manifest_path)
     print(summary_path)
+    print(slice_metrics_path)
     print(reliability_path)
     return 0
 

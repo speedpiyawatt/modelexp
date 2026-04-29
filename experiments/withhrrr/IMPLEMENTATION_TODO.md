@@ -81,6 +81,45 @@ Note 2026-04-29: created `experiments/withhrrr/withhrrr_model/` with `prepare_tr
 
 ## TODO
 
+### Source-Disagreement Robustness Layer
+
+Status: done
+
+Goal:
+
+- Keep the base LightGBM residual quantile model, but add a top-layer evaluation path for source-conflict regimes.
+- Do not promote a regime method unless rolling validation selects it.
+
+Implemented 2026-04-29:
+
+- Added shared source-disagreement regime logic under `withhrrr_model/source_disagreement.py`.
+- Added `source_disagreement_regime_offsets` with hierarchical shrinkage to quantile calibration.
+- Added source-disagreement ladder widening candidates to final ladder calibration.
+- Added source-regime diagnostics to holdout evaluation and prediction JSON output.
+- Updated server dual inference comparison to print the with-HRRR source regime and ladder adjustment.
+
+Verification 2026-04-29:
+
+```bash
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.prepare_training_features
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.rolling_origin_model_select
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_rolling_origin
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.distribution_diagnostics
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.calibrate_ladder
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.evaluate --output-dir experiments/withhrrr/data/runtime/evaluation/full_holdout_local
+.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py
+.venv/bin/python -m py_compile experiments/withhrrr/withhrrr_model/*.py tools/weather/run_server_dual_inference.py
+```
+
+Result:
+
+- New quantile candidate `source_disagreement_regime_offsets` did not win rolling validation.
+- New ladder widening candidates did not win rolling validation.
+- Selected quantile calibration remains `hrrr_nbm_direction_offsets`.
+- Selected ladder calibration remains `bucket_reliability_s1_00`.
+- Diagnostics are available in `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
+
 ### 1. Stage HRRR Overnight Summary Data
 
 Status: done

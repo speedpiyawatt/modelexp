@@ -7,6 +7,8 @@ import pathlib
 
 import pandas as pd
 
+from .source_disagreement import add_source_disagreement_features
+
 
 DEFAULT_BASE_PATH = pathlib.Path(
     "experiments/withhrrr/data/runtime/training/training_features_overnight_normalized.parquet"
@@ -218,7 +220,7 @@ def _prepare_hrrr_disagreement_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["hrrr_colder_than_lamp_3f"] = (out["hrrr_minus_lamp_tmax_f"] <= -3.0).astype("boolean")
     out["hrrr_hotter_than_nbm_3f"] = (out["hrrr_minus_nbm_tmax_f"] >= 3.0).astype("boolean")
     out["hrrr_colder_than_nbm_3f"] = (out["hrrr_minus_nbm_tmax_f"] <= -3.0).astype("boolean")
-    return out
+    return add_source_disagreement_features(out)
 
 
 def build_training_table(

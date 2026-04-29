@@ -11,6 +11,7 @@ import pandas as pd
 
 from .distribution import quantiles_to_degree_ladder
 from .event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
+from .source_disagreement import DISAGREEMENT_WIDENING_REGIMES, add_source_disagreement_features
 from .train_quantile_models import DEFAULT_QUANTILES, pinball_loss
 
 
@@ -517,8 +518,18 @@ def main() -> int:
         "hrrr_colder_than_lamp_3f",
         "hrrr_hotter_than_nbm_3f",
         "hrrr_colder_than_nbm_3f",
+        "nbm_native_tmax_2m_day_max_f",
+        "source_spread_f",
+        "source_median_tmax_f",
+        "warmest_source",
+        "coldest_source",
+        "native_minus_hrrr_f",
+        "hrrr_minus_source_median_f",
+        "native_minus_source_median_f",
+        "source_disagreement_regime",
     ]
     prediction_df = valid_df[[column for column in diagnostic_columns if column in valid_df.columns]].copy()
+    prediction_df = add_source_disagreement_features(prediction_df)
     pinball_rows: list[dict[str, object]] = []
     for quantile in DEFAULT_QUANTILES:
         tag = quantile_tag(quantile)
@@ -664,6 +675,36 @@ def main() -> int:
         prediction_df,
         bins=representative_event_bins(representative_bin_labels),
     )
+    score_regimes = prediction_df[["target_date_local", "station_id", "source_disagreement_regime"]].copy()
+    degree_with_regime = degree_scores.merge(score_regimes, on=["target_date_local", "station_id"], how="left")
+    event_with_regime = event_scores.merge(score_regimes, on=["target_date_local", "station_id"], how="left")
+    source_regime_rows = []
+    source_masks = {
+        "high_disagreement": degree_with_regime["source_disagreement_regime"].astype(str).isin(DISAGREEMENT_WIDENING_REGIMES),
+        "native_warm_hrrr_cold": degree_with_regime["source_disagreement_regime"].astype(str) == "native_warm_hrrr_cold",
+    }
+    for regime in sorted(degree_with_regime["source_disagreement_regime"].dropna().astype(str).unique()):
+        source_masks[f"regime:{regime}"] = degree_with_regime["source_disagreement_regime"].astype(str) == regime
+    for slice_name, degree_mask in source_masks.items():
+        degree_subset = degree_with_regime.loc[degree_mask]
+        if degree_subset.empty:
+            continue
+        keys = degree_subset[["target_date_local", "station_id"]].drop_duplicates()
+        event_subset = event_with_regime.merge(keys, on=["target_date_local", "station_id"], how="inner")
+        pred_subset = prediction_df.merge(keys, on=["target_date_local", "station_id"], how="inner")
+        source_regime_rows.append(
+            {
+                "slice": slice_name,
+                "row_count": int(len(keys)),
+                "event_bin_nll": float(event_subset["negative_log_likelihood"].mean()),
+                "event_bin_brier": float(event_subset["brier_score"].mean()),
+                "degree_ladder_nll": float(degree_subset["negative_log_likelihood"].mean()),
+                "degree_ladder_rps": float(degree_subset["ranked_probability_score"].mean()),
+                "q50_mae_f": mae(pred_subset["final_tmax_f"], pred_subset["pred_tmax_q50_f"]),
+                "q50_rmse_f": rmse(pred_subset["final_tmax_f"], pred_subset["pred_tmax_q50_f"]),
+                "event_bin_observed_probability": float(event_subset["observed_bin_probability"].mean()),
+            }
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metrics_overall = {
@@ -693,6 +734,7 @@ def main() -> int:
     pd.DataFrame(hrrr_nbm_disagreement_rows).to_csv(args.output_dir / "metrics_by_hrrr_nbm_disagreement.csv", index=False)
     pd.DataFrame(hrrr_lamp_direction_rows).to_csv(args.output_dir / "metrics_by_hrrr_lamp_direction.csv", index=False)
     pd.DataFrame(hrrr_nbm_direction_rows).to_csv(args.output_dir / "metrics_by_hrrr_nbm_direction.csv", index=False)
+    pd.DataFrame(source_regime_rows).to_csv(args.output_dir / "metrics_by_source_disagreement_regime.csv", index=False)
     degree_scores.to_csv(args.output_dir / "degree_ladder_scores.csv", index=False)
     modal_reliability.to_csv(args.output_dir / "degree_ladder_modal_reliability.csv", index=False)
     degree_reliability.to_csv(args.output_dir / "degree_ladder_reliability.csv", index=False)
@@ -725,6 +767,7 @@ def main() -> int:
             "metrics_by_hrrr_nbm_disagreement.csv",
             "metrics_by_hrrr_lamp_direction.csv",
             "metrics_by_hrrr_nbm_direction.csv",
+            "metrics_by_source_disagreement_regime.csv",
             "degree_ladder_scores.csv",
             "degree_ladder_modal_reliability.csv",
             "degree_ladder_reliability.csv",

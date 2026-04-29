@@ -23,7 +23,7 @@ HRRR-only is not good enough to be the whole model. On the 2025 holdout, HRRR-on
 - Quantile calibration: `hrrr_nbm_direction_offsets`
 - Distribution method: `normal_iqr`
 - Ladder reliability calibration: `bucket_reliability_s1_00`
-- Feature count: `304`
+- Feature count: `316`
 - Training rows: `1,094` eligible rows from `2023-01-01` through `2025-12-31`
 
 ## Current Metrics
@@ -44,6 +44,12 @@ Rolling 2025 calibration test, `365` rows:
 | conformal quantiles + interpolation | `1.274655` | `0.615411` | `2.071875` | `0.010205` |
 | conformal quantiles + `normal_iqr` | `1.261539` | `0.616776` | `2.024162` | `0.009516` |
 | selected equal-3-way-anchor quantiles + `normal_iqr` + ladder reliability | `1.240912` | `0.603902` | `1.999327` | `0.009510` |
+
+Source-disagreement robustness, rolling 2025 calibration test:
+
+- `source_disagreement_regime_offsets` was evaluated but not promoted; event-bin NLL/Brier was `1.370733/0.616891`, worse than the selected `hrrr_nbm_direction_offsets`.
+- Source-disagreement ladder widening was evaluated at `0.5F`, `1.0F`, and `1.5F`; none beat `bucket_reliability_s1_00`, so no widening is enabled by default.
+- Diagnostics are written to `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
 
 HRRR ablation, rolling `729` validation rows:
 

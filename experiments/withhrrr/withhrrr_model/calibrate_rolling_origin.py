@@ -12,6 +12,7 @@ import pandas as pd
 from .calibrate_quantiles import apply_offsets, coverage_rows, fit_offsets
 from .evaluate import build_degree_ladder_diagnostics, build_event_bin_diagnostics, mae, rmse
 from .model_config import DEFAULT_MODEL_CANDIDATE_ID
+from .source_disagreement import source_disagreement_regime_series
 from .train_quantile_models import DEFAULT_QUANTILES, quantile_tag
 
 
@@ -105,6 +106,10 @@ def hrrr_nbm_direction_segments(df: pd.DataFrame) -> pd.Series:
     )
 
 
+def source_disagreement_regime_segments(df: pd.DataFrame) -> pd.Series:
+    return source_disagreement_regime_series(df)
+
+
 SEGMENTERS = {
     "season": season_segments,
     "disagreement": disagreement_segments,
@@ -113,6 +118,7 @@ SEGMENTERS = {
     "hrrr_nbm_disagreement": hrrr_nbm_disagreement_segments,
     "hrrr_lamp_direction": hrrr_lamp_direction_segments,
     "hrrr_nbm_direction": hrrr_nbm_direction_segments,
+    "source_disagreement_regime": source_disagreement_regime_segments,
 }
 
 
@@ -169,6 +175,49 @@ def apply_segmented_offsets(df: pd.DataFrame, config: dict[str, object]) -> pd.D
         calibrated_columns.append(column)
     out.loc[:, calibrated_columns] = np.maximum.accumulate(out[calibrated_columns].to_numpy(float), axis=1)
     return out
+
+
+def fit_shrunk_segmented_offsets(
+    calibration_df: pd.DataFrame,
+    *,
+    segment_name: str,
+    min_segment_rows: int = 30,
+    full_weight_rows: int = 120,
+) -> dict[str, object]:
+    if segment_name not in SEGMENTERS:
+        raise ValueError(f"unknown segment_name: {segment_name}")
+    global_offsets = fit_offsets(calibration_df)
+    segments = SEGMENTERS[segment_name](calibration_df)
+    segment_offsets: dict[str, dict[str, float]] = {}
+    raw_segment_offsets: dict[str, dict[str, float]] = {}
+    segment_counts: dict[str, int] = {}
+    segment_weights: dict[str, float] = {}
+    for segment_value, group_index in calibration_df.groupby(segments, dropna=False).groups.items():
+        segment_key = str(segment_value)
+        group = calibration_df.loc[group_index]
+        count = int(len(group))
+        segment_counts[segment_key] = count
+        if count < min_segment_rows:
+            continue
+        raw_offsets = fit_offsets(group)
+        weight = min(1.0, count / float(full_weight_rows))
+        segment_weights[segment_key] = float(weight)
+        raw_segment_offsets[segment_key] = raw_offsets
+        segment_offsets[segment_key] = {
+            tag: float(global_offsets[tag] + weight * (raw_offsets[tag] - global_offsets[tag]))
+            for tag in global_offsets
+        }
+    return {
+        "segment_name": segment_name,
+        "min_segment_rows": int(min_segment_rows),
+        "full_weight_rows": int(full_weight_rows),
+        "global_offsets_f": global_offsets,
+        "segment_offsets_f": segment_offsets,
+        "raw_segment_offsets_f": raw_segment_offsets,
+        "segment_counts": segment_counts,
+        "segment_weights": segment_weights,
+        "shrinkage": "global_plus_min_1_count_over_full_weight_rows",
+    }
 
 
 def conformal_quantile(nonconformity: np.ndarray, alpha: float) -> float:
@@ -267,6 +316,16 @@ def calibration_methods(calibration_df: pd.DataFrame, *, min_segment_rows: int) 
     global_offsets = fit_offsets(calibration_df)
     return [
         ("global_offsets", {"offsets_f": global_offsets}, lambda df: apply_offsets(df, global_offsets)),
+        (
+            "source_disagreement_regime_offsets",
+            fit_shrunk_segmented_offsets(
+                calibration_df,
+                segment_name="source_disagreement_regime",
+                min_segment_rows=30,
+                full_weight_rows=120,
+            ),
+            apply_segmented_offsets,
+        ),
         ("season_offsets", fit_segmented_offsets(calibration_df, segment_name="season", min_segment_rows=min_segment_rows), apply_segmented_offsets),
         ("disagreement_offsets", fit_segmented_offsets(calibration_df, segment_name="disagreement", min_segment_rows=min_segment_rows), apply_segmented_offsets),
         ("hrrr_lamp_disagreement_offsets", fit_segmented_offsets(calibration_df, segment_name="hrrr_lamp_disagreement", min_segment_rows=min_segment_rows), apply_segmented_offsets),

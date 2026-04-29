@@ -11,6 +11,7 @@ import pandas as pd
 
 from .distribution import degree_ladder_from_quantiles, expected_temperature
 from .event_bins import load_event_bin_labels, map_ladder_to_bins, parse_event_bin
+from .source_disagreement import DISAGREEMENT_WIDENING_REGIMES, source_disagreement_features
 from .train_quantile_models import DEFAULT_QUANTILES, quantile_tag
 
 
@@ -143,6 +144,14 @@ def _calibration_segment(row: pd.DataFrame | None, segment_name: str) -> str | N
         if float(value) <= -3.0:
             return "hrrr_colder_than_nbm_3f"
         return "within_3f"
+    if segment_name == "source_disagreement_regime":
+        value = _single_row_value(row, "source_disagreement_regime")
+        if value is not None and not pd.isna(value):
+            return str(value)
+        if row is None:
+            return "unknown"
+        features = source_disagreement_features(row)
+        return str(features["source_disagreement_regime"].iloc[0])
     return None
 
 
@@ -221,13 +230,61 @@ def _ladder_shrinkage(method_id: str) -> float:
     return float(method_id.removeprefix("bucket_reliability_s").replace("_", "."))
 
 
-def apply_ladder_calibration(ladder: pd.DataFrame, manifest_path: pathlib.Path | None) -> tuple[pd.DataFrame, dict[str, object]]:
+def _widening_from_method_id(method_id: str) -> float | None:
+    prefix = "source_disagreement_widen_"
+    if not method_id.startswith(prefix):
+        return None
+    token = method_id.removeprefix(prefix).removesuffix("f")
+    return float(token.replace("_", "."))
+
+
+def _gaussian_kernel(width_f: float) -> np.ndarray:
+    if width_f <= 0.0:
+        return np.asarray([1.0], dtype=float)
+    radius = max(1, int(np.ceil(width_f * 3.0)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / width_f) ** 2)
+    return kernel / kernel.sum()
+
+
+def widen_ladder(ladder: pd.DataFrame, *, widening_f: float) -> pd.DataFrame:
+    out = ladder.copy()
+    probabilities = pd.to_numeric(out["probability"], errors="coerce").fillna(0.0).to_numpy(float)
+    kernel = _gaussian_kernel(widening_f)
+    radius = len(kernel) // 2
+    padded = np.pad(probabilities, (radius, radius), mode="edge")
+    widened = np.convolve(padded, kernel, mode="valid")
+    total = float(widened.sum())
+    if total > 0.0:
+        out["probability"] = widened / total
+    return out
+
+
+def apply_ladder_calibration(
+    ladder: pd.DataFrame,
+    manifest_path: pathlib.Path | None,
+    *,
+    source_disagreement_regime: str | None = None,
+) -> tuple[pd.DataFrame, dict[str, object]]:
     if manifest_path is None:
         return ladder, {"enabled": False, "path": None, "method_id": "none"}
     manifest = load_json(manifest_path)
     method_id = str(manifest.get("selected_method_id", "quantile_calibrated_ladder"))
     if method_id in {"none", "quantile_calibrated_ladder"}:
         return ladder, {"enabled": False, "path": str(manifest_path), "method_id": method_id}
+    widening_f = _widening_from_method_id(method_id)
+    if widening_f is not None:
+        regime = str(source_disagreement_regime or "unknown")
+        enabled = regime in DISAGREEMENT_WIDENING_REGIMES
+        adjusted = widen_ladder(ladder, widening_f=widening_f) if enabled else ladder
+        return adjusted, {
+            "enabled": enabled,
+            "path": str(manifest_path),
+            "method_id": method_id,
+            "source_disagreement_regime": regime,
+            "widening_f": widening_f,
+            "widening_regimes": sorted(DISAGREEMENT_WIDENING_REGIMES),
+        }
     reliability_path = manifest.get("bucket_reliability_path")
     bucket_count = int(manifest.get("bucket_count", 10))
     if not isinstance(reliability_path, str):
@@ -309,8 +366,17 @@ def main() -> int:
     for quantile, value in zip(DEFAULT_QUANTILES, rearranged_final_values):
         final_quantiles[float(quantile)] = float(value)
 
+    disagreement = source_disagreement_features(row).iloc[0].to_dict()
+    disagreement_metadata = {
+        str(key): (None if pd.isna(value) else value)
+        for key, value in disagreement.items()
+    }
     ladder = degree_ladder_from_quantiles(final_quantiles, method_id=distribution_method)
-    ladder, ladder_calibration = apply_ladder_calibration(ladder, ladder_calibration_path)
+    ladder, ladder_calibration = apply_ladder_calibration(
+        ladder,
+        ladder_calibration_path,
+        source_disagreement_regime=str(disagreement_metadata.get("source_disagreement_regime") or "unknown"),
+    )
     bin_records: list[dict[str, object]] = []
     event_bin_labels = list(args.event_bin)
     if args.event_bins_path is not None:
@@ -339,6 +405,7 @@ def main() -> int:
         "distribution_method": distribution_method,
         "distribution_manifest_path": str(distribution_manifest_path) if distribution_manifest_path is not None else None,
         "ladder_calibration": ladder_calibration,
+        "source_disagreement": disagreement_metadata,
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = args.output_dir / f"prediction_{args.station_id}_{args.target_date_local}.json"

@@ -28,6 +28,14 @@ NON_FEATURE_COLUMNS = {
     "target_residual_f",
     "model_training_eligible",
     "model_prediction_available",
+    "source_spread_f",
+    "source_median_tmax_f",
+    "warmest_source",
+    "coldest_source",
+    "native_minus_hrrr_f",
+    "hrrr_minus_source_median_f",
+    "native_minus_source_median_f",
+    "source_disagreement_regime",
 }
 NON_FEATURE_SUBSTRINGS = (
     "market",

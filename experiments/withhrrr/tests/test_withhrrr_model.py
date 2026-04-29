@@ -16,8 +16,9 @@ from experiments.withhrrr.withhrrr_model.calibrate_ladder import (
     fit_bucket_reliability,
     ladder_records,
     selected_distribution_method as selected_ladder_distribution_method,
+    widen_ladder_records,
 )
-from experiments.withhrrr.withhrrr_model.calibrate_rolling_origin import calibration_sort_key
+from experiments.withhrrr.withhrrr_model.calibrate_rolling_origin import calibration_sort_key, fit_shrunk_segmented_offsets
 from experiments.withhrrr.withhrrr_model.build_inference_features import prediction_available
 from experiments.withhrrr.withhrrr_model.distribution import degree_ladder_from_quantiles
 from experiments.withhrrr.withhrrr_model.event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
@@ -28,6 +29,7 @@ from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration
 from experiments.withhrrr.withhrrr_model.prepare_training_features import build_training_table
 from experiments.withhrrr.withhrrr_model.rolling_origin_model_select import leakage_findings
 from experiments.withhrrr.withhrrr_model.run_online_inference import cleanup_runtime_artifacts
+from experiments.withhrrr.withhrrr_model.source_disagreement import source_disagreement_features
 from experiments.withhrrr.withhrrr_model.train_quantile_models import select_feature_columns
 
 
@@ -85,6 +87,35 @@ def test_training_table_anchor_policy_variants() -> None:
     assert float(out.loc[0, "target_residual_f"]) == 1.0
     assert float(out.loc[0, "nbm_native_tmax_minus_anchor_f"]) == 2.0
     assert bool(out.loc[0, "nbm_native_tmax_above_anchor_2f"]) is True
+
+
+def test_source_disagreement_regime_precedence() -> None:
+    rows = pd.DataFrame(
+        [
+            {"nbm_tmax_open_f": 54.0, "nbm_native_tmax_2m_day_max_f": 58.0, "lamp_tmax_open_f": 55.0, "hrrr_tmax_open_f": 52.0},
+            {"nbm_tmax_open_f": 56.0, "nbm_native_tmax_2m_day_max_f": 51.0, "lamp_tmax_open_f": 55.0, "hrrr_tmax_open_f": 58.0},
+            {"nbm_tmax_open_f": 54.0, "nbm_native_tmax_2m_day_max_f": 55.0, "lamp_tmax_open_f": 56.0, "hrrr_tmax_open_f": 60.0},
+            {"nbm_tmax_open_f": 54.0, "nbm_native_tmax_2m_day_max_f": 55.0, "lamp_tmax_open_f": 56.0, "hrrr_tmax_open_f": 50.0},
+            {"nbm_tmax_open_f": 52.0, "nbm_native_tmax_2m_day_max_f": 56.0, "lamp_tmax_open_f": 55.0, "hrrr_tmax_open_f": 54.0},
+            {"nbm_tmax_open_f": 52.0, "nbm_native_tmax_2m_day_max_f": 54.0, "lamp_tmax_open_f": 55.0, "hrrr_tmax_open_f": 54.0},
+            {"nbm_tmax_open_f": 52.0, "nbm_native_tmax_2m_day_max_f": 53.0, "lamp_tmax_open_f": 53.5, "hrrr_tmax_open_f": 53.0},
+            {"nbm_tmax_open_f": 52.0, "nbm_native_tmax_2m_day_max_f": pd.NA, "lamp_tmax_open_f": 53.5, "hrrr_tmax_open_f": 53.0},
+        ]
+    )
+    out = source_disagreement_features(rows)
+    assert out["source_disagreement_regime"].tolist() == [
+        "native_warm_hrrr_cold",
+        "native_cold_hrrr_warm",
+        "hrrr_hot_outlier",
+        "hrrr_cold_outlier",
+        "broad_disagreement",
+        "moderate_disagreement",
+        "tight_consensus",
+        "unknown",
+    ]
+    assert float(out.loc[0, "source_spread_f"]) == 6.0
+    assert out.loc[0, "warmest_source"] == "native_nbm"
+    assert out.loc[0, "coldest_source"] == "hrrr"
 
 
 def test_feature_selection_allows_hrrr_but_excludes_leakage() -> None:
@@ -171,6 +202,62 @@ def test_prediction_reads_hrrr_segmented_calibration() -> None:
     assert calibration_offsets(payload, row=row) == {"q50": -0.5}
 
 
+def test_source_disagreement_shrunk_offsets_use_count_weighting() -> None:
+    rows = []
+    for index in range(190):
+        if index < 10:
+            regime = "under_30"
+            residual = 4.0
+        elif index < 70:
+            regime = "sixty_rows"
+            residual = 2.0
+        else:
+            regime = "full_rows"
+            residual = 3.0
+        rows.append(
+            {
+                "source_disagreement_regime": regime,
+                "final_tmax_f": residual,
+                "pred_tmax_q05_f": 0.0,
+                "pred_tmax_q10_f": 0.0,
+                "pred_tmax_q25_f": 0.0,
+                "pred_tmax_q50_f": 0.0,
+                "pred_tmax_q75_f": 0.0,
+                "pred_tmax_q90_f": 0.0,
+                "pred_tmax_q95_f": 0.0,
+            }
+        )
+    config = fit_shrunk_segmented_offsets(
+        pd.DataFrame(rows),
+        segment_name="source_disagreement_regime",
+        min_segment_rows=30,
+        full_weight_rows=120,
+    )
+    global_q50 = config["global_offsets_f"]["q50"]
+    assert "under_30" not in config["segment_offsets_f"]
+    assert config["segment_weights"]["sixty_rows"] == 0.5
+    assert config["segment_weights"]["full_rows"] == 1.0
+    assert config["segment_offsets_f"]["sixty_rows"]["q50"] == global_q50 + 0.5 * (2.0 - global_q50)
+    assert config["segment_offsets_f"]["full_rows"]["q50"] == 3.0
+
+
+def test_prediction_reads_source_disagreement_segmented_calibration() -> None:
+    payload = {
+        "selected_method_id": "source_disagreement_regime_offsets",
+        "methods": {
+            "source_disagreement_regime_offsets": {
+                "config": {
+                    "segment_name": "source_disagreement_regime",
+                    "global_offsets_f": {"q50": 0.0},
+                    "segment_offsets_f": {"native_warm_hrrr_cold": {"q50": 1.25}},
+                }
+            }
+        },
+    }
+    row = pd.DataFrame([{"source_disagreement_regime": "native_warm_hrrr_cold"}])
+    assert calibration_offsets(payload, row=row) == {"q50": 1.25}
+
+
 def test_distribution_and_ladder_calibration_are_manifest_driven(tmp_path) -> None:
     method_id, path = selected_distribution_method("auto", manifest_path=tmp_path / "missing_distribution_manifest.json")
     assert method_id == "normal_iqr"
@@ -238,6 +325,21 @@ def test_ladder_bucket_reliability_preserves_probability_mass() -> None:
     reliability = fit_bucket_reliability(records, bucket_count=5)
     calibrated = apply_bucket_reliability(records, reliability, bucket_count=5, shrinkage=0.5)
     assert calibrated.groupby(["target_date_local", "station_id"])["probability"].sum().round(6).tolist() == [1.0, 1.0]
+
+
+def test_disagreement_ladder_widening_preserves_mass_and_spreads_peak() -> None:
+    records = pd.DataFrame(
+        [
+            {"target_date_local": "2025-01-01", "station_id": "KLGA", "final_tmax_f": 70.0, "observed_temp_f": 70, "source_disagreement_regime": "native_warm_hrrr_cold", "temp_f": 69, "probability": 0.05, "observed": False},
+            {"target_date_local": "2025-01-01", "station_id": "KLGA", "final_tmax_f": 70.0, "observed_temp_f": 70, "source_disagreement_regime": "native_warm_hrrr_cold", "temp_f": 70, "probability": 0.90, "observed": True},
+            {"target_date_local": "2025-01-01", "station_id": "KLGA", "final_tmax_f": 70.0, "observed_temp_f": 70, "source_disagreement_regime": "native_warm_hrrr_cold", "temp_f": 71, "probability": 0.05, "observed": False},
+        ]
+    )
+    widened = widen_ladder_records(records, widening_f=1.0)
+    assert round(float(widened["probability"].sum()), 6) == 1.0
+    assert float(widened.loc[widened["temp_f"] == 70, "probability"].iloc[0]) < 0.90
+    assert float(widened.loc[widened["temp_f"] == 69, "probability"].iloc[0]) > 0.05
+    assert float(widened.loc[widened["temp_f"] == 71, "probability"].iloc[0]) > 0.05
 
 
 def test_event_bin_adapter_and_polymarket_parser() -> None:
