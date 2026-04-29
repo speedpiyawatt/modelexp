@@ -158,6 +158,7 @@ Result:
 - Rolling selection metrics: event-bin NLL `1.462654`, degree-ladder NLL `2.325077`, q50 MAE `1.415372`.
 - Refreshed selected downstream defaults: `conformal_intervals`, `normal_iqr`, `bucket_reliability_s1_00`.
 - Refreshed holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.372809/0.619639`, degree NLL/RPS `2.149011/0.010002`, q50 MAE/RMSE `1.252238/1.651186`.
+- Deployed to production server: code commit `20330a1` is pulled on `/root/modelexp` at `root@198.199.64.163`; ignored runtime artifacts were synced separately for `models`, `model_selection`, `calibration_selection`, `distribution_diagnostics`, and `ladder_calibration`. Server-side verification confirmed selected training spec `equal_3way`, feature profile `high_disagreement_weighted`, weight profile `high_disagreement_weighted`, no meta residual.
 
 ### 1. Stage HRRR Overnight Summary Data
 

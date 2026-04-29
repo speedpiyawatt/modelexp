@@ -60,9 +60,10 @@ The folder `experiments/no_hrrr_model/` is a separate no-HRRR modeling experimen
 The folder `experiments/withhrrr/` is the HRRR-inclusive version of the no-HRRR experiment and is now the preferred experiment when the user asks for the best overnight fair-value model with current inputs.
 
 - it keeps the same model family as `experiments/no_hrrr_model`: residual LightGBM quantile models, calibrated final-Tmax quantiles, a 1F temperature ladder, and an event-bin adapter
-- it learns from Wunderground, NBM, LAMP, and HRRR source blocks; HRRR is a model feature and calibration/evaluation regime, not the primary anchor
-- the current anchor remains `0.5 * nbm_tmax_open_f + 0.5 * lamp_tmax_open_f`; HRRR-only was not promoted to anchor because holdout metrics were worse than the residual model
-- HRRR disagreement diagnostics are promoted as features, including HRRR-vs-LAMP/NBM deltas and out-of-range indicators
+- it learns from Wunderground, NBM, LAMP, and HRRR source blocks; HRRR is both a learned input and part of the selected equal 3-way source anchor
+- the current selected anchor is `equal_3way`: `(nbm_tmax_open_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 3`; HRRR-only was not promoted because holdout metrics were worse than the residual model
+- the current selected with-HRRR model uses the Source-Trust upgrade: model candidate `very_regularized_min_leaf70_lgbm_350`, feature profile `high_disagreement_weighted`, weight profile `high_disagreement_weighted`, quantile calibration `conformal_intervals`, distribution `normal_iqr`, and ladder reliability `bucket_reliability_s1_00`
+- HRRR/source disagreement diagnostics are promoted as features, including HRRR-vs-LAMP/NBM deltas, native-NBM deltas, source ranks, warmest/coldest flags, WU-last-temp-vs-source deltas, and disagreement regimes
 - current selected with-HRRR defaults are documented in `experiments/withhrrr/README.md`, `TODO.md`, and `IMPLEMENTATION_TODO.md`
 - future agents must update both `experiments/withhrrr/TODO.md` and `experiments/withhrrr/IMPLEMENTATION_TODO.md` when changing selected model behavior, inference behavior, or reported metrics
 
@@ -215,6 +216,7 @@ For download-heavy or long-running network steps:
 ```
 
 - the server runner assumes SSH access to `root@198.199.64.163` and repo path `/root/modelexp`; override with `MODELEXP_SERVER`, `MODELEXP_REMOTE_REPO`, or `MODELEXP_REMOTE_OUTPUT_ROOT` only when needed
+- as of 2026-04-29, `/root/modelexp` is expected to include commit `20330a1` or newer plus synced ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/`; a plain Git pull is not enough to refresh those ignored artifacts
 - the server runner runs no-HRRR and HRRR source work in parallel, reuses the no-HRRR Wunderground/LAMP/NBM artifacts to build the with-HRRR prediction, then returns a local text comparison
 - server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, and logs
 - the server runner deletes downloaded/intermediate source artifacts after producing the predictions

@@ -32,6 +32,7 @@ Source-trust upgrade status:
 - Implemented and validated 2026-04-29.
 - Rolling model selection can now evaluate dynamic anchors (`equal_3way`, 4-way native/NBM/LAMP/HRRR, median 4-way, trimmed-mean 4-way, fold-local ridge 4-way), source-trust feature profiles, weighted disagreement specialists, and an optional meta residual correction.
 - Full rolling-origin validation selected the high-disagreement-weighted profile on the existing equal-3way anchor. Dynamic 4-way, median, trimmed, ridge, and meta residual variants were evaluated but not promoted.
+- Deployed 2026-04-29: code was pushed in commit `20330a1` and pulled on `/root/modelexp` at `root@198.199.64.163`. Ignored runtime artifacts for models, model selection, quantile calibration, distribution diagnostics, and ladder calibration were synced separately because `experiments/withhrrr/data/runtime/` is gitignored.
 
 ## Current Metrics
 
@@ -68,6 +69,14 @@ HRRR ablation, rolling `729` validation rows:
 HRRR improves the rolling probability metrics materially. Keep HRRR in the model.
 
 ## Runbook
+
+Production-style one-date inference should use the server dual runner from the local repo:
+
+```bash
+.venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD
+```
+
+The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the Source-Trust model, the server needs both the Git code and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`.
 
 Prepare the model table:
 
