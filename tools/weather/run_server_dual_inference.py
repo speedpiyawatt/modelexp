@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+from typing import Any
+
+
+DEFAULT_SERVER = "root@198.199.64.163"
+DEFAULT_REMOTE_REPO = "/root/modelexp"
+DEFAULT_REMOTE_OUTPUT_ROOT = "data/runtime/server_dual_inference"
+
+
+def parse_date(value: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid date {value!r}; expected YYYY-MM-DD") from exc
+
+
+def run_ssh(server: str, script: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["ssh", server, "bash", "-lc", script],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def prediction_path(run_root: str, model_name: str, target_date: dt.date) -> str:
+    return f"{run_root}/predictions/{model_name}/prediction_KLGA_{target_date.isoformat()}.json"
+
+
+def remote_script(*, target_date: dt.date, remote_repo: str, output_root: str) -> str:
+    date = target_date.isoformat()
+    run_root = f"{output_root}/{date}"
+    no_hrrr_runtime = f"{run_root}/runtime/no_hrrr"
+    with_hrrr_runtime = f"{run_root}/runtime/with_hrrr"
+    hrrr_run_root = f"{with_hrrr_runtime}/hrrr"
+    no_hrrr_prediction_dir = f"{run_root}/predictions/no_hrrr"
+    with_hrrr_prediction_dir = f"{run_root}/predictions/with_hrrr"
+    no_hrrr_prediction = prediction_path(run_root, "no_hrrr", target_date)
+    with_hrrr_prediction = prediction_path(run_root, "with_hrrr", target_date)
+    return f"""
+set -euo pipefail
+cd {shlex.quote(remote_repo)}
+
+DATE={shlex.quote(date)}
+RUN_ROOT={shlex.quote(run_root)}
+NO_HRRR_RUNTIME={shlex.quote(no_hrrr_runtime)}
+WITH_HRRR_RUNTIME={shlex.quote(with_hrrr_runtime)}
+HRRR_RUN_ROOT={shlex.quote(hrrr_run_root)}
+NO_HRRR_PRED_DIR={shlex.quote(no_hrrr_prediction_dir)}
+WITH_HRRR_PRED_DIR={shlex.quote(with_hrrr_prediction_dir)}
+NO_HRRR_PRED={shlex.quote(no_hrrr_prediction)}
+WITH_HRRR_PRED={shlex.quote(with_hrrr_prediction)}
+
+mkdir -p "$NO_HRRR_PRED_DIR" "$WITH_HRRR_PRED_DIR"
+rm -rf "$NO_HRRR_RUNTIME" "$WITH_HRRR_RUNTIME"
+rm -f "$NO_HRRR_PRED" "$WITH_HRRR_PRED"
+
+(
+  set -euo pipefail
+  .venv/bin/python -m experiments.no_hrrr_model.no_hrrr_model.run_online_inference \\
+    --target-date-local "$DATE" \\
+    --runtime-root "$NO_HRRR_RUNTIME" \\
+    --prediction-output-dir "$NO_HRRR_PRED_DIR" \\
+    --polymarket-event-slug \\
+    --overwrite \\
+    --keep-artifacts
+) > "$RUN_ROOT/no_hrrr.log" 2>&1 &
+NO_HRRR_PID=$!
+
+(
+  set -euo pipefail
+  .venv/bin/python tools/hrrr/run_hrrr_monthly_backfill.py \\
+    --start-local-date "$DATE" \\
+    --end-local-date "$DATE" \\
+    --run-root "$HRRR_RUN_ROOT" \\
+    --selection-mode overnight_0005 \\
+    --batch-reduce-mode cycle \\
+    --day-workers 1 \\
+    --max-workers 4 \\
+    --download-workers 4 \\
+    --reduce-workers 2 \\
+    --extract-workers 2 \\
+    --reduce-queue-size 2 \\
+    --extract-queue-size 2 \\
+    --range-merge-gap-bytes 65536 \\
+    --crop-method auto \\
+    --crop-grib-type same \\
+    --wgrib2-threads 1 \\
+    --extract-method wgrib2-bin \\
+    --summary-profile overnight \\
+    --skip-provenance \\
+    --progress-mode log
+) > "$RUN_ROOT/hrrr.log" 2>&1 &
+HRRR_PID=$!
+
+set +e
+wait "$NO_HRRR_PID"
+NO_HRRR_STATUS=$?
+wait "$HRRR_PID"
+HRRR_STATUS=$?
+set -e
+
+if [ "$NO_HRRR_STATUS" -ne 0 ]; then
+  echo "[error] no-HRRR inference failed; log follows" >&2
+  tail -200 "$RUN_ROOT/no_hrrr.log" >&2 || true
+  exit "$NO_HRRR_STATUS"
+fi
+if [ "$HRRR_STATUS" -ne 0 ]; then
+  echo "[error] HRRR source build failed; log follows" >&2
+  tail -200 "$RUN_ROOT/hrrr.log" >&2 || true
+  exit "$HRRR_STATUS"
+fi
+
+EVENT_BINS_PATH=$(find "$NO_HRRR_RUNTIME/polymarket" -path '*/event_bins.json' -print -quit)
+if [ -z "$EVENT_BINS_PATH" ]; then
+  echo "[error] no-HRRR inference did not produce Polymarket event_bins.json" >&2
+  tail -100 "$RUN_ROOT/no_hrrr.log" >&2 || true
+  exit 1
+fi
+
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.build_inference_features \\
+  --target-date-local "$DATE" \\
+  --station-id KLGA \\
+  --label-history-path "$NO_HRRR_RUNTIME/wunderground_tables/target_date_local=$DATE/labels_daily.parquet" \\
+  --obs-path "$NO_HRRR_RUNTIME/wunderground_tables/target_date_local=$DATE/wu_obs_intraday.parquet" \\
+  --nbm-root "$NO_HRRR_RUNTIME/nbm/nbm_overnight" \\
+  --lamp-root "$NO_HRRR_RUNTIME/lamp_overnight" \\
+  --hrrr-root "$HRRR_RUN_ROOT/hrrr_summary" \\
+  --output-dir "$WITH_HRRR_RUNTIME/prediction_features"
+
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.predict \\
+  --features-path "$WITH_HRRR_RUNTIME/prediction_features/target_date_local=$DATE/withhrrr.inference_features_normalized.parquet" \\
+  --output-dir "$WITH_HRRR_PRED_DIR" \\
+  --target-date-local "$DATE" \\
+  --station-id KLGA \\
+  --event-bins-path "$EVENT_BINS_PATH"
+
+rm -rf \\
+  "$NO_HRRR_RUNTIME/wunderground_history" \\
+  "$NO_HRRR_RUNTIME/wunderground_tables" \\
+  "$NO_HRRR_RUNTIME/lamp_raw" \\
+  "$NO_HRRR_RUNTIME/lamp_features" \\
+  "$NO_HRRR_RUNTIME/lamp_overnight" \\
+  "$NO_HRRR_RUNTIME/nbm" \\
+  "$NO_HRRR_RUNTIME/polymarket" \\
+  "$NO_HRRR_RUNTIME/prediction_features" \\
+  "$HRRR_RUN_ROOT" \\
+  "$WITH_HRRR_RUNTIME/prediction_features"
+
+.venv/bin/python - <<'PY'
+import json
+from pathlib import Path
+
+date = {date!r}
+run_root = Path({run_root!r})
+paths = {{
+    "no_hrrr": Path({no_hrrr_prediction!r}),
+    "with_hrrr": Path({with_hrrr_prediction!r}),
+}}
+data = {{name: json.loads(path.read_text()) for name, path in paths.items()}}
+
+def bins(payload):
+    return {{row["bin"]: float(row["probability"]) for row in payload.get("event_bins", [])}}
+
+no_bins = bins(data["no_hrrr"])
+with_bins = bins(data["with_hrrr"])
+comparison = {{
+    "target_date_local": date,
+    "remote_run_root": str(run_root),
+    "predictions": {{
+        name: {{
+            "path": str(paths[name]),
+            "status": payload.get("status"),
+            "expected_final_tmax_f": payload.get("expected_final_tmax_f"),
+            "anchor_tmax_f": payload.get("anchor_tmax_f"),
+            "distribution_method": payload.get("distribution_method"),
+            "final_tmax_quantiles_f": payload.get("final_tmax_quantiles_f"),
+            "event_bins": payload.get("event_bins", []),
+        }}
+        for name, payload in data.items()
+    }},
+    "diff_with_hrrr_minus_no_hrrr": {{
+        "expected_final_tmax_f": data["with_hrrr"]["expected_final_tmax_f"] - data["no_hrrr"]["expected_final_tmax_f"],
+        "anchor_tmax_f": data["with_hrrr"].get("anchor_tmax_f", 0.0) - data["no_hrrr"].get("anchor_tmax_f", 0.0),
+        "event_bins": [
+            {{"bin": label, "probability_diff": with_bins[label] - no_bins[label]}}
+            for label in no_bins
+            if label in with_bins
+        ],
+    }},
+}}
+comparison_path = run_root / "comparison.json"
+comparison_path.write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\\n")
+print("RESULT_JSON_BEGIN")
+print(json.dumps(comparison, sort_keys=True))
+print("RESULT_JSON_END")
+PY
+"""
+
+
+def extract_result(stdout: str) -> dict[str, Any]:
+    start_marker = "RESULT_JSON_BEGIN"
+    end_marker = "RESULT_JSON_END"
+    if start_marker not in stdout or end_marker not in stdout:
+        raise SystemExit("Remote inference completed without a result JSON block.")
+    body = stdout.split(start_marker, 1)[1].split(end_marker, 1)[0].strip()
+    return json.loads(body)
+
+
+def fmt(value: Any, digits: int = 2) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value):.{digits}f}"
+
+
+def print_summary(result: dict[str, Any]) -> None:
+    predictions = result["predictions"]
+    no_hrrr = predictions["no_hrrr"]
+    with_hrrr = predictions["with_hrrr"]
+    diff = result["diff_with_hrrr_minus_no_hrrr"]
+    print(f"date: {result['target_date_local']}")
+    print(f"remote_run_root: {result['remote_run_root']}")
+    print()
+    print("model        expected_f  anchor_f  distribution")
+    print(f"no_hrrr      {fmt(no_hrrr['expected_final_tmax_f']):>10}  {fmt(no_hrrr['anchor_tmax_f']):>8}  {no_hrrr['distribution_method']}")
+    print(f"with_hrrr    {fmt(with_hrrr['expected_final_tmax_f']):>10}  {fmt(with_hrrr['anchor_tmax_f']):>8}  {with_hrrr['distribution_method']}")
+    print(f"diff         {fmt(diff['expected_final_tmax_f']):>10}  {fmt(diff['anchor_tmax_f']):>8}")
+    print()
+    print("event bins")
+    no_bins = {row["bin"]: float(row["probability"]) for row in no_hrrr["event_bins"]}
+    with_bins = {row["bin"]: float(row["probability"]) for row in with_hrrr["event_bins"]}
+    for label, no_prob in no_bins.items():
+        if label not in with_bins:
+            continue
+        with_prob = with_bins[label]
+        print(f"{label:<18} no_hrrr={no_prob:6.4f}  with_hrrr={with_prob:6.4f}  diff={with_prob - no_prob:+7.4f}")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: tools/weather/run_server_dual_inference.py YYYY-MM-DD", file=sys.stderr)
+        return 2
+    target_date = parse_date(sys.argv[1])
+    server = os.environ.get("MODELEXP_SERVER", DEFAULT_SERVER)
+    remote_repo = os.environ.get("MODELEXP_REMOTE_REPO", DEFAULT_REMOTE_REPO)
+    output_root = os.environ.get("MODELEXP_REMOTE_OUTPUT_ROOT", DEFAULT_REMOTE_OUTPUT_ROOT)
+
+    completed = run_ssh(server, remote_script(target_date=target_date, remote_repo=remote_repo, output_root=output_root))
+    if completed.returncode != 0:
+        print(completed.stdout, end="")
+        print(completed.stderr, end="", file=sys.stderr)
+        return completed.returncode
+    result = extract_result(completed.stdout)
+    print_summary(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
