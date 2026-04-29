@@ -13,6 +13,7 @@ from .distribution import degree_ladder_from_quantiles, expected_temperature
 from .event_bins import load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from .source_disagreement import DISAGREEMENT_WIDENING_REGIMES, source_disagreement_features
 from .train_quantile_models import DEFAULT_QUANTILES, quantile_tag
+from .calibrate_rolling_origin import apply_method_config
 
 
 DEFAULT_FEATURES_PATH = pathlib.Path("experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.parquet")
@@ -197,6 +198,23 @@ def calibration_offsets(payload: dict[str, object], row: pd.DataFrame | None = N
     return {}
 
 
+def selected_calibration_config(payload: dict[str, object]) -> tuple[str, dict[str, object]]:
+    selected_method_id = str(payload.get("selected_method_id") or payload.get("method") or "none")
+    if selected_method_id in {"none", "uncalibrated"}:
+        return "none", {}
+    methods = payload.get("methods")
+    if isinstance(methods, dict):
+        selected = methods.get(selected_method_id)
+        if isinstance(selected, dict):
+            config = selected.get("config")
+            if isinstance(config, dict):
+                return selected_method_id, config
+    offsets = payload.get("offsets_f")
+    if isinstance(offsets, dict):
+        return "global_offsets", {"offsets_f": offsets}
+    return selected_method_id, {}
+
+
 def selected_distribution_method(
     method_arg: str,
     *,
@@ -341,8 +359,12 @@ def main() -> int:
     elif calibration_path is None and DEFAULT_CALIBRATION_PATH.exists():
         calibration_path = DEFAULT_CALIBRATION_PATH
     offsets: dict[str, float] = {}
+    calibration_method_id = "none"
+    calibration_config: dict[str, object] = {}
     if calibration_path is not None:
-        offsets = calibration_offsets(load_json(calibration_path), row=row)
+        calibration_payload = load_json(calibration_path)
+        offsets = calibration_offsets(calibration_payload, row=row)
+        calibration_method_id, calibration_config = selected_calibration_config(calibration_payload)
     distribution_method, distribution_manifest_path = selected_distribution_method(
         args.distribution_method,
         manifest_path=args.distribution_manifest_path,
@@ -361,7 +383,7 @@ def main() -> int:
         booster = lgb.Booster(model_file=str(args.models_dir / f"residual_quantile_{tag}.txt"))
         residual = float(booster.predict(x, num_iteration=booster.best_iteration)[0])
         residual_quantiles[float(quantile)] = residual
-        raw_final_values.append(anchor_tmax_f + residual + offsets.get(tag, 0.0))
+        raw_final_values.append(anchor_tmax_f + residual)
 
     meta_residual_correction_f = 0.0
     if meta_residual_enabled:
@@ -375,6 +397,16 @@ def main() -> int:
         meta_booster = lgb.Booster(model_file=str(meta_model_path))
         meta_residual_correction_f = float(meta_booster.predict(meta_x, num_iteration=meta_booster.best_iteration)[0])
         raw_final_values = [value + meta_residual_correction_f for value in raw_final_values]
+
+    calibration_input = row.copy()
+    for quantile, value in zip(DEFAULT_QUANTILES, raw_final_values):
+        calibration_input[f"pred_tmax_{quantile_tag(quantile)}_f"] = float(value)
+    if calibration_path is not None and calibration_method_id != "none":
+        calibrated = apply_method_config(calibration_input, calibration_method_id, calibration_config)
+        raw_final_values = [
+            float(pd.to_numeric(calibrated[f"calibrated_pred_tmax_{quantile_tag(quantile)}_f"], errors="coerce").iloc[0])
+            for quantile in DEFAULT_QUANTILES
+        ]
 
     rearranged_final_values = np.maximum.accumulate(np.asarray(raw_final_values, dtype=float))
     for quantile, value in zip(DEFAULT_QUANTILES, rearranged_final_values):
@@ -422,6 +454,7 @@ def main() -> int:
         "max_so_far_f": args.max_so_far_f,
         "calibration_path": str(calibration_path) if calibration_path is not None else None,
         "calibration_enabled": calibration_path is not None,
+        "calibration_method_id": calibration_method_id if calibration_path is not None else "none",
         "calibration_offsets_f": offsets,
         "distribution_method": distribution_method,
         "distribution_manifest_path": str(distribution_manifest_path) if distribution_manifest_path is not None else None,

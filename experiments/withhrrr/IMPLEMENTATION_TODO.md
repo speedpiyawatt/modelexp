@@ -209,6 +209,7 @@ Result:
 - Rolling selection metrics: event-bin NLL `1.459584`, degree-ladder NLL `2.281087`, q50 MAE/RMSE `1.443267/1.996376`.
 - Refreshed selected downstream defaults: `global_offsets`, `normal_iqr`, `bucket_reliability_s1_00`.
 - Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.244989/0.608950`, degree NLL/RPS `2.000670/0.009480`.
+- Calibration robustness update 2026-04-30: added candidate comparison for `global_offsets`, `conformal_intervals`, `no_offsets`, `global_offsets_no_upper_tail`, `global_offsets_shrunk_50pct`, and conditional source-disagreement methods. Promotion now rejects candidates that reduce observed-bin probability by more than `0.02` in `tight_consensus` or `moderate_disagreement`; selected quantile calibration changed to `global_offsets_no_upper_tail`. Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.241810/0.606852`, degree NLL/RPS `2.000715/0.009475`.
 - Refreshed holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.345150/0.612207`, degree NLL/RPS `2.099877/0.010060`, q50 MAE/RMSE `1.261223/1.639528`.
 - Local inference smoke for `2025-12-31` produced an inference row with all four nearby stations available, `nearby_feature_count=106`, `feature_count=467`, and a valid prediction JSON.
 - Unit suite passed with `27` tests.

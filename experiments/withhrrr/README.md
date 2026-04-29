@@ -63,11 +63,12 @@ Rolling 2025 calibration test, `365` rows:
 | conformal quantiles + interpolation | `1.274655` | `0.615411` | `2.071875` | `0.010205` |
 | conformal quantiles + `normal_iqr` | `1.261539` | `0.616776` | `2.024162` | `0.009516` |
 | selected source-trust quantiles + `normal_iqr` + ladder reliability | `1.250237` | `0.607134` | `2.008158` | `0.009521` |
-| selected nearby source-trust quantiles + `normal_iqr` + ladder reliability | `1.244989` | `0.608950` | `2.000670` | `0.009480` |
+| selected nearby source-trust quantiles + guarded `global_offsets_no_upper_tail` + `normal_iqr` + ladder reliability | `1.241810` | `0.606852` | `2.000715` | `0.009475` |
 
 Source-disagreement robustness, rolling 2025 calibration test:
 
-- `source_disagreement_regime_offsets` was evaluated but not promoted; after the nearby-station upgrade, `global_offsets` won quantile calibration by event-bin NLL.
+- Quantile calibration now evaluates `global_offsets`, `conformal_intervals`, `no_offsets`, `global_offsets_no_upper_tail`, `global_offsets_shrunk_50pct`, and conditional source-disagreement variants. Promotion is guarded against observed-bin-probability drops in `tight_consensus` and `moderate_disagreement` slices. `global_offsets` and `conformal_intervals` were rejected by this guard; `global_offsets_no_upper_tail` is selected.
+- `source_disagreement_regime_offsets` remains evaluated as a diagnostic method but is no longer eligible for promotion unless the promotion family is deliberately expanded.
 - Source-disagreement ladder widening was evaluated at `0.5F`, `1.0F`, and `1.5F`; none beat `bucket_reliability_s1_00`, so no widening is enabled by default.
 - Diagnostics are written to `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
 

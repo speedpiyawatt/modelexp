@@ -19,7 +19,11 @@ from experiments.withhrrr.withhrrr_model.calibrate_ladder import (
     selected_distribution_method as selected_ladder_distribution_method,
     widen_ladder_records,
 )
-from experiments.withhrrr.withhrrr_model.calibrate_rolling_origin import calibration_sort_key, fit_shrunk_segmented_offsets
+from experiments.withhrrr.withhrrr_model.calibrate_rolling_origin import (
+    calibration_sort_key,
+    select_calibration_method,
+    fit_shrunk_segmented_offsets,
+)
 from experiments.withhrrr.withhrrr_model.build_inference_features import nearby_available, prediction_available
 from experiments.withhrrr.withhrrr_model.distribution import degree_ladder_from_quantiles
 from experiments.withhrrr.withhrrr_model.event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
@@ -667,6 +671,29 @@ def test_calibration_sort_key_uses_probability_scores_before_uncalibrated_penalt
         ]
     )
     assert list(calibration_sort_key(summary)["method_id"]) == ["global_offsets", "uncalibrated", "worse"]
+
+
+def test_calibration_selection_rejects_consensus_observed_probability_drop() -> None:
+    summary = pd.DataFrame(
+        [
+            {"method_id": "global_offsets", "event_bin_nll": 1.00, "degree_ladder_nll": 2.00},
+            {"method_id": "global_offsets_no_upper_tail", "event_bin_nll": 1.05, "degree_ladder_nll": 2.05},
+            {"method_id": "uncalibrated", "event_bin_nll": 1.20, "degree_ladder_nll": 2.20},
+        ]
+    )
+    slices = pd.DataFrame(
+        [
+            {"method_id": "uncalibrated", "slice": "overall", "event_bin_observed_probability": 0.40, "q50_mae_f": 1.0},
+            {"method_id": "uncalibrated", "slice": "moderate_disagreement", "event_bin_observed_probability": 0.42, "q50_mae_f": 1.0},
+            {"method_id": "global_offsets", "slice": "overall", "event_bin_observed_probability": 0.39, "q50_mae_f": 1.0},
+            {"method_id": "global_offsets", "slice": "moderate_disagreement", "event_bin_observed_probability": 0.38, "q50_mae_f": 1.0},
+            {"method_id": "global_offsets_no_upper_tail", "slice": "overall", "event_bin_observed_probability": 0.40, "q50_mae_f": 1.0},
+            {"method_id": "global_offsets_no_upper_tail", "slice": "moderate_disagreement", "event_bin_observed_probability": 0.41, "q50_mae_f": 1.0},
+        ]
+    )
+    selected, rejected = select_calibration_method(summary, slices)
+    assert selected == "global_offsets_no_upper_tail"
+    assert rejected[0]["method_id"] == "global_offsets"
 
 
 def test_online_inference_cleanup_deletes_only_runtime_artifacts(tmp_path) -> None:
