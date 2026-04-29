@@ -15,6 +15,7 @@ from experiments.withhrrr.withhrrr_model.calibrate_ladder import (
     apply_bucket_reliability,
     fit_bucket_reliability,
     ladder_records,
+    select_ladder_method,
     selected_distribution_method as selected_ladder_distribution_method,
     widen_ladder_records,
 )
@@ -27,9 +28,22 @@ from experiments.withhrrr.withhrrr_model.model_config import DEFAULT_CANDIDATES,
 from experiments.withhrrr.withhrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
 from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration, calibration_offsets, selected_distribution_method
 from experiments.withhrrr.withhrrr_model.prepare_training_features import build_training_table
-from experiments.withhrrr.withhrrr_model.rolling_origin_model_select import leakage_findings
+from experiments.withhrrr.withhrrr_model.rolling_origin_model_select import (
+    leakage_findings,
+    load_candidate_specs,
+    load_candidates,
+    looks_like_candidate_spec_config,
+    looks_like_model_candidate_config,
+)
 from experiments.withhrrr.withhrrr_model.run_online_inference import cleanup_runtime_artifacts
 from experiments.withhrrr.withhrrr_model.source_disagreement import source_disagreement_features
+from experiments.withhrrr.withhrrr_model.source_trust import (
+    add_source_trust_features,
+    apply_anchor_policy,
+    fit_ridge_4way_anchor,
+    source_trust_feature_subset,
+    training_weights,
+)
 from experiments.withhrrr.withhrrr_model.train_quantile_models import select_feature_columns
 
 
@@ -89,6 +103,35 @@ def test_training_table_anchor_policy_variants() -> None:
     assert bool(out.loc[0, "nbm_native_tmax_above_anchor_2f"]) is True
 
 
+def test_training_table_source_trust_anchor_policy_variants() -> None:
+    base = pd.DataFrame(
+        [
+            {
+                "target_date_local": "2025-04-11",
+                "station_id": "KLGA",
+                "label_final_tmax_f": 70.0,
+                "final_tmax_f": 70.0,
+                "nbm_tmax_open_f": 68.0,
+                "nbm_native_tmax_2m_day_max_f": 74.0,
+                "lamp_tmax_open_f": 65.0,
+                "hrrr_tmax_open_f": 72.0,
+                "wu_last_temp_f": 55.0,
+                "meta_nbm_available": True,
+                "meta_lamp_available": True,
+                "meta_hrrr_available": True,
+            }
+        ]
+    )
+    median = build_training_table(base, anchor_policy="source_median_4way")
+    trimmed = build_training_table(base, anchor_policy="source_trimmed_mean_4way")
+    assert float(median.loc[0, "anchor_tmax_f"]) == 70.0
+    assert float(trimmed.loc[0, "anchor_tmax_f"]) == 70.0
+    assert float(median.loc[0, "native_minus_lamp_tmax_f"]) == 9.0
+    assert float(median.loc[0, "wu_last_temp_minus_hrrr_f"]) == -17.0
+    assert int(median.loc[0, "source_rank_native"]) == 4
+    assert bool(median.loc[0, "source_native_warmest"]) is True
+
+
 def test_source_disagreement_regime_precedence() -> None:
     rows = pd.DataFrame(
         [
@@ -116,6 +159,125 @@ def test_source_disagreement_regime_precedence() -> None:
     assert float(out.loc[0, "source_spread_f"]) == 6.0
     assert out.loc[0, "warmest_source"] == "native_nbm"
     assert out.loc[0, "coldest_source"] == "hrrr"
+
+
+def test_source_trust_features_and_weights() -> None:
+    rows = pd.DataFrame(
+        [
+            {"nbm_tmax_open_f": 54.0, "nbm_native_tmax_2m_day_max_f": 58.0, "lamp_tmax_open_f": 55.0, "hrrr_tmax_open_f": 52.0, "wu_last_temp_f": 51.0, "source_disagreement_regime": "native_warm_hrrr_cold"},
+            {"nbm_tmax_open_f": 52.0, "nbm_native_tmax_2m_day_max_f": pd.NA, "lamp_tmax_open_f": 53.5, "hrrr_tmax_open_f": 53.0, "source_disagreement_regime": "unknown"},
+        ]
+    )
+    out = add_source_trust_features(rows)
+    assert float(out.loc[0, "source_trimmed_mean_tmax_f"]) == 54.5
+    assert float(out.loc[0, "abs_native_minus_hrrr_f"]) == 6.0
+    assert bool(out.loc[0, "source_hrrr_coldest"]) is True
+    assert pd.isna(out.loc[1, "source_trimmed_mean_tmax_f"])
+    weights = training_weights(out, "native_warm_hrrr_cold_specialist")
+    assert weights.tolist() == [4.0, 1.0]
+
+
+def test_source_trust_feature_profiles_filter_columns() -> None:
+    columns = [
+        "nbm_tmax_open_f",
+        "native_minus_lamp_tmax_f",
+        "target_month",
+        "hrrr_tmax_open_f",
+        "source_hrrr_coldest",
+    ]
+    assert source_trust_feature_subset(columns, "global_all_features") == ["nbm_tmax_open_f", "hrrr_tmax_open_f"]
+    assert source_trust_feature_subset(columns, "source_trust_all_features") == columns
+    assert source_trust_feature_subset(columns, "high_disagreement_weighted") == columns
+
+
+def test_rolling_selector_keeps_legacy_model_candidate_config_compatibility(tmp_path) -> None:
+    model_config = tmp_path / "model_candidates.json"
+    model_config.write_text(
+        json.dumps(
+            {
+                "candidates": [
+                    {
+                        "candidate_id": "custom_lgbm",
+                        "params": {"learning_rate": 0.05, "num_leaves": 3},
+                        "num_boost_round": 5,
+                    }
+                ]
+            }
+        )
+    )
+    payload = json.loads(model_config.read_text())
+    assert looks_like_model_candidate_config(payload)
+    assert not looks_like_candidate_spec_config(payload)
+
+    candidates = load_candidates(model_config)
+    assert [candidate["candidate_id"] for candidate in candidates] == ["custom_lgbm"]
+    specs = load_candidate_specs(None, candidates)
+    assert specs == [
+        {
+            "model_candidate_id": "custom_lgbm",
+            "anchor_policy": "equal_3way",
+            "feature_profile": "global_all_features",
+            "weight_profile": "unweighted",
+            "meta_residual": False,
+            "candidate_id": "custom_lgbm__anchor=equal_3way__features=global_all_features__weights=unweighted",
+        }
+    ]
+
+
+def test_rolling_selector_accepts_candidate_spec_config(tmp_path) -> None:
+    spec_config = tmp_path / "candidate_specs.json"
+    spec_config.write_text(
+        json.dumps(
+            {
+                "candidate_specs": [
+                    {
+                        "model_candidate_id": DEFAULT_MODEL_CANDIDATE_ID,
+                        "anchor_policy": "source_median_4way",
+                        "feature_profile": "source_trust_all_features",
+                    }
+                ]
+            }
+        )
+    )
+    payload = json.loads(spec_config.read_text())
+    assert looks_like_candidate_spec_config(payload)
+    assert not looks_like_model_candidate_config(payload)
+
+    specs = load_candidate_specs(spec_config, [candidate_by_id(DEFAULT_MODEL_CANDIDATE_ID)])
+    assert specs == [
+        {
+            "model_candidate_id": DEFAULT_MODEL_CANDIDATE_ID,
+            "anchor_policy": "source_median_4way",
+            "feature_profile": "source_trust_all_features",
+            "weight_profile": "unweighted",
+            "meta_residual": False,
+            "candidate_id": (
+                f"{DEFAULT_MODEL_CANDIDATE_ID}__anchor=source_median_4way"
+                "__features=source_trust_all_features__weights=unweighted"
+            ),
+        }
+    ]
+
+
+def test_ridge_anchor_requires_metadata_for_prediction_path() -> None:
+    rows = pd.DataFrame(
+        [
+            {"final_tmax_f": 60.0, "nbm_tmax_open_f": 58.0, "nbm_native_tmax_2m_day_max_f": 61.0, "lamp_tmax_open_f": 57.0, "hrrr_tmax_open_f": 59.0},
+            {"final_tmax_f": 65.0, "nbm_tmax_open_f": 64.0, "nbm_native_tmax_2m_day_max_f": 66.0, "lamp_tmax_open_f": 63.0, "hrrr_tmax_open_f": 64.0},
+            {"final_tmax_f": 70.0, "nbm_tmax_open_f": 69.0, "nbm_native_tmax_2m_day_max_f": 71.0, "lamp_tmax_open_f": 68.0, "hrrr_tmax_open_f": 69.0},
+            {"final_tmax_f": 75.0, "nbm_tmax_open_f": 74.0, "nbm_native_tmax_2m_day_max_f": 76.0, "lamp_tmax_open_f": 73.0, "hrrr_tmax_open_f": 74.0},
+            {"final_tmax_f": 80.0, "nbm_tmax_open_f": 79.0, "nbm_native_tmax_2m_day_max_f": 81.0, "lamp_tmax_open_f": 78.0, "hrrr_tmax_open_f": 79.0},
+        ]
+    )
+    metadata = fit_ridge_4way_anchor(rows)
+    anchored = apply_anchor_policy(rows, anchor_policy="ridge_4way_anchor", ridge_metadata=metadata)
+    assert anchored["anchor_tmax_f"].notna().all()
+    try:
+        apply_anchor_policy(rows, anchor_policy="ridge_4way_anchor")
+    except ValueError as exc:
+        assert "requires ridge_metadata" in str(exc)
+    else:
+        raise AssertionError("ridge_4way_anchor should require metadata")
 
 
 def test_feature_selection_allows_hrrr_but_excludes_leakage() -> None:
@@ -340,6 +502,40 @@ def test_disagreement_ladder_widening_preserves_mass_and_spreads_peak() -> None:
     assert float(widened.loc[widened["temp_f"] == 70, "probability"].iloc[0]) < 0.90
     assert float(widened.loc[widened["temp_f"] == 69, "probability"].iloc[0]) > 0.05
     assert float(widened.loc[widened["temp_f"] == 71, "probability"].iloc[0]) > 0.05
+
+
+def test_select_ladder_method_promotes_widening_with_tolerable_overall_regression() -> None:
+    summary = pd.DataFrame(
+        [
+            {"method_id": "bucket_reliability_s1_00", "event_bin_nll": 1.000, "degree_ladder_nll": 1.000},
+            {"method_id": "source_disagreement_widen_0_50f", "event_bin_nll": 1.004, "degree_ladder_nll": 1.050},
+            {"method_id": "quantile_calibrated_ladder", "event_bin_nll": 1.020, "degree_ladder_nll": 1.020},
+        ]
+    )
+    slice_metrics = pd.DataFrame(
+        [
+            {"method_id": "bucket_reliability_s1_00", "slice": "high_disagreement", "event_bin_nll": 1.50},
+            {"method_id": "source_disagreement_widen_0_50f", "slice": "high_disagreement", "event_bin_nll": 1.45},
+            {"method_id": "quantile_calibrated_ladder", "slice": "high_disagreement", "event_bin_nll": 1.55},
+        ]
+    )
+    assert select_ladder_method(summary, slice_metrics, max_overall_regression=0.005) == "source_disagreement_widen_0_50f"
+
+
+def test_select_ladder_method_rejects_widening_without_high_disagreement_gain() -> None:
+    summary = pd.DataFrame(
+        [
+            {"method_id": "bucket_reliability_s1_00", "event_bin_nll": 1.000, "degree_ladder_nll": 1.000},
+            {"method_id": "source_disagreement_widen_0_50f", "event_bin_nll": 1.004, "degree_ladder_nll": 1.050},
+        ]
+    )
+    slice_metrics = pd.DataFrame(
+        [
+            {"method_id": "bucket_reliability_s1_00", "slice": "high_disagreement", "event_bin_nll": 1.50},
+            {"method_id": "source_disagreement_widen_0_50f", "slice": "high_disagreement", "event_bin_nll": 1.51},
+        ]
+    )
+    assert select_ladder_method(summary, slice_metrics, max_overall_regression=0.005) == "bucket_reliability_s1_00"
 
 
 def test_event_bin_adapter_and_polymarket_parser() -> None:

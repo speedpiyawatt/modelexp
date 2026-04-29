@@ -57,6 +57,17 @@ Important: HRRR enters as both the selected equal 3-way anchor component and mod
 
 ## Latest Optimization Pass: HRRR Disagreement Regimes
 
+- [x] Add source-trust dynamic anchor and specialist candidate system.
+  - Done 2026-04-29: added `withhrrr_model/source_trust.py`, richer pairwise source deltas, source ranks, warmest/coldest flags, WU-last-temp-vs-source deltas, target month/day-of-year features, median 4-way and trimmed-mean 4-way anchors, fold-local ridge 4-way anchors, weighted source-trust candidate profiles, and an optional source-trust meta residual correction candidate.
+  - Done 2026-04-29: `rolling_origin_model_select.py` now evaluates candidate specs as `(anchor_policy, model_candidate_id, feature_profile, weight_profile, meta_residual)` and writes `rolling_origin_model_selection_source_slices.csv` with high-disagreement and regime-specific probability metrics.
+  - Done 2026-04-29: `train_quantile_models.py`, `build_inference_features.py`, `evaluate.py`, and `predict.py` now read the selected anchor/profile metadata from model-selection/training manifests. If a ridge anchor or meta residual correction is selected, the required metadata/artifact is saved and loaded explicitly.
+  - Eval 2026-04-29: smoke validation over actual training parquet passed with a `source_median_4way` candidate and one rolling split. Commands: `.venv/bin/python -m experiments.withhrrr.withhrrr_model.prepare_training_features`, a temp one-candidate `rolling_origin_model_select`, `train_quantile_models --model-selection-manifest-path ...`, and `evaluate --models-dir ...`.
+  - Eval 2026-04-29: local tests passed: `.venv/bin/python -m py_compile experiments/withhrrr/withhrrr_model/*.py tools/weather/run_server_dual_inference.py` and `.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py` (`26 passed`).
+  - Eval 2026-04-29: full default rolling-origin grid evaluated `32` candidate specs. Selected candidate: `very_regularized_min_leaf70_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted__weights=high_disagreement_weighted`; weighted rolling event-bin NLL `1.462654`, degree-ladder NLL `2.325077`, q50 MAE `1.415372`.
+  - Eval 2026-04-29: dynamic 4-way/native/median/trimmed/ridge anchors and the meta residual candidate were evaluated but not promoted. Top alternatives: `native_warm_hrrr_cold_specialist` event NLL `1.464717`, `hrrr_outlier_specialist` `1.471316`, `hourly_native_lamp_hrrr` anchor `1.488369`, `ridge_4way_anchor` `1.497106`, meta residual `1.496992`.
+  - Eval 2026-04-29: refreshed calibration/distribution/ladder/final model artifacts. Selected quantile calibration `conformal_intervals`, distribution `normal_iqr`, ladder `bucket_reliability_s1_00`. Rolling 2025 ladder-calibrated event-bin NLL/Brier `1.250237/0.607134`; degree NLL/RPS `2.008158/0.009521`.
+  - Eval 2026-04-29: refreshed holdout `2025-05-27..2025-12-31`, `219` rows. Event-bin NLL/Brier `1.372809/0.619639`; degree NLL/RPS `2.149011/0.010002`; q50 MAE/RMSE `1.252238/1.651186`.
+
 - [x] Add source-disagreement robustness layer.
   - Done 2026-04-29: added shared source-regime features for NBM hourly, native NBM TMAX, LAMP, and HRRR. Regimes include `native_warm_hrrr_cold`, `native_cold_hrrr_warm`, HRRR hot/cold outliers, broad/moderate disagreement, tight consensus, and unknown.
   - Done 2026-04-29: `calibrate_rolling_origin.py` now evaluates `source_disagreement_regime_offsets` with hierarchical shrinkage: segment offsets require at least `30` rows and shrink toward global with weight `min(1, count/120)`.

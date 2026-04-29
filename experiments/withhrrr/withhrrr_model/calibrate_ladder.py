@@ -20,6 +20,7 @@ from .distribution import degree_ladder_from_quantiles
 DEFAULT_PREDICTIONS_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet")
 DEFAULT_QUANTILE_CALIBRATION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json")
 DEFAULT_DISTRIBUTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics/distribution_diagnostics_manifest.json")
+DEFAULT_MODEL_SELECTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_manifest.json")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/ladder_calibration")
 FALLBACK_DISTRIBUTION_METHOD_ID = "normal_iqr"
 DistributionMethod = str
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distribution-manifest-path", type=pathlib.Path, default=DEFAULT_DISTRIBUTION_MANIFEST_PATH)
     parser.add_argument("--distribution-method", default="auto", choices=("auto", "interpolation_tail", "interpolation_no_tail", "smoothed_interpolation_tail", "normal_iqr"))
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--candidate-id", default=DEFAULT_MODEL_CANDIDATE_ID)
+    parser.add_argument("--candidate-id", default="auto")
     parser.add_argument("--calibration-valid-end", default="2024-12-31")
     parser.add_argument("--test-valid-start", default="2025-01-01")
     parser.add_argument("--bucket-count", type=int, default=10)
@@ -40,6 +41,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disagreement-widening", default="0.0,0.5,1.0,1.5")
     parser.add_argument("--widening-max-overall-event-nll-regression", type=float, default=0.005)
     return parser.parse_args()
+
+
+def resolve_candidate_id(candidate_id: str) -> str:
+    if candidate_id != "auto":
+        return candidate_id
+    if DEFAULT_MODEL_SELECTION_MANIFEST_PATH.exists():
+        payload = json.loads(DEFAULT_MODEL_SELECTION_MANIFEST_PATH.read_text())
+        selected = payload.get("selected_candidate_id")
+        if isinstance(selected, str) and selected:
+            return selected
+    return DEFAULT_MODEL_CANDIDATE_ID
 
 
 def parse_shrinkage_grid(value: str) -> list[float]:
@@ -295,33 +307,44 @@ def score_records_by_disagreement_slice(records: pd.DataFrame, *, method_id: str
 def select_ladder_method(summary: pd.DataFrame, slice_metrics: pd.DataFrame, *, max_overall_regression: float) -> str:
     sorted_summary = summary.sort_values(["event_bin_nll", "degree_ladder_nll"]).reset_index(drop=True)
     best_by_overall = str(sorted_summary.iloc[0]["method_id"])
-    if not best_by_overall.startswith("source_disagreement_widen_"):
+    non_widening = sorted_summary.loc[~sorted_summary["method_id"].astype(str).str.startswith("source_disagreement_widen_")]
+    if non_widening.empty:
         return best_by_overall
-    baseline = sorted_summary.loc[sorted_summary["method_id"] == "quantile_calibrated_ladder"]
-    if baseline.empty:
-        baseline = sorted_summary.iloc[[0]]
-    baseline_event_nll = float(baseline.iloc[0]["event_bin_nll"])
+    baseline = non_widening.iloc[0]
+    baseline_method_id = str(baseline["method_id"])
+    baseline_event_nll = float(baseline["event_bin_nll"])
     high = slice_metrics.loc[slice_metrics["slice"] == "high_disagreement"].copy()
     if high.empty:
-        return best_by_overall
-    baseline_high = high.loc[high["method_id"] == "quantile_calibrated_ladder"]
-    candidate_high = high.loc[high["method_id"] == best_by_overall]
-    if baseline_high.empty or candidate_high.empty:
-        return best_by_overall
-    candidate_event_nll = float(sorted_summary.loc[sorted_summary["method_id"] == best_by_overall, "event_bin_nll"].iloc[0])
-    high_improvement = float(baseline_high["event_bin_nll"].iloc[0]) - float(candidate_high["event_bin_nll"].iloc[0])
-    if candidate_event_nll <= baseline_event_nll + float(max_overall_regression) and high_improvement > 0.0:
-        return best_by_overall
-    return str(sorted_summary.loc[~sorted_summary["method_id"].astype(str).str.startswith("source_disagreement_widen_")].iloc[0]["method_id"])
+        return baseline_method_id
+    baseline_high = high.loc[high["method_id"] == baseline_method_id]
+    if baseline_high.empty:
+        baseline_high = high.loc[high["method_id"] == "quantile_calibrated_ladder"]
+    if baseline_high.empty:
+        return baseline_method_id
+    baseline_high_event_nll = float(baseline_high["event_bin_nll"].iloc[0])
+    widening_candidates = sorted_summary.loc[sorted_summary["method_id"].astype(str).str.startswith("source_disagreement_widen_")]
+    for _, candidate in widening_candidates.iterrows():
+        candidate_method_id = str(candidate["method_id"])
+        candidate_event_nll = float(candidate["event_bin_nll"])
+        if candidate_event_nll > baseline_event_nll + float(max_overall_regression):
+            continue
+        candidate_high = high.loc[high["method_id"] == candidate_method_id]
+        if candidate_high.empty:
+            continue
+        high_improvement = baseline_high_event_nll - float(candidate_high["event_bin_nll"].iloc[0])
+        if high_improvement > 0.0:
+            return candidate_method_id
+    return baseline_method_id
 
 
 def main() -> int:
     args = parse_args()
+    candidate_id = resolve_candidate_id(str(args.candidate_id))
     df = pd.read_parquet(args.predictions_path)
     if "candidate_id" in df.columns:
-        df = df.loc[df["candidate_id"].astype(str) == str(args.candidate_id)].copy()
+        df = df.loc[df["candidate_id"].astype(str) == candidate_id].copy()
     if df.empty:
-        raise ValueError(f"no rolling-origin predictions for candidate_id={args.candidate_id}")
+        raise ValueError(f"no rolling-origin predictions for candidate_id={candidate_id}")
     manifest = json.loads(args.quantile_calibration_manifest_path.read_text())
     calibration_df = df.loc[df["target_date_local"].astype(str) <= args.calibration_valid_end].copy()
     test_df = df.loc[df["target_date_local"].astype(str) >= args.test_valid_start].copy()
@@ -379,7 +402,7 @@ def main() -> int:
         "quantile_calibration_manifest_path": str(args.quantile_calibration_manifest_path),
         "distribution_manifest_path": str(args.distribution_manifest_path),
         "distribution_method": distribution_method,
-        "candidate_id": args.candidate_id,
+        "candidate_id": candidate_id,
         "calibration_valid_end": args.calibration_valid_end,
         "test_valid_start": args.test_valid_start,
         "calibration_row_count": int(calibration_frame[["target_date_local", "station_id"]].drop_duplicates().shape[0]),

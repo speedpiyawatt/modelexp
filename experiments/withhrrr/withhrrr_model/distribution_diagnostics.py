@@ -25,6 +25,7 @@ from .train_quantile_models import DEFAULT_QUANTILES, quantile_tag
 DEFAULT_PREDICTIONS_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet")
 DEFAULT_QUANTILE_CALIBRATION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection/rolling_origin_calibration_manifest.json")
 DEFAULT_MODEL_SELECTION_SUMMARY_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_summary.csv")
+DEFAULT_MODEL_SELECTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_manifest.json")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/distribution_diagnostics")
 
 
@@ -34,10 +35,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quantile-calibration-manifest-path", type=pathlib.Path, default=DEFAULT_QUANTILE_CALIBRATION_MANIFEST_PATH)
     parser.add_argument("--model-selection-summary-path", type=pathlib.Path, default=DEFAULT_MODEL_SELECTION_SUMMARY_PATH)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--candidate-id", default=DEFAULT_MODEL_CANDIDATE_ID)
+    parser.add_argument("--candidate-id", default="auto")
     parser.add_argument("--distribution-test-valid-start", default="2025-01-01")
     parser.add_argument("--crossing-penalty-weight", type=float, default=0.10)
     return parser.parse_args()
+
+
+def resolve_candidate_id(candidate_id: str) -> str:
+    if candidate_id != "auto":
+        return candidate_id
+    if DEFAULT_MODEL_SELECTION_MANIFEST_PATH.exists():
+        payload = json.loads(DEFAULT_MODEL_SELECTION_MANIFEST_PATH.read_text())
+        selected = payload.get("selected_candidate_id")
+        if isinstance(selected, str) and selected:
+            return selected
+    return DEFAULT_MODEL_CANDIDATE_ID
 
 
 def raw_final_quantile_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -230,14 +242,15 @@ def crossing_candidate_summary(crossing: pd.DataFrame, model_selection_summary_p
 
 def main() -> int:
     args = parse_args()
+    candidate_id = resolve_candidate_id(str(args.candidate_id))
     df = pd.read_parquet(args.predictions_path)
     if df.empty:
         raise ValueError("distribution diagnostics require non-empty rolling-origin predictions")
     crossing = crossing_diagnostics(df)
     candidate_crossing = crossing_candidate_summary(crossing, args.model_selection_summary_path, penalty_weight=args.crossing_penalty_weight)
-    selected_df = df.loc[df["candidate_id"].astype(str) == str(args.candidate_id)].copy()
+    selected_df = df.loc[df["candidate_id"].astype(str) == candidate_id].copy()
     if selected_df.empty:
-        raise ValueError(f"no predictions for candidate_id={args.candidate_id}")
+        raise ValueError(f"no predictions for candidate_id={candidate_id}")
     calibration_manifest = json.loads(args.quantile_calibration_manifest_path.read_text())
     distribution_test_df = selected_df.loc[selected_df["target_date_local"].astype(str) >= args.distribution_test_valid_start].copy()
     if distribution_test_df.empty:
@@ -260,7 +273,7 @@ def main() -> int:
         "built_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "predictions_path": str(args.predictions_path),
         "quantile_calibration_manifest_path": str(args.quantile_calibration_manifest_path),
-        "candidate_id": args.candidate_id,
+        "candidate_id": candidate_id,
         "crossing_diagnostics_path": str(crossing_path),
         "crossing_candidate_summary_path": str(candidate_crossing_path),
         "crossing_penalty_weight": float(args.crossing_penalty_weight),

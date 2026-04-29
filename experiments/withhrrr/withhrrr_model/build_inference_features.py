@@ -101,6 +101,9 @@ def prediction_available(model_ready: pd.DataFrame) -> pd.Series:
 
 def main() -> int:
     args = parse_args()
+    feature_manifest = load_json(args.feature_manifest_path)
+    anchor_policy = str(feature_manifest.get("anchor_policy", "equal_3way"))
+    ridge_metadata = feature_manifest.get("ridge_anchor_metadata") if isinstance(feature_manifest.get("ridge_anchor_metadata"), dict) else None
     label_history_df = filter_label_history_for_inference(
         _read_parquet(args.label_history_path),
         target_date_local=args.target_date_local,
@@ -137,7 +140,7 @@ def main() -> int:
         raise ValueError(f"failed to build inference row for {args.station_id} {args.target_date_local}")
 
     normalized = normalize_training_features_overnight(unnormalized, load_vocabularies(args.vocab_path))
-    model_ready = build_training_table(normalized, hrrr=None)
+    model_ready = build_training_table(normalized, hrrr=None, anchor_policy=anchor_policy, ridge_metadata=ridge_metadata)
     model_ready["model_prediction_available"] = prediction_available(model_ready)
     if not bool(model_ready["model_prediction_available"].iloc[0]):
         availability = {
@@ -147,7 +150,7 @@ def main() -> int:
         }
         raise ValueError(f"with-HRRR prediction sources unavailable for {args.station_id} {args.target_date_local}: {availability}")
 
-    feature_columns = list(load_json(args.feature_manifest_path)["feature_columns"])
+    feature_columns = list(feature_manifest["feature_columns"])
     for column in feature_columns:
         if column not in model_ready.columns:
             model_ready[column] = pd.NA
@@ -173,6 +176,10 @@ def main() -> int:
         "unnormalized_path": str(unnormalized_path),
         "normalized_path": str(normalized_path),
         "feature_count": len(feature_columns),
+        "anchor_policy": anchor_policy,
+        "feature_profile": feature_manifest.get("feature_profile"),
+        "weight_profile": feature_manifest.get("weight_profile"),
+        "meta_residual": feature_manifest.get("meta_residual"),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     print(normalized_path)

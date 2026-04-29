@@ -20,11 +20,18 @@ HRRR-only is not good enough to be the whole model. On the 2025 holdout, HRRR-on
 
 - Model candidate: `very_regularized_min_leaf70_lgbm_350`
 - Anchor policy: `equal_3way`
-- Quantile calibration: `hrrr_nbm_direction_offsets`
+- Feature/weight profile: `high_disagreement_weighted`
+- Quantile calibration: `conformal_intervals`
 - Distribution method: `normal_iqr`
 - Ladder reliability calibration: `bucket_reliability_s1_00`
-- Feature count: `316`
+- Feature count: `350`
 - Training rows: `1,094` eligible rows from `2023-01-01` through `2025-12-31`
+
+Source-trust upgrade status:
+
+- Implemented and validated 2026-04-29.
+- Rolling model selection can now evaluate dynamic anchors (`equal_3way`, 4-way native/NBM/LAMP/HRRR, median 4-way, trimmed-mean 4-way, fold-local ridge 4-way), source-trust feature profiles, weighted disagreement specialists, and an optional meta residual correction.
+- Full rolling-origin validation selected the high-disagreement-weighted profile on the existing equal-3way anchor. Dynamic 4-way, median, trimmed, ridge, and meta residual variants were evaluated but not promoted.
 
 ## Current Metrics
 
@@ -32,9 +39,9 @@ Single holdout, `2025-05-27..2025-12-31`, `219` rows:
 
 | Metric | Value |
 | --- | ---: |
-| q50 MAE/RMSE | `1.2589 / 1.6305` |
-| degree NLL/Brier/RPS | `2.182397 / 0.822290 / 0.010258` |
-| event-bin NLL/Brier | `1.411969 / 0.620390` |
+| q50 MAE/RMSE | `1.2522 / 1.6512` |
+| degree NLL/Brier/RPS | `2.149011 / 0.820223 / 0.010002` |
+| event-bin NLL/Brier | `1.372809 / 0.619639` |
 
 Rolling 2025 calibration test, `365` rows:
 
@@ -43,7 +50,7 @@ Rolling 2025 calibration test, `365` rows:
 | uncalibrated quantiles + interpolation | `1.370969` | `0.622307` | `2.233741` | `0.010356` |
 | conformal quantiles + interpolation | `1.274655` | `0.615411` | `2.071875` | `0.010205` |
 | conformal quantiles + `normal_iqr` | `1.261539` | `0.616776` | `2.024162` | `0.009516` |
-| selected equal-3-way-anchor quantiles + `normal_iqr` + ladder reliability | `1.240912` | `0.603902` | `1.999327` | `0.009510` |
+| selected source-trust quantiles + `normal_iqr` + ladder reliability | `1.250237` | `0.607134` | `2.008158` | `0.009521` |
 
 Source-disagreement robustness, rolling 2025 calibration test:
 
@@ -88,6 +95,13 @@ Run rolling-origin model selection:
 ```bash
 rm -rf experiments/withhrrr/data/runtime/evaluation/model_selection
 .venv/bin/python -m experiments.withhrrr.withhrrr_model.rolling_origin_model_select
+```
+
+After model selection, retrain production artifacts from the selected manifest:
+
+```bash
+rm -rf experiments/withhrrr/data/runtime/models
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models
 ```
 
 Run HRRR ablation:

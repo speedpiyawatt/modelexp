@@ -23,7 +23,6 @@ DEFAULT_DISTRIBUTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/run
 DEFAULT_LADDER_CALIBRATION_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/ladder_calibration/ladder_calibration_manifest.json")
 FALLBACK_DISTRIBUTION_METHOD_ID = "normal_iqr"
 DISTRIBUTION_METHOD_IDS = ["auto", "interpolation_tail", "interpolation_no_tail", "smoothed_interpolation_tail", "normal_iqr"]
-ANCHOR_POLICY = "feature_anchor_tmax_f"
 
 
 def parse_args() -> argparse.Namespace:
@@ -330,6 +329,8 @@ def main() -> int:
     args = parse_args()
     feature_manifest = load_json(args.models_dir / "feature_manifest.json")
     feature_columns = list(feature_manifest["feature_columns"])
+    anchor_policy = str(feature_manifest.get("anchor_policy", "feature_anchor_tmax_f"))
+    meta_residual_enabled = bool(feature_manifest.get("meta_residual", False))
     df = pd.read_parquet(args.features_path)
     row = select_row(df, target_date_local=args.target_date_local, station_id=args.station_id)
     x = prepare_features(row, feature_columns)
@@ -362,6 +363,19 @@ def main() -> int:
         residual_quantiles[float(quantile)] = residual
         raw_final_values.append(anchor_tmax_f + residual + offsets.get(tag, 0.0))
 
+    meta_residual_correction_f = 0.0
+    if meta_residual_enabled:
+        meta_model_path = args.models_dir / "meta_residual_correction.txt"
+        if not meta_model_path.exists():
+            raise ValueError(f"meta residual correction selected but model file is missing: {meta_model_path}")
+        meta_x = x.copy()
+        q50_residual = residual_quantiles[0.5]
+        meta_x["base_pred_q50_f"] = anchor_tmax_f + q50_residual
+        meta_x["base_residual_q50_f"] = q50_residual
+        meta_booster = lgb.Booster(model_file=str(meta_model_path))
+        meta_residual_correction_f = float(meta_booster.predict(meta_x, num_iteration=meta_booster.best_iteration)[0])
+        raw_final_values = [value + meta_residual_correction_f for value in raw_final_values]
+
     rearranged_final_values = np.maximum.accumulate(np.asarray(raw_final_values, dtype=float))
     for quantile, value in zip(DEFAULT_QUANTILES, rearranged_final_values):
         final_quantiles[float(quantile)] = float(value)
@@ -391,7 +405,14 @@ def main() -> int:
         "target_date_local": args.target_date_local,
         "station_id": args.station_id,
         "anchor_tmax_f": anchor_tmax_f,
-        "anchor_policy": ANCHOR_POLICY,
+        "anchor_policy": anchor_policy,
+        "feature_profile": feature_manifest.get("feature_profile"),
+        "weight_profile": feature_manifest.get("weight_profile"),
+        "model_selection_manifest_path": feature_manifest.get("model_selection_manifest_path"),
+        "meta_residual": {
+            "enabled": meta_residual_enabled,
+            "correction_f": meta_residual_correction_f,
+        },
         "expected_final_tmax_f": expected_temperature(ladder),
         "residual_quantiles_f": {str(key): value for key, value in residual_quantiles.items()},
         "final_tmax_quantiles_f": {str(key): value for key, value in final_quantiles.items()},

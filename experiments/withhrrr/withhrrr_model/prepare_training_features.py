@@ -8,6 +8,7 @@ import pathlib
 import pandas as pd
 
 from .source_disagreement import add_source_disagreement_features
+from .source_trust import SOURCE_TRUST_FEATURE_COLUMNS, add_source_trust_features, apply_anchor_policy
 
 
 DEFAULT_BASE_PATH = pathlib.Path(
@@ -27,6 +28,8 @@ ANCHOR_POLICIES = (
     "hourly_native_lamp_hrrr",
     "native_lamp",
     "equal_3way",
+    "source_median_4way",
+    "source_trimmed_mean_4way",
 )
 
 
@@ -158,41 +161,6 @@ def _prepare_base_columns(base: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
-def apply_anchor_policy(df: pd.DataFrame, *, anchor_policy: str) -> pd.DataFrame:
-    if anchor_policy not in ANCHOR_POLICIES:
-        raise ValueError(f"unknown anchor_policy={anchor_policy!r}")
-    out = df.copy()
-    nbm = _numeric_column(out, "nbm_tmax_open_f")
-    native = _numeric_column(out, "nbm_native_tmax_2m_day_max_f")
-    lamp = _numeric_column(out, "lamp_tmax_open_f")
-    hrrr = _numeric_column(out, "hrrr_tmax_open_f")
-
-    out["anchor_current_50_50_tmax_f"] = 0.5 * nbm + 0.5 * lamp
-    out["anchor_hourly_native_lamp_tmax_f"] = (nbm + native + lamp) / 3.0
-    out["anchor_hourly_native_lamp_hrrr_tmax_f"] = (nbm + native + lamp + hrrr) / 4.0
-    out["anchor_native_lamp_tmax_f"] = 0.5 * native + 0.5 * lamp
-    out["anchor_equal_3way_tmax_f"] = (hrrr + lamp + nbm) / 3.0
-
-    policy_columns = {
-        "current_50_50": "anchor_current_50_50_tmax_f",
-        "hourly_native_lamp": "anchor_hourly_native_lamp_tmax_f",
-        "hourly_native_lamp_hrrr": "anchor_hourly_native_lamp_hrrr_tmax_f",
-        "native_lamp": "anchor_native_lamp_tmax_f",
-        "equal_3way": "anchor_equal_3way_tmax_f",
-    }
-    out["anchor_tmax_f"] = _numeric_column(out, policy_columns[anchor_policy])
-    out["anchor_policy"] = anchor_policy
-    out["nbm_native_tmax_minus_anchor_f"] = native - _numeric_column(out, "anchor_tmax_f")
-    out["nbm_native_tmax_minus_nbm_tmax_f"] = native - nbm
-    out["abs_nbm_native_tmax_minus_anchor_f"] = out["nbm_native_tmax_minus_anchor_f"].abs()
-    out["abs_nbm_native_tmax_minus_nbm_tmax_f"] = out["nbm_native_tmax_minus_nbm_tmax_f"].abs()
-    out["nbm_native_tmax_above_anchor_2f"] = (out["nbm_native_tmax_minus_anchor_f"] >= 2.0).astype("boolean")
-    out["nbm_native_tmax_below_anchor_2f"] = (out["nbm_native_tmax_minus_anchor_f"] <= -2.0).astype("boolean")
-    out["nbm_native_tmax_above_hourly_nbm_2f"] = (out["nbm_native_tmax_minus_nbm_tmax_f"] >= 2.0).astype("boolean")
-    out["nbm_native_tmax_below_hourly_nbm_2f"] = (out["nbm_native_tmax_minus_nbm_tmax_f"] <= -2.0).astype("boolean")
-    return out
-
-
 def _prepare_hrrr_disagreement_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "hrrr_tmax_open_f" not in out.columns:
@@ -220,7 +188,8 @@ def _prepare_hrrr_disagreement_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["hrrr_colder_than_lamp_3f"] = (out["hrrr_minus_lamp_tmax_f"] <= -3.0).astype("boolean")
     out["hrrr_hotter_than_nbm_3f"] = (out["hrrr_minus_nbm_tmax_f"] >= 3.0).astype("boolean")
     out["hrrr_colder_than_nbm_3f"] = (out["hrrr_minus_nbm_tmax_f"] <= -3.0).astype("boolean")
-    return add_source_disagreement_features(out)
+    out = add_source_disagreement_features(out)
+    return add_source_trust_features(out)
 
 
 def build_training_table(
@@ -228,6 +197,7 @@ def build_training_table(
     hrrr: pd.DataFrame | None = None,
     *,
     anchor_policy: str = DEFAULT_ANCHOR_POLICY,
+    ridge_metadata: dict[str, object] | None = None,
 ) -> pd.DataFrame:
     if base.empty:
         raise ValueError("base normalized training table is empty")
@@ -255,7 +225,7 @@ def build_training_table(
             merged["meta_hrrr_available"] = True
     merged["meta_hrrr_available"] = merged["meta_hrrr_available"].astype("boolean").fillna(False)
     merged = _prepare_hrrr_disagreement_columns(merged)
-    merged = apply_anchor_policy(merged, anchor_policy=anchor_policy)
+    merged = apply_anchor_policy(merged, anchor_policy=anchor_policy, ridge_metadata=ridge_metadata)
 
     label = pd.to_numeric(merged["label_final_tmax_f"], errors="coerce")
     anchor = pd.to_numeric(merged["anchor_tmax_f"], errors="coerce")
@@ -315,6 +285,8 @@ def build_manifest(
         "hrrr_root": str(hrrr_root),
         "output_path": str(output_path),
         "anchor_policy": anchor_policy,
+        "anchor_columns": sorted(column for column in df.columns if column.startswith("anchor_") and column.endswith("_tmax_f")),
+        "source_trust_feature_count": int(sum(1 for column in SOURCE_TRUST_FEATURE_COLUMNS if column in df.columns)),
         "row_count": int(len(df)),
         "column_count": int(len(df.columns)),
         "target_date_min": str(dates.min()) if len(df) else None,

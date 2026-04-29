@@ -17,6 +17,7 @@ from .train_quantile_models import DEFAULT_QUANTILES, quantile_tag
 
 
 DEFAULT_PREDICTIONS_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_predictions.parquet")
+DEFAULT_MODEL_SELECTION_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_manifest.json")
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/calibration_selection")
 
 
@@ -24,11 +25,22 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fit rolling-origin calibration on earlier holdouts and test on later holdouts.")
     parser.add_argument("--predictions-path", type=pathlib.Path, default=DEFAULT_PREDICTIONS_PATH)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--candidate-id", default=DEFAULT_MODEL_CANDIDATE_ID)
+    parser.add_argument("--candidate-id", default="auto")
     parser.add_argument("--calibration-valid-end", default="2024-12-31")
     parser.add_argument("--test-valid-start", default="2025-01-01")
     parser.add_argument("--min-segment-rows", type=int, default=60)
     return parser.parse_args()
+
+
+def resolve_candidate_id(candidate_id: str) -> str:
+    if candidate_id != "auto":
+        return candidate_id
+    if DEFAULT_MODEL_SELECTION_MANIFEST_PATH.exists():
+        payload = json.loads(DEFAULT_MODEL_SELECTION_MANIFEST_PATH.read_text())
+        selected = payload.get("selected_candidate_id")
+        if isinstance(selected, str) and selected:
+            return selected
+    return DEFAULT_MODEL_CANDIDATE_ID
 
 
 def interval_score(df: pd.DataFrame, *, prefix: str, lower_tag: str, upper_tag: str, alpha: float) -> float:
@@ -354,11 +366,12 @@ def apply_method_config(df: pd.DataFrame, method_id: str, config: dict[str, obje
 
 def main() -> int:
     args = parse_args()
+    candidate_id = resolve_candidate_id(str(args.candidate_id))
     df = pd.read_parquet(args.predictions_path)
     if "candidate_id" in df.columns:
-        df = df.loc[df["candidate_id"].astype(str) == str(args.candidate_id)].copy()
+        df = df.loc[df["candidate_id"].astype(str) == candidate_id].copy()
     if df.empty:
-        raise ValueError(f"no rolling-origin predictions for candidate_id={args.candidate_id}")
+        raise ValueError(f"no rolling-origin predictions for candidate_id={candidate_id}")
     calibration_df = df.loc[df["target_date_local"].astype(str) <= args.calibration_valid_end].copy()
     test_df = df.loc[df["target_date_local"].astype(str) >= args.test_valid_start].copy()
     if calibration_df.empty or test_df.empty:
@@ -387,7 +400,7 @@ def main() -> int:
         "status": "ok",
         "built_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "predictions_path": str(args.predictions_path),
-        "candidate_id": args.candidate_id,
+        "candidate_id": candidate_id,
         "calibration_valid_end": args.calibration_valid_end,
         "test_valid_start": args.test_valid_start,
         "calibration_row_count": int(len(calibration_df)),

@@ -12,6 +12,7 @@ import pandas as pd
 from .distribution import quantiles_to_degree_ladder
 from .event_bins import EventBin, load_event_bin_labels, map_ladder_to_bins, parse_event_bin
 from .source_disagreement import DISAGREEMENT_WIDENING_REGIMES, add_source_disagreement_features
+from .source_trust import apply_anchor_and_residual
 from .train_quantile_models import DEFAULT_QUANTILES, pinball_loss
 
 
@@ -485,6 +486,9 @@ def main() -> int:
     validation_start_date = str(training_manifest["validation_start_date"])
 
     df = pd.read_parquet(args.features_path)
+    anchor_policy = str(feature_manifest.get("anchor_policy", training_manifest.get("anchor_policy", "equal_3way")))
+    ridge_metadata = feature_manifest.get("ridge_anchor_metadata") if isinstance(feature_manifest.get("ridge_anchor_metadata"), dict) else None
+    df = apply_anchor_and_residual(df, anchor_policy=anchor_policy, ridge_metadata=ridge_metadata)
     eligible = df.loc[df["model_training_eligible"].astype("boolean").fillna(False)].copy()
     train_df = eligible.loc[eligible["target_date_local"].astype(str) < validation_start_date].copy()
     valid_df = eligible.loc[eligible["target_date_local"].astype(str) >= validation_start_date].copy()
@@ -531,10 +535,12 @@ def main() -> int:
     prediction_df = valid_df[[column for column in diagnostic_columns if column in valid_df.columns]].copy()
     prediction_df = add_source_disagreement_features(prediction_df)
     pinball_rows: list[dict[str, object]] = []
+    residual_predictions: dict[str, np.ndarray] = {}
     for quantile in DEFAULT_QUANTILES:
         tag = quantile_tag(quantile)
         booster = lgb.Booster(model_file=str(args.models_dir / f"residual_quantile_{tag}.txt"))
         residual_pred = booster.predict(valid_x, num_iteration=booster.best_iteration)
+        residual_predictions[tag] = residual_pred
         final_pred = pd.to_numeric(valid_df["anchor_tmax_f"], errors="coerce").to_numpy(float) + residual_pred
         prediction_df[f"pred_residual_{tag}_f"] = residual_pred
         prediction_df[f"pred_tmax_{tag}_raw_f"] = final_pred
@@ -547,6 +553,26 @@ def main() -> int:
                 "final_tmax_pinball_loss": pinball_loss(valid_y_final.to_numpy(float), final_pred, quantile),
             }
         )
+
+    if bool(feature_manifest.get("meta_residual", False)):
+        meta_model_path = args.models_dir / "meta_residual_correction.txt"
+        if not meta_model_path.exists():
+            raise ValueError(f"meta residual correction selected but model file is missing: {meta_model_path}")
+        meta_x = valid_x.copy()
+        valid_anchor = pd.to_numeric(valid_df["anchor_tmax_f"], errors="coerce").to_numpy(float)
+        meta_x["base_pred_q50_f"] = valid_anchor + residual_predictions["q50"]
+        meta_x["base_residual_q50_f"] = residual_predictions["q50"]
+        meta_booster = lgb.Booster(model_file=str(meta_model_path))
+        correction = meta_booster.predict(meta_x, num_iteration=meta_booster.best_iteration)
+        prediction_df["pred_meta_residual_correction_f"] = correction
+        for quantile in DEFAULT_QUANTILES:
+            tag = quantile_tag(quantile)
+            prediction_df[f"pred_tmax_{tag}_raw_f"] = prediction_df[f"pred_tmax_{tag}_raw_f"] + correction
+            prediction_df[f"pred_tmax_{tag}_f"] = prediction_df[f"pred_tmax_{tag}_f"] + correction
+        for row in pinball_rows:
+            tag = str(row["tag"])
+            quantile = float(row["quantile"])
+            row["final_tmax_pinball_loss"] = pinball_loss(valid_y_final.to_numpy(float), prediction_df[f"pred_tmax_{tag}_f"].to_numpy(float), quantile)
 
     final_quantile_columns = [f"pred_tmax_{quantile_tag(q)}_f" for q in DEFAULT_QUANTILES]
     raw_final_quantile_columns = [f"pred_tmax_{quantile_tag(q)}_raw_f" for q in DEFAULT_QUANTILES]

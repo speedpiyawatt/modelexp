@@ -120,6 +120,45 @@ Result:
 - Selected ladder calibration remains `bucket_reliability_s1_00`.
 - Diagnostics are available in `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
 
+### Source-Trust Model Upgrade
+
+Status: done
+
+Goal:
+
+- Keep the base residual LightGBM quantile model family.
+- Evaluate dynamic anchors, source-trust interaction features, weighted disagreement specialists, and an optional meta residual correction.
+- Promote only if rolling-origin validation improves overall probability metrics or stays within `+0.005` overall event-bin NLL while improving high-disagreement event-bin NLL by at least `0.02`.
+
+Implemented 2026-04-29:
+
+- Added `withhrrr_model/source_trust.py` with richer source deltas, source ranks, WU-last-temp-vs-source deltas, median/trimmed anchors, fold-local ridge anchor helpers, and source-regime training weights.
+- Extended `prepare_training_features.py` with `source_median_4way` and `source_trimmed_mean_4way` anchor policies and source-trust features.
+- Extended `rolling_origin_model_select.py` so evaluated candidates are full specs: anchor policy, model candidate, feature profile, weight profile, and optional meta residual correction.
+- Extended production training/inference so selected anchor/profile metadata is read from manifests. Ridge anchors and meta residual models require explicit saved artifacts when selected.
+
+Verification 2026-04-29:
+
+```bash
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.prepare_training_features
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.rolling_origin_model_select --candidate-config-path /tmp/.../candidates.json --splits-path /tmp/.../splits.json --output-dir /tmp/.../out
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models --model-selection-manifest-path /tmp/.../out/rolling_origin_model_selection_manifest.json --output-dir /tmp/.../models
+.venv/bin/python -m experiments.withhrrr.withhrrr_model.evaluate --models-dir /tmp/.../models --output-dir /tmp/.../eval
+.venv/bin/python -m py_compile experiments/withhrrr/withhrrr_model/*.py tools/weather/run_server_dual_inference.py
+.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py
+```
+
+Result:
+
+- Smoke candidate used `source_median_4way` and completed rolling selection, production training, and holdout evaluation.
+- Unit suite passed with `26` tests.
+- Full default rolling-origin grid evaluated `32` candidate specs.
+- Selected candidate: `very_regularized_min_leaf70_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted__weights=high_disagreement_weighted`.
+- Selected model metadata: anchor `equal_3way`, feature profile `high_disagreement_weighted`, weight profile `high_disagreement_weighted`, no meta residual.
+- Rolling selection metrics: event-bin NLL `1.462654`, degree-ladder NLL `2.325077`, q50 MAE `1.415372`.
+- Refreshed selected downstream defaults: `conformal_intervals`, `normal_iqr`, `bucket_reliability_s1_00`.
+- Refreshed holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.372809/0.619639`, degree NLL/RPS `2.149011/0.010002`, q50 MAE/RMSE `1.252238/1.651186`.
+
 ### 1. Stage HRRR Overnight Summary Data
 
 Status: done

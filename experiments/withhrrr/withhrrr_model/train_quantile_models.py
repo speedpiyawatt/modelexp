@@ -9,13 +9,17 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from .model_config import DEFAULT_MODEL_CANDIDATE_ID, DEFAULT_QUANTILES, RANDOM_SEED, selected_model_candidate
+from .model_config import DEFAULT_MODEL_CANDIDATE_ID, DEFAULT_QUANTILES, RANDOM_SEED, candidate_by_id, selected_model_candidate
+from .source_trust import apply_anchor_and_residual, fit_ridge_4way_anchor, source_trust_feature_subset, training_weights
 
 
 DEFAULT_INPUT_PATH = pathlib.Path(
     "experiments/withhrrr/data/runtime/training/training_features_overnight_withhrrr_model.parquet"
 )
 DEFAULT_OUTPUT_DIR = pathlib.Path("experiments/withhrrr/data/runtime/models")
+DEFAULT_MODEL_SELECTION_MANIFEST_PATH = pathlib.Path(
+    "experiments/withhrrr/data/runtime/evaluation/model_selection/rolling_origin_model_selection_manifest.json"
+)
 DEFAULT_VALIDATION_FRACTION = 0.20
 
 IDENTITY_COLUMNS = {"target_date_local", "station_id", "selection_cutoff_local"}
@@ -28,13 +32,8 @@ NON_FEATURE_COLUMNS = {
     "target_residual_f",
     "model_training_eligible",
     "model_prediction_available",
-    "source_spread_f",
-    "source_median_tmax_f",
     "warmest_source",
     "coldest_source",
-    "native_minus_hrrr_f",
-    "hrrr_minus_source_median_f",
-    "native_minus_source_median_f",
     "source_disagreement_regime",
 }
 NON_FEATURE_SUBSTRINGS = (
@@ -51,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train with-HRRR residual LightGBM quantile models.")
     parser.add_argument("--input-path", type=pathlib.Path, default=DEFAULT_INPUT_PATH)
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--model-selection-manifest-path", type=pathlib.Path, default=DEFAULT_MODEL_SELECTION_MANIFEST_PATH)
     parser.add_argument("--validation-fraction", type=float, default=DEFAULT_VALIDATION_FRACTION)
     parser.add_argument("--min-train-rows", type=int, default=100)
     return parser.parse_args()
@@ -142,17 +142,18 @@ def train_validation_split(
 
 def train_one_quantile(
     *,
+    selected_candidate: dict[str, object],
     quantile: float,
     x_train: pd.DataFrame,
     y_train: pd.Series,
     x_valid: pd.DataFrame,
     y_valid: pd.Series,
+    train_weight: pd.Series | None = None,
 ) -> tuple[lgb.Booster, dict[str, float]]:
-    selected_candidate = selected_model_candidate()
     candidate_params = selected_candidate["params"]
     if not isinstance(candidate_params, dict):
         raise ValueError(f"selected candidate {DEFAULT_MODEL_CANDIDATE_ID} params must be a dict")
-    train_data = lgb.Dataset(x_train, label=y_train, free_raw_data=False)
+    train_data = lgb.Dataset(x_train, label=y_train, weight=train_weight, free_raw_data=False)
     valid_data = lgb.Dataset(x_valid, label=y_valid, reference=train_data, free_raw_data=False)
     params = {
         "objective": "quantile",
@@ -181,6 +182,41 @@ def train_one_quantile(
     return booster, metrics
 
 
+def train_meta_residual_model(
+    *,
+    x_train: pd.DataFrame,
+    y_train_final: pd.Series,
+    base_q50_final_train: np.ndarray,
+    base_q50_residual_train: np.ndarray,
+    train_weight: pd.Series | None = None,
+) -> tuple[lgb.Booster, dict[str, float]]:
+    meta_x = x_train.copy()
+    meta_x["base_pred_q50_f"] = base_q50_final_train
+    meta_x["base_residual_q50_f"] = base_q50_residual_train
+    meta_y = pd.to_numeric(y_train_final, errors="coerce").to_numpy(float) - base_q50_final_train
+    train_data = lgb.Dataset(meta_x, label=meta_y, weight=train_weight, free_raw_data=False)
+    params = {
+        "objective": "regression_l2",
+        "metric": "rmse",
+        "learning_rate": 0.025,
+        "num_leaves": 7,
+        "max_depth": 3,
+        "min_data_in_leaf": 40,
+        "feature_fraction": 0.80,
+        "bagging_fraction": 0.80,
+        "bagging_freq": 1,
+        "lambda_l2": 8.0,
+        "verbosity": -1,
+        "seed": RANDOM_SEED,
+    }
+    booster = lgb.train(params, train_data, num_boost_round=180)
+    pred = booster.predict(meta_x)
+    return booster, {
+        "train_correction_mae_f": float(np.mean(np.abs(meta_y - pred))),
+        "train_correction_rmse_f": float(np.sqrt(np.mean((meta_y - pred) ** 2))),
+    }
+
+
 def feature_prefix_counts(feature_columns: list[str]) -> dict[str, int]:
     prefixes = ("wu_", "nbm_", "lamp_", "hrrr_", "meta_")
     return {prefix: sum(1 for column in feature_columns if column.startswith(prefix)) for prefix in prefixes}
@@ -191,14 +227,41 @@ def write_json(path: pathlib.Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def selected_training_spec(manifest_path: pathlib.Path) -> dict[str, object]:
+    if manifest_path.exists():
+        payload = json.loads(manifest_path.read_text())
+        spec = payload.get("selected_candidate_spec")
+        if isinstance(spec, dict):
+            return {
+                "model_candidate_id": str(spec.get("model_candidate_id", DEFAULT_MODEL_CANDIDATE_ID)),
+                "anchor_policy": str(spec.get("anchor_policy", "equal_3way")),
+                "feature_profile": str(spec.get("feature_profile", "global_all_features")),
+                "weight_profile": str(spec.get("weight_profile", "unweighted")),
+                "meta_residual": bool(spec.get("meta_residual", False)),
+                "source_manifest_path": str(manifest_path),
+            }
+    selected_candidate = selected_model_candidate()
+    return {
+        "model_candidate_id": str(selected_candidate["candidate_id"]),
+        "anchor_policy": "equal_3way",
+        "feature_profile": "global_all_features",
+        "weight_profile": "unweighted",
+        "meta_residual": False,
+        "source_manifest_path": None,
+    }
+
+
 def main() -> int:
     args = parse_args()
-    selected_candidate = selected_model_candidate()
+    training_spec = selected_training_spec(args.model_selection_manifest_path)
+    selected_candidate = candidate_by_id(str(training_spec["model_candidate_id"]))
     selected_params = selected_candidate["params"]
     if not isinstance(selected_params, dict):
-        raise ValueError(f"selected candidate {DEFAULT_MODEL_CANDIDATE_ID} params must be a dict")
+        raise ValueError(f"selected candidate {training_spec['model_candidate_id']} params must be a dict")
     df = pd.read_parquet(args.input_path)
-    feature_columns = select_feature_columns(df)
+    ridge_metadata = fit_ridge_4way_anchor(df) if training_spec["anchor_policy"] == "ridge_4way_anchor" else None
+    df = apply_anchor_and_residual(df, anchor_policy=str(training_spec["anchor_policy"]), ridge_metadata=ridge_metadata)
+    feature_columns = source_trust_feature_subset(select_feature_columns(df), str(training_spec["feature_profile"]))
     if not any(column.startswith("hrrr_") for column in feature_columns):
         raise ValueError("feature selection did not include any HRRR columns")
     x, y = prepare_model_frame(df, feature_columns)
@@ -209,24 +272,44 @@ def main() -> int:
         validation_fraction=args.validation_fraction,
         min_train_rows=args.min_train_rows,
     )
+    train_weight = training_weights(df.loc[x_train.index], str(training_spec["weight_profile"]))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_metrics: dict[str, dict[str, float]] = {}
     model_paths: dict[str, str] = {}
+    train_predictions: dict[str, np.ndarray] = {}
     for quantile in DEFAULT_QUANTILES:
         tag = quantile_tag(quantile)
         booster, metrics = train_one_quantile(
+            selected_candidate=selected_candidate,
             quantile=quantile,
             x_train=x_train,
             y_train=y_train,
             x_valid=x_valid,
             y_valid=y_valid,
+            train_weight=train_weight,
         )
+        train_predictions[tag] = booster.predict(x_train)
         model_path = args.output_dir / f"residual_quantile_{tag}.txt"
         booster.save_model(model_path)
         model_metrics[tag] = metrics
         model_paths[tag] = str(model_path)
         print(f"{tag} validation_pinball_loss={metrics['validation_pinball_loss']:.6f} best_iteration={metrics['best_iteration']}")
+
+    meta_residual_metrics = None
+    if bool(training_spec["meta_residual"]):
+        train_anchor = pd.to_numeric(df.loc[x_train.index, "anchor_tmax_f"], errors="coerce").to_numpy(float)
+        train_final = pd.to_numeric(df.loc[x_train.index, "final_tmax_f"], errors="coerce")
+        meta_booster, meta_residual_metrics = train_meta_residual_model(
+            x_train=x_train,
+            y_train_final=train_final,
+            base_q50_final_train=train_anchor + train_predictions["q50"],
+            base_q50_residual_train=train_predictions["q50"],
+            train_weight=train_weight,
+        )
+        meta_model_path = args.output_dir / "meta_residual_correction.txt"
+        meta_booster.save_model(meta_model_path)
+        model_paths["meta_residual_correction"] = str(meta_model_path)
 
     feature_manifest = {
         "status": "ok",
@@ -236,6 +319,13 @@ def main() -> int:
         "feature_columns": feature_columns,
         "feature_prefix_counts": feature_prefix_counts(feature_columns),
         "excluded_columns": sorted(column for column in df.columns if column not in feature_columns),
+        "anchor_policy": training_spec["anchor_policy"],
+        "feature_profile": training_spec["feature_profile"],
+        "weight_profile": training_spec["weight_profile"],
+        "meta_residual": training_spec["meta_residual"],
+        "ridge_anchor_metadata": ridge_metadata,
+        "model_selection_manifest_path": training_spec["source_manifest_path"],
+        "meta_residual_model_path": model_paths.get("meta_residual_correction"),
     }
     training_manifest = {
         "status": "ok",
@@ -244,8 +334,15 @@ def main() -> int:
         "output_dir": str(args.output_dir),
         "target_column": "target_residual_f",
         "quantiles": list(DEFAULT_QUANTILES),
-        "model_candidate_id": DEFAULT_MODEL_CANDIDATE_ID,
+        "model_candidate_id": str(training_spec["model_candidate_id"]),
         "model_candidate": selected_candidate,
+        "anchor_policy": training_spec["anchor_policy"],
+        "feature_profile": training_spec["feature_profile"],
+        "weight_profile": training_spec["weight_profile"],
+        "meta_residual": training_spec["meta_residual"],
+        "ridge_anchor_metadata": ridge_metadata,
+        "model_selection_manifest_path": training_spec["source_manifest_path"],
+        "meta_residual_metrics": meta_residual_metrics,
         "training_procedure": "fixed_num_boost_round_no_inner_early_stopping",
         "lightgbm_params": selected_params,
         "num_boost_round": int(selected_candidate.get("num_boost_round", 250)),
