@@ -70,7 +70,7 @@ UTC = dt.timezone.utc
 DEFAULT_OUTPUT = pathlib.Path("data/nbm/grib2")
 LEAD_HOURS = list(range(1, 37))
 DEFAULT_SELECTION_MODE = "all"
-SELECTION_MODES = (DEFAULT_SELECTION_MODE, "overnight_0005")
+SELECTION_MODES = (DEFAULT_SELECTION_MODE, "overnight_0005", "latest")
 DEFAULT_RANGE_MERGE_GAP_BYTES = 4096
 DEFAULT_CFGRIB_INDEX_STRATEGY = "temp_dir_per_unit"
 OVERNIGHT_INIT_START_HOUR_LOCAL = 18
@@ -127,6 +127,7 @@ class CyclePlan:
     init_time_local: dt.datetime
     cycle: str
     selected_target_dates: tuple[dt.date, ...] = ()
+    selected_lead_hours: tuple[int, ...] = ()
 
     @property
     def init_date_local(self) -> dt.date:
@@ -143,13 +144,50 @@ class CyclePlan:
 
 
 def lead_hours_for_cycle(cycle_plan: CyclePlan) -> list[int]:
+    candidate_leads = list(cycle_plan.selected_lead_hours) if cycle_plan.selected_lead_hours else list(LEAD_HOURS)
     if not cycle_plan.selected_target_dates:
-        return list(LEAD_HOURS)
+        return candidate_leads
     selected_dates = set(cycle_plan.selected_target_dates)
     return [
         lead_hour
-        for lead_hour in LEAD_HOURS
+        for lead_hour in candidate_leads
         if (cycle_plan.init_time_utc + dt.timedelta(hours=lead_hour)).astimezone(NY_TZ).date() in selected_dates
+    ]
+
+
+def parse_int_ranges(value: str) -> tuple[int, ...]:
+    values: set[int] = set()
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_str, end_str = token.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                raise ValueError(f"Invalid range: {token}")
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(token))
+    if not values:
+        raise ValueError(f"No values parsed from {value!r}")
+    return tuple(sorted(values))
+
+
+def apply_lead_hour_filter(cycle_plans: list[CyclePlan], lead_hours_text: str | None) -> list[CyclePlan]:
+    if not lead_hours_text:
+        return cycle_plans
+    selected_lead_hours = parse_int_ranges(lead_hours_text)
+    return [
+        CyclePlan(
+            init_time_utc=cycle_plan.init_time_utc,
+            init_time_local=cycle_plan.init_time_local,
+            cycle=cycle_plan.cycle,
+            selected_target_dates=cycle_plan.selected_target_dates,
+            selected_lead_hours=selected_lead_hours,
+        )
+        for cycle_plan in cycle_plans
     ]
 
 
@@ -508,6 +546,10 @@ def parse_args() -> argparse.Namespace:
         help="Cycle-planning mode. Use overnight_0005 to keep only overnight cycles eligible by the 00:05 America/New_York cutoff.",
     )
     parser.add_argument(
+        "--lead-hours",
+        help="Optional comma/range filter for forecast lead files to process, e.g. 2-5 or 1,2,3.",
+    )
+    parser.add_argument(
         "--keep-downloads",
         action="store_true",
         help="Keep downloaded selected-record .grib2 and .idx files after success",
@@ -742,6 +784,30 @@ def discover_cycle_plans(
             for issue_key, cycle_plan in sorted(selected_cycle_by_issue.items(), key=lambda item: item[1].init_time_utc)
         ]
         return plans
+    if selection_mode == "latest":
+        selected_target_dates_by_issue: dict[tuple[dt.datetime, str], list[dt.date]] = {}
+        selected_cycle_by_issue: dict[tuple[dt.datetime, str], CyclePlan] = {}
+        for target_date_local in iter_dates(start_local, end_local):
+            eligible_cycles = [
+                cycle_plan
+                for cycle_plan in available_cycles
+                if cycle_plan.init_time_local.date() == target_date_local
+            ]
+            if not eligible_cycles:
+                continue
+            selected_cycle = eligible_cycles[-1]
+            issue_key = (selected_cycle.init_time_utc, selected_cycle.cycle)
+            selected_cycle_by_issue[issue_key] = selected_cycle
+            selected_target_dates_by_issue.setdefault(issue_key, []).append(target_date_local)
+        return [
+            CyclePlan(
+                init_time_utc=cycle_plan.init_time_utc,
+                init_time_local=cycle_plan.init_time_local,
+                cycle=cycle_plan.cycle,
+                selected_target_dates=tuple(sorted(selected_target_dates_by_issue[issue_key])),
+            )
+            for issue_key, cycle_plan in sorted(selected_cycle_by_issue.items(), key=lambda item: item[1].init_time_utc)
+        ]
     return [
         cycle_plan
         for cycle_plan in available_cycles
@@ -3862,6 +3928,7 @@ def _run_pipeline_legacy(args: argparse.Namespace, client: S3HttpClient | None =
         progress=None,
         selection_mode=getattr(args, "selection_mode", DEFAULT_SELECTION_MODE),
     )
+    cycle_plans = apply_lead_hour_filter(cycle_plans, getattr(args, "lead_hours", None))
     if not cycle_plans:
         raise SystemExit("No GRIB2 cycles found for the requested local-date window.")
     planned_lead_count = total_lead_hours_for_cycles(cycle_plans)
@@ -4060,6 +4127,7 @@ def run_pipeline(args: argparse.Namespace, client: S3HttpClient | None = None) -
         progress=None,
         selection_mode=getattr(args, "selection_mode", DEFAULT_SELECTION_MODE),
     )
+    cycle_plans = apply_lead_hour_filter(cycle_plans, getattr(args, "lead_hours", None))
     if not cycle_plans:
         raise SystemExit("No GRIB2 cycles found for the requested local-date window.")
     planned_lead_count = total_lead_hours_for_cycles(cycle_plans)

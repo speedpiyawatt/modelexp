@@ -197,6 +197,15 @@ For download-heavy or long-running network steps:
 - do not poll or heartbeat-check external downloads when the user has agreed to run them manually
 - once the user confirms completion, continue with validation, parsing, merging, or downstream local processing
 
+Manual current-day Tmax requests:
+
+- when the user asks for a manual/current Tmax forecast, first record the request time in both the machine timezone and `America/New_York`
+- pull LAMP, NBM, and HRRR using the latest currently relevant issue/cycle, not the overnight `00:05` anchor, unless the user explicitly asks for the overnight model
+- target only the plausible remaining Tmax window around KLGA peak heating, roughly late morning through late afternoon local, and avoid pulling the entire local day when the request is intraday
+- for manual current-day NBM/HRRR runs, prefer a fresh `data/runtime/manual_tmax_YYYY_MM_DD_HHMM` run root and delete stale/partial artifacts before re-running
+- on an M4-class local machine, prefer multiple workers for manual pulls: use at least 4 download workers when the tool supports it, keep `wgrib2` threads at `1`, and use bounded reduce/extract queues so downloads, crop, and extraction can overlap without exhausting disk
+- after the user confirms the manual downloads are complete, analyze the latest-cycle raw rows directly if no current-day summary builder exists; do not reinterpret latest-cycle data as an overnight fair-value row
+
 Optimization guidance:
 
 - treat `--selection-mode overnight_0005` in NBM and HRRR as an overnight-validation or short-window replay optimization, not a full-history backfill default; for NBM it also narrows source selection to one latest cutoff-eligible issue per target day

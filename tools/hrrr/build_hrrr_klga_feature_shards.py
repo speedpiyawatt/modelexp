@@ -69,7 +69,7 @@ DEFAULT_MAX_WORKERS = 2
 DEFAULT_RANGE_MERGE_GAP_BYTES = 64 * 1024
 DEFAULT_CFGRIB_INDEX_STRATEGY = "temp_dir_per_task"
 DEFAULT_SELECTION_MODE = "all"
-SELECTION_MODES = (DEFAULT_SELECTION_MODE, "overnight_0005")
+SELECTION_MODES = (DEFAULT_SELECTION_MODE, "overnight_0005", "latest")
 BATCH_REDUCE_MODES = ("off", "cycle")
 CROP_METHODS = ("auto", "small_grib", "ijsmall_grib")
 EXTRACT_METHODS = ("cfgrib", "eccodes", "wgrib2-bin", "wgrib2-ijbox-bin")
@@ -632,6 +632,10 @@ def parse_args() -> argparse.Namespace:
         help="Task-planning mode. Use overnight_0005 to keep only the anchor overnight cycle plus the latest revision cycle.",
     )
     parser.add_argument(
+        "--forecast-hours",
+        help="Optional comma/range filter for forecast-hour files to process, e.g. 3-6 or 2,3,4.",
+    )
+    parser.add_argument(
         "--crop-method",
         choices=CROP_METHODS,
         default=DEFAULT_CROP_METHOD,
@@ -798,6 +802,26 @@ def parse_date(value: str) -> pd.Timestamp:
     return pd.Timestamp(value).normalize()
 
 
+def parse_int_ranges(value: str) -> set[int]:
+    values: set[int] = set()
+    for part in value.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_str, end_str = token.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                raise ValueError(f"Invalid range: {token}")
+            values.update(range(start, end + 1))
+        else:
+            values.add(int(token))
+    if not values:
+        raise ValueError(f"No values parsed from {value!r}")
+    return values
+
+
 def iter_dates(start_date: pd.Timestamp, end_date: pd.Timestamp) -> Iterable[pd.Timestamp]:
     current = start_date
     while current <= end_date:
@@ -868,21 +892,30 @@ def select_anchor_cycle(tasks: list[TaskSpec], expected_slots: set[str]) -> tupl
 
 def build_tasks_for_target_date(target_date_local: pd.Timestamp, selection_mode: str = DEFAULT_SELECTION_MODE) -> list[TaskSpec]:
     target_date = target_date_local.date()
-    window_start = dt.datetime.combine(
-        target_date - dt.timedelta(days=1),
-        dt.time(OVERNIGHT_INIT_START_HOUR_LOCAL, 0),
-        tzinfo=NY_TZ,
-    )
-    window_end = dt.datetime.combine(
-        target_date,
-        dt.time(OVERNIGHT_INIT_END_HOUR_LOCAL, 0),
-        tzinfo=NY_TZ,
-    )
-    availability_cutoff = dt.datetime.combine(
-        target_date,
-        dt.time(0, OVERNIGHT_AVAILABILITY_CUTOFF_MINUTE_LOCAL),
-        tzinfo=NY_TZ,
-    )
+    if selection_mode == "latest":
+        window_start = dt.datetime.combine(target_date, dt.time(0, 0), tzinfo=NY_TZ)
+        now_utc = dt.datetime.now(dt.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        availability_cutoff = (now_utc - dt.timedelta(hours=2)).astimezone(NY_TZ)
+        window_end = min(
+            availability_cutoff,
+            dt.datetime.combine(target_date, dt.time(23, 0), tzinfo=NY_TZ),
+        )
+    else:
+        window_start = dt.datetime.combine(
+            target_date - dt.timedelta(days=1),
+            dt.time(OVERNIGHT_INIT_START_HOUR_LOCAL, 0),
+            tzinfo=NY_TZ,
+        )
+        window_end = dt.datetime.combine(
+            target_date,
+            dt.time(OVERNIGHT_INIT_END_HOUR_LOCAL, 0),
+            tzinfo=NY_TZ,
+        )
+        availability_cutoff = dt.datetime.combine(
+            target_date,
+            dt.time(0, OVERNIGHT_AVAILABILITY_CUTOFF_MINUTE_LOCAL),
+            tzinfo=NY_TZ,
+        )
 
     available_cycles: list[dt.datetime] = []
     current = window_end
@@ -933,6 +966,21 @@ def build_tasks_for_target_date(target_date_local: pd.Timestamp, selection_mode:
 
     if not cycle_task_map:
         return []
+
+    if selection_mode == "latest":
+        latest_cycle_key = min(cycle_task_map, key=lambda cycle_key: all_cycle_rank[cycle_key])
+        retained_tasks = [
+            TaskSpec(
+                **{
+                    **task.__dict__,
+                    "cycle_rank_desc": 0,
+                    "anchor_cycle_candidate": True,
+                }
+            )
+            for task in cycle_task_map[latest_cycle_key]
+        ]
+        retained_tasks.sort(key=lambda item: item.forecast_hour)
+        return retained_tasks
 
     cycle_slots = {
         cycle_key: {task.valid_time_local for task in cycle_tasks}
@@ -5882,6 +5930,9 @@ def main() -> int:
         return 2
 
     tasks = build_all_tasks(start_date, end_date, selection_mode=args.selection_mode)
+    if args.forecast_hours:
+        selected_forecast_hours = parse_int_ranges(args.forecast_hours)
+        tasks = [task for task in tasks if int(task.forecast_hour) in selected_forecast_hours]
     if args.limit_tasks is not None:
         tasks = tasks[: args.limit_tasks]
     if not tasks:
