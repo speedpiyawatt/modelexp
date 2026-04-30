@@ -120,6 +120,43 @@ Result:
 - Selected ladder calibration remains `bucket_reliability_s1_00`.
 - Diagnostics are available in `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
 
+### Dual No-HRRR / With-HRRR Guard
+
+Status: done
+
+Goal:
+
+- Keep raw no-HRRR and raw with-HRRR outputs visible, but add a validation-selected guarded recommendation for regimes where the with-HRRR source-trust model is historically risky.
+- Use validation rows plus retained 2026 live backtest rows before promoting any guard.
+
+Implemented 2026-04-30:
+
+- Added `tools/weather/dual_guard.py` with shared guard weights and payload blending.
+- Added `tools/weather/evaluate_dual_guard.py` to evaluate:
+  - `always_no_hrrr`
+  - `always_with_hrrr`
+  - `with_hrrr_except_native_cold_hrrr_warm`
+  - `with_hrrr_only_high_or_very_high_disagreement`
+  - `probability_blend_by_regime`
+  - `expected_tmax_blend_by_regime`
+- Updated `tools/weather/run_server_dual_inference.py` to read `experiments/withhrrr/data/runtime/evaluation/dual_guard/dual_guard_manifest.json` and print a `guarded` recommendation with applied weights.
+
+Verification 2026-04-30:
+
+```bash
+.venv/bin/python tools/weather/evaluate_dual_guard.py
+.venv/bin/python -m py_compile tools/weather/dual_guard.py tools/weather/evaluate_dual_guard.py tools/weather/run_server_dual_inference.py experiments/withhrrr/withhrrr_model/source_disagreement.py experiments/withhrrr/withhrrr_model/predict.py
+.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py
+```
+
+Result:
+
+- Selected guard: `with_hrrr_except_native_cold_hrrr_warm`.
+- Validation holdout, `219` rows: always with-HRRR event NLL/observed-bin probability/MAE `1.133178/0.385604/1.265688`; selected guard `1.137793/0.385989/1.250839`.
+- 2026 live backtest, `86` successful rows: always with-HRRR event NLL/observed-bin probability/MAE/top-bin accuracy `1.589559/0.408022/2.085680/0.500`; selected guard `1.554194/0.411389/2.024112/0.500`.
+- Artifact paths: `experiments/withhrrr/data/runtime/evaluation/dual_guard/dual_guard_manifest.json`, `dual_guard_summary.csv`, `dual_guard_slices.csv`, and `dual_guard_scored_rows.parquet`.
+- Note: validation expected-Tmax metrics use q50 as a proxy because historical holdout prediction JSONs are not retained; 2026 live-backtest metrics use the retained `expected_final_tmax_f` from prediction JSONs.
+
 ### Source-Trust Model Upgrade
 
 Status: done
@@ -210,6 +247,7 @@ Result:
 - Refreshed selected downstream defaults: `global_offsets`, `normal_iqr`, `bucket_reliability_s1_00`.
 - Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.244989/0.608950`, degree NLL/RPS `2.000670/0.009480`.
 - Calibration robustness update 2026-04-30: added candidate comparison for `global_offsets`, `conformal_intervals`, `no_offsets`, `global_offsets_no_upper_tail`, `global_offsets_shrunk_50pct`, and conditional source-disagreement methods. Promotion now rejects candidates that reduce observed-bin probability by more than `0.02` in `tight_consensus` or `moderate_disagreement`; selected quantile calibration changed to `global_offsets_no_upper_tail`. Refreshed rolling 2025 ladder metrics: event-bin NLL/Brier `1.241810/0.606852`, degree NLL/RPS `2.000715/0.009475`.
+- Calibration implementation note: `global_offsets_no_upper_tail` applies the fitted q05/q10/q25/q50 offsets and explicitly sets q75/q90/q95 offsets to `0.0`; prediction output includes both the legacy `calibration_offsets_f` and structured `calibration` metadata so future conditional methods can expose the selected branch.
 - Refreshed production-calibrated holdout `2025-05-27..2025-12-31`: event-bin NLL/Brier `1.133178/0.603449`, degree NLL/RPS `1.861432/0.009238`, raw q50 MAE/RMSE `1.261223/1.639528`, scored q50 MAE/RMSE `1.265688/1.642842`.
 - Local inference smoke for `2025-12-31` produced an inference row with all four nearby stations available, `nearby_feature_count=106`, `feature_count=467`, and a valid prediction JSON.
 - Unit suite passed with `27` tests.
@@ -221,7 +259,8 @@ Review fixes 2026-04-30:
 - Fixed `build_inference_features.py` so a selected nearby feature profile requires at least one available nearby station and generated nearby columns; it no longer silently predicts with all nearby features missing.
 - Reran rolling-origin model selection after the feature-filter fix. The selected candidate remained `nearby_vreg_leaf100_lgbm_350__anchor=equal_3way__features=high_disagreement_weighted_nearby__weights=high_disagreement_weighted`.
 - Reran calibration, distribution diagnostics, ladder calibration, final training, and holdout evaluation. After fixing the evaluator to score the production calibrated stack, final holdout event-bin NLL/Brier is `1.133178/0.603449`; raw q50 MAE remains `1.261223`.
-- Verification: py_compile passed; `.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py` passed with `28` tests; all-nearby inference smoke passed; no-nearby inference smoke failed explicitly as intended.
+- Evaluator behavior: `withhrrr_model.evaluate` now loads selected calibration/distribution/ladder manifests by default. `validation_predictions.parquet` is the production-calibrated scoring frame; `validation_predictions_raw.parquet` preserves raw model quantiles for debugging.
+- Verification: py_compile passed; `.venv/bin/python -m pytest experiments/withhrrr/tests/test_withhrrr_model.py` passed with `30` tests; all-nearby inference smoke passed; no-nearby inference smoke failed explicitly as intended.
 - Deploy status: code was pushed to GitHub `origin/main` and synced to the DigitalOcean server with ignored runtime artifacts. Later code commits or runtime artifact rebuilds still need explicit server sync before server dual inference is current.
 
 ### 1. Stage HRRR Overnight Summary Data

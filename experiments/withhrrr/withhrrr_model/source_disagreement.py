@@ -18,6 +18,7 @@ DISAGREEMENT_WIDENING_REGIMES = {
     "hrrr_hot_outlier",
     "hrrr_cold_outlier",
 }
+HIGH_RISK_REGIMES = DISAGREEMENT_WIDENING_REGIMES
 
 
 def _numeric_source(df: pd.DataFrame, column: str) -> pd.Series:
@@ -87,6 +88,46 @@ def source_disagreement_features(df: pd.DataFrame) -> pd.DataFrame:
                 "tight_consensus",
             ],
             default="unknown",
+        ),
+        index=df.index,
+        dtype="string",
+    )
+    high_risk = complete & out["source_disagreement_regime"].isin(HIGH_RISK_REGIMES)
+    very_high_risk = complete & (spread >= 6.0)
+    out["source_disagreement_risk_level"] = pd.Series(
+        np.select(
+            [
+                very_high_risk,
+                high_risk,
+                moderate_disagreement,
+                tight_consensus,
+            ],
+            [
+                "very_high",
+                "high",
+                "medium",
+                "low",
+            ],
+            default="unknown",
+        ),
+        index=df.index,
+        dtype="string",
+    )
+    out["source_disagreement_risk_reason"] = pd.Series(
+        np.select(
+            [
+                very_high_risk,
+                high_risk,
+                moderate_disagreement,
+                tight_consensus,
+            ],
+            [
+                "source_spread_at_least_6f",
+                "source_conflict_or_outlier_regime",
+                "source_spread_2f_to_4f",
+                "source_spread_below_2f",
+            ],
+            default="missing_required_source",
         ),
         index=df.index,
         dtype="string",

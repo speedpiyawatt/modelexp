@@ -371,6 +371,14 @@ def print_prediction_summary(payload: dict[str, object], output_path: pathlib.Pa
     print(f"expected_final_tmax_f={float(payload['expected_final_tmax_f']):.2f}")
     print(f"anchor_tmax_f={float(payload['anchor_tmax_f']):.2f}")
     print(f"distribution_method={payload['distribution_method']}")
+    disagreement = payload.get("source_disagreement", {})
+    if isinstance(disagreement, dict):
+        print(
+            "source_disagreement "
+            f"risk={disagreement.get('source_disagreement_risk_level', 'unknown')} "
+            f"regime={disagreement.get('source_disagreement_regime', 'unknown')} "
+            f"spread_f={disagreement.get('source_spread_f', 'n/a')}"
+        )
     final_quantiles = payload.get("final_tmax_quantiles_f", {})
     if isinstance(final_quantiles, dict):
         labels = (("0.05", "q05"), ("0.1", "q10"), ("0.25", "q25"), ("0.5", "q50"), ("0.75", "q75"), ("0.9", "q90"), ("0.95", "q95"))

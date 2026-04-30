@@ -63,8 +63,12 @@ The folder `experiments/withhrrr/` is the HRRR-inclusive version of the no-HRRR 
 - it learns from Wunderground, NBM, LAMP, and HRRR source blocks; HRRR is both a learned input and part of the selected equal 3-way source anchor
 - the current selected anchor is `equal_3way`: `(nbm_tmax_open_f + lamp_tmax_open_f + hrrr_tmax_open_f) / 3`; HRRR-only was not promoted because holdout metrics were worse than the residual model
 - the current selected with-HRRR model uses the Source-Trust plus nearby-station upgrade: model candidate `nearby_vreg_leaf100_lgbm_350`, feature profile `high_disagreement_weighted_nearby`, weight profile `high_disagreement_weighted`, guarded quantile calibration `global_offsets_no_upper_tail`, distribution `normal_iqr`, and ladder reliability `bucket_reliability_s1_00`
+- guarded `global_offsets_no_upper_tail` means q05/q10/q25/q50 keep fitted global offsets while q75/q90/q95 offsets are forced to `0.0`; it replaced plain `global_offsets` because the guard rejected methods that reduced observed-bin probability too much on `tight_consensus` or `moderate_disagreement` rows
 - HRRR/source disagreement diagnostics are promoted as features, including HRRR-vs-LAMP/NBM deltas, native-NBM deltas, source ranks, warmest/coldest flags, WU-last-temp-vs-source deltas, and disagreement regimes
 - nearby-station Wunderground context for `KJRB`, `KJFK`, `KEWR`, and `KTEB` is now part of the selected with-HRRR feature profile; nearby observations must be cutoff-safe at `00:05 America/New_York` and guarded against stale reports
+- server dual inference now applies a validation-selected dual-model guard when `experiments/withhrrr/data/runtime/evaluation/dual_guard/dual_guard_manifest.json` exists; current guard is `with_hrrr_except_native_cold_hrrr_warm`, meaning use with-HRRR normally but fall back to no-HRRR probabilities/expected Tmax when the with-HRRR source regime is `native_cold_hrrr_warm`
+- rebuild the guard manifest after refreshing validation or 2026 backtest artifacts with `.venv/bin/python tools/weather/evaluate_dual_guard.py`
+- `experiments/withhrrr/withhrrr_model/evaluate.py` now scores the production calibrated probability stack by default and writes raw model rows separately to `validation_predictions_raw.parquet`; use explicit no-calibration/no-ladder flags only when debugging raw model quantiles
 - current selected with-HRRR defaults are documented in `experiments/withhrrr/README.md`, `TODO.md`, and `IMPLEMENTATION_TODO.md`
 - future agents must update both `experiments/withhrrr/TODO.md` and `experiments/withhrrr/IMPLEMENTATION_TODO.md` when changing selected model behavior, inference behavior, or reported metrics
 
@@ -268,7 +272,7 @@ Server dual inference:
 
 - use `.venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD` from the local repo when the user wants one-date production-style inference and comparison
 - the script starts no-HRRR online inference, HRRR source build, and KJRB/KJFK/KEWR/KTEB nearby Wunderground prefetch concurrently on `root@198.199.64.163`, then builds the with-HRRR row from no-HRRR WU/LAMP/NBM artifacts plus HRRR summary and nearby Wunderground station context
-- the script prints expected Tmax, anchor, distribution method, event-bin probabilities, and with-HRRR minus no-HRRR probability differences
+- the script prints expected Tmax, anchor, distribution method, source-disagreement risk level, event-bin probabilities, with-HRRR minus no-HRRR probability differences, and a `guarded` recommendation when a dual-guard manifest is available
 - a 2026-04-29 validation run for `2026-04-28` returned no-HRRR expected `65.07F`, with-HRRR expected `64.63F`, and finalized Wunderground/Synoptic peak near `64F`; with-HRRR was closer for that date
 - if the script fails, inspect `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/no_hrrr.log` and `hrrr.log`
 

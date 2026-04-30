@@ -30,7 +30,7 @@ from experiments.withhrrr.withhrrr_model.event_bins import EventBin, load_event_
 from experiments.withhrrr.withhrrr_model.hrrr_ablation_diagnostics import drop_hrrr_feature_columns
 from experiments.withhrrr.withhrrr_model.model_config import DEFAULT_CANDIDATES, DEFAULT_MODEL_CANDIDATE_ID, HRRR_CANDIDATES, candidate_by_id
 from experiments.withhrrr.withhrrr_model.nearby_observations import build_nearby_station_features
-from experiments.withhrrr.withhrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
+from experiments.withhrrr.withhrrr_model.polymarket_event import extract_event_bins, fallback_weather_event_slug, weather_event_slug_for_date, write_outputs
 from experiments.withhrrr.withhrrr_model.predict import apply_ladder_calibration, calibration_metadata, calibration_offsets, selected_distribution_method
 from experiments.withhrrr.withhrrr_model.prepare_training_features import build_training_table
 from experiments.withhrrr.withhrrr_model.rolling_origin_model_select import (
@@ -224,6 +224,16 @@ def test_source_disagreement_regime_precedence() -> None:
         "broad_disagreement",
         "moderate_disagreement",
         "tight_consensus",
+        "unknown",
+    ]
+    assert out["source_disagreement_risk_level"].tolist() == [
+        "very_high",
+        "very_high",
+        "very_high",
+        "very_high",
+        "high",
+        "medium",
+        "low",
         "unknown",
     ]
     assert float(out.loc[0, "source_spread_f"]) == 6.0
@@ -677,6 +687,22 @@ def test_event_bin_adapter_and_polymarket_parser() -> None:
     }
     assert [row["label"] for row in extract_event_bins(event)] == ["59F or below", "60-61F", "78F or higher"]
     assert weather_event_slug_for_date(dt.date(2026, 4, 25)) == "highest-temperature-in-nyc-on-april-25-2026"
+    assert fallback_weather_event_slug("highest-temperature-in-nyc-on-january-1-2026") == "highest-temperature-in-nyc-on-january-1"
+
+
+def test_polymarket_manifest_records_resolved_slug(tmp_path) -> None:
+    _, bins_path, manifest_path = write_outputs(
+        output_dir=tmp_path,
+        slug="highest-temperature-in-nyc-on-january-1-2026",
+        resolved_slug="highest-temperature-in-nyc-on-january-1",
+        event={"id": "event-1", "markets": []},
+        bins=[{"label": "30F or below"}],
+    )
+    manifest = json.loads(manifest_path.read_text())
+    assert bins_path.parent.name == "event_slug=highest-temperature-in-nyc-on-january-1"
+    assert manifest["event_slug"] == "highest-temperature-in-nyc-on-january-1-2026"
+    assert manifest["resolved_event_slug"] == "highest-temperature-in-nyc-on-january-1"
+    assert manifest["used_fallback_slug"] is True
 
 
 def test_load_event_bin_labels_and_distribution_mass(tmp_path) -> None:

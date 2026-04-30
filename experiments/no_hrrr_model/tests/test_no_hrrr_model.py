@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import pathlib
 import sys
 
@@ -23,7 +24,7 @@ from experiments.no_hrrr_model.no_hrrr_model.evaluate import (
     representative_event_bins,
 )
 from experiments.no_hrrr_model.no_hrrr_model.normalize_features import normalize_features
-from experiments.no_hrrr_model.no_hrrr_model.polymarket_event import extract_event_bins, weather_event_slug_for_date
+from experiments.no_hrrr_model.no_hrrr_model.polymarket_event import extract_event_bins, fallback_weather_event_slug, weather_event_slug_for_date, write_outputs
 from experiments.no_hrrr_model.no_hrrr_model.predict import calibration_offsets, selected_distribution_method
 from experiments.no_hrrr_model.no_hrrr_model.calibrate_rolling_origin import calibration_sort_key
 from experiments.no_hrrr_model.no_hrrr_model.calibrate_ladder import apply_bucket_reliability, fit_bucket_reliability, selected_quantile_calibrated_frame
@@ -313,6 +314,22 @@ def test_extract_polymarket_event_bins_from_markets() -> None:
 
 def test_weather_event_slug_for_date() -> None:
     assert weather_event_slug_for_date(dt.date(2026, 4, 25)) == "highest-temperature-in-nyc-on-april-25-2026"
+    assert fallback_weather_event_slug("highest-temperature-in-nyc-on-january-1-2026") == "highest-temperature-in-nyc-on-january-1"
+
+
+def test_polymarket_manifest_records_resolved_slug(tmp_path) -> None:
+    _, bins_path, manifest_path = write_outputs(
+        output_dir=tmp_path,
+        slug="highest-temperature-in-nyc-on-january-1-2026",
+        resolved_slug="highest-temperature-in-nyc-on-january-1",
+        event={"id": "event-1", "markets": []},
+        bins=[{"label": "30F or below"}],
+    )
+    manifest = json.loads(manifest_path.read_text())
+    assert bins_path.parent.name == "event_slug=highest-temperature-in-nyc-on-january-1"
+    assert manifest["event_slug"] == "highest-temperature-in-nyc-on-january-1-2026"
+    assert manifest["resolved_event_slug"] == "highest-temperature-in-nyc-on-january-1"
+    assert manifest["used_fallback_slug"] is True
 
 
 def test_lamp_source_auto_uses_archive_for_past_cutoff_dates() -> None:

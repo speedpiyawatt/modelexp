@@ -110,7 +110,7 @@ def remote_url_exists(url: str) -> bool:
         with urllib.request.urlopen(request, timeout=10) as response:
             return 200 <= response.status < 400
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+        if exc.code in {403, 404}:
             return False
         raise
     except urllib.error.URLError:
@@ -220,6 +220,15 @@ def cleanup_runtime_artifacts(runtime_root: pathlib.Path, candidates: list[pathl
     return deleted
 
 
+def find_polymarket_event_bins(polymarket_dir: pathlib.Path) -> pathlib.Path:
+    matches = sorted(polymarket_dir.glob("event_slug=*/event_bins.json"))
+    if not matches:
+        raise SystemExit(f"No Polymarket event_bins.json found under {polymarket_dir}")
+    if len(matches) > 1:
+        raise SystemExit(f"Multiple Polymarket event_bins.json files found under {polymarket_dir}: {matches}")
+    return matches[0]
+
+
 def fetch_iem_lamp_cycle(*, station_id: str, utc_date: dt.date, cycle: str, output_dir: pathlib.Path, overwrite: bool) -> pathlib.Path:
     destination = output_dir / "source=iem" / f"date_utc={utc_date.isoformat()}" / f"cycle={cycle}" / f"iem.{iem_lav_pil(station_id)}.{utc_date.strftime('%Y%m%d')}.{cycle}z.ascii"
     if destination.exists() and not overwrite:
@@ -298,6 +307,7 @@ def fetch_lamp(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
                 command.append("--overwrite")
             run(command, continue_on_error=args.continue_on_lamp_fetch_error)
     elif lamp_source == "archive":
+        cache_dir = args.runtime_root / "lamp_archive_cache" / date_token
         command = [
             sys.executable,
             "tools/lamp/fetch_lamp.py",
@@ -308,6 +318,8 @@ def fetch_lamp(args: argparse.Namespace, target_date: dt.date) -> pathlib.Path:
             utc_date.isoformat(),
             "--output-dir",
             str(raw_dir),
+            "--cache-dir",
+            str(cache_dir),
         ]
         for cycle in CANDIDATE_LAMP_CYCLES:
             command.extend(["--cycle", cycle])
@@ -429,6 +441,7 @@ def main() -> int:
             cleanup_candidates.extend(
                 [
                     args.runtime_root / "lamp_raw" / date_token,
+                    args.runtime_root / "lamp_archive_cache" / date_token,
                     args.runtime_root / "lamp_features" / date_token,
                     args.runtime_root / "lamp_overnight",
                 ]
@@ -455,7 +468,7 @@ def main() -> int:
                     str(polymarket_dir),
                 ]
             )
-            event_bins_path = polymarket_dir / f"event_slug={polymarket_event_slug}" / "event_bins.json"
+            event_bins_path = find_polymarket_event_bins(polymarket_dir)
             paths["event_bins_path"] = str(event_bins_path)
             cleanup_candidates.append(polymarket_dir)
 

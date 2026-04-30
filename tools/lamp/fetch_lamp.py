@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import urllib.error
 import urllib.request
+import zlib
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
@@ -354,14 +355,27 @@ def extract_archive_members_fast(args: argparse.Namespace) -> list[pathlib.Path]
                 gzip_path = cache_path_for_monthly_cycle(year_month, cycle_token, args.cache_dir)
                 url = archive_monthly_cycle_url(year_month, cycle_token)
                 download_with_progress(url, gzip_path, overwrite=args.overwrite)
-                _extract_matching_issues_from_monthly_cycle_gzip(
-                    gzip_path,
-                    start_date=start_date,
-                    end_date=end_date,
-                    cycle_filter=cycle_filter,
-                    output_dir=staged_output_dir,
-                    overwrite=True,
-                )
+                try:
+                    _extract_matching_issues_from_monthly_cycle_gzip(
+                        gzip_path,
+                        start_date=start_date,
+                        end_date=end_date,
+                        cycle_filter=cycle_filter,
+                        output_dir=staged_output_dir,
+                        overwrite=True,
+                    )
+                except (EOFError, gzip.BadGzipFile, zlib.error) as exc:
+                    matching = [
+                        path
+                        for path in staged_output_dir.rglob("*.ascii")
+                        if f"cycle={cycle_token}" in path.parts
+                    ]
+                    if not matching:
+                        raise
+                    print(
+                        f"[warn] monthly-cycle archive {gzip_path.name} ended with a gzip footer/read error "
+                        f"after writing {len(matching)} matching issue file(s): {exc}"
+                    )
         return promote_staged_archive_outputs(staged_output_dir, final_archive_root, overwrite=args.overwrite)
 
 

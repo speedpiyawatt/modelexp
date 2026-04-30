@@ -54,7 +54,14 @@ def weather_event_slug_for_date(target_date: dt.date) -> str:
     return f"{WEATHER_EVENT_SLUG_PREFIX}-{month}-{target_date.day}-{target_date.year}"
 
 
-def fetch_event_by_slug(slug: str) -> dict[str, Any]:
+def fallback_weather_event_slug(slug: str) -> str | None:
+    match = re.fullmatch(rf"({re.escape(WEATHER_EVENT_SLUG_PREFIX)}-[a-z]+-\d{{1,2}})-\d{{4}}", slug)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def resolve_event_by_slug(slug: str) -> tuple[dict[str, Any], str]:
     quoted = urllib.parse.quote(slug, safe="")
     try:
         payload = fetch_json(f"{GAMMA_BASE_URL}/events/slug/{quoted}")
@@ -62,11 +69,19 @@ def fetch_event_by_slug(slug: str) -> dict[str, Any]:
         payload = fetch_json(f"{GAMMA_BASE_URL}/events?slug={quoted}")
     if isinstance(payload, list):
         if not payload:
+            fallback_slug = fallback_weather_event_slug(slug)
+            if fallback_slug is not None:
+                return resolve_event_by_slug(fallback_slug)
             raise ValueError(f"no Polymarket event found for slug={slug!r}")
-        return payload[0]
+        return payload[0], slug
     if not isinstance(payload, dict):
         raise ValueError(f"unexpected Polymarket event response type for slug={slug!r}: {type(payload).__name__}")
-    return payload
+    return payload, slug
+
+
+def fetch_event_by_slug(slug: str) -> dict[str, Any]:
+    event, _ = resolve_event_by_slug(slug)
+    return event
 
 
 def _json_array(value: Any) -> list[Any]:
@@ -164,8 +179,16 @@ def extract_event_bins(event: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def write_outputs(*, output_dir: pathlib.Path, slug: str, event: dict[str, Any], bins: list[dict[str, Any]]) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
-    root = output_dir / f"event_slug={slug}"
+def write_outputs(
+    *,
+    output_dir: pathlib.Path,
+    slug: str,
+    event: dict[str, Any],
+    bins: list[dict[str, Any]],
+    resolved_slug: str | None = None,
+) -> tuple[pathlib.Path, pathlib.Path, pathlib.Path]:
+    output_slug = resolved_slug or slug
+    root = output_dir / f"event_slug={output_slug}"
     root.mkdir(parents=True, exist_ok=True)
     event_path = root / "polymarket_event.json"
     bins_path = root / "event_bins.json"
@@ -176,6 +199,8 @@ def write_outputs(*, output_dir: pathlib.Path, slug: str, event: dict[str, Any],
         "status": "ok",
         "built_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "event_slug": slug,
+        "resolved_event_slug": output_slug,
+        "used_fallback_slug": output_slug != slug,
         "event_id": event.get("id"),
         "event_title": event.get("title") or event.get("question"),
         "bin_count": len(bins),
@@ -188,12 +213,19 @@ def write_outputs(*, output_dir: pathlib.Path, slug: str, event: dict[str, Any],
 
 def main() -> int:
     args = parse_args()
+    resolved_slug = args.event_slug
     if args.input_json is not None:
         event = json.loads(args.input_json.read_text())
     else:
-        event = fetch_event_by_slug(args.event_slug)
+        event, resolved_slug = resolve_event_by_slug(args.event_slug)
     bins = extract_event_bins(event)
-    _, bins_path, manifest_path = write_outputs(output_dir=args.output_dir, slug=args.event_slug, event=event, bins=bins)
+    _, bins_path, manifest_path = write_outputs(
+        output_dir=args.output_dir,
+        slug=args.event_slug,
+        resolved_slug=resolved_slug,
+        event=event,
+        bins=bins,
+    )
     print(bins_path)
     print(manifest_path)
     return 0

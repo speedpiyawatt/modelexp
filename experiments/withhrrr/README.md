@@ -22,9 +22,10 @@ HRRR-only is not good enough to be the whole model. On the 2025 holdout, HRRR-on
 - Anchor policy: `equal_3way`
 - Feature/weight profile: `high_disagreement_weighted_nearby` / `high_disagreement_weighted`
 - Nearby stations: `KJRB`, `KJFK`, `KEWR`, `KTEB`
-- Quantile calibration: `global_offsets`
+- Quantile calibration: guarded `global_offsets_no_upper_tail`
 - Distribution method: `normal_iqr`
 - Ladder reliability calibration: `bucket_reliability_s1_00`
+- Dual-model inference guard: `with_hrrr_except_native_cold_hrrr_warm`
 - Feature count: `467`
 - Training rows: `1,094` eligible rows from `2023-01-01` through `2025-12-31`
 
@@ -69,9 +70,19 @@ Rolling 2025 calibration test, `365` rows:
 Source-disagreement robustness, rolling 2025 calibration test:
 
 - Quantile calibration now evaluates `global_offsets`, `conformal_intervals`, `no_offsets`, `global_offsets_no_upper_tail`, `global_offsets_shrunk_50pct`, and conditional source-disagreement variants. Promotion is guarded against observed-bin-probability drops in `tight_consensus` and `moderate_disagreement` slices. `global_offsets` and `conformal_intervals` were rejected by this guard; `global_offsets_no_upper_tail` is selected.
+- `global_offsets_no_upper_tail` applies the learned lower/median quantile offsets while zeroing the q75/q90/q95 offsets. This keeps the calibration benefit that improved validation NLL without pushing too much probability out of the correct upper event bins on tight/moderate source-consensus days.
+- Prediction JSON includes `calibration_method_id`, legacy `calibration_offsets_f`, and structured `calibration` metadata. If a conditional source-disagreement calibration is selected in a future run, the structured metadata records the row regime, branch, branch method, and branch offsets.
 - `source_disagreement_regime_offsets` remains evaluated as a diagnostic method but is no longer eligible for promotion unless the promotion family is deliberately expanded.
 - Source-disagreement ladder widening was evaluated at `0.5F`, `1.0F`, and `1.5F`; none beat `bucket_reliability_s1_00`, so no widening is enabled by default.
 - Diagnostics are written to `metrics_by_source_disagreement_regime.csv` and `ladder_calibration_disagreement_slices.csv`.
+
+Dual-model guard, validation plus 2026 live backtest:
+
+- `tools/weather/evaluate_dual_guard.py` evaluates no-HRRR, with-HRRR, regime switching, and blend candidates on the production holdout plus retained 2026 server-dual prediction JSONs.
+- Selected guard: `with_hrrr_except_native_cold_hrrr_warm`. It uses with-HRRR normally, but falls back to no-HRRR probabilities and expected Tmax when the with-HRRR source regime is `native_cold_hrrr_warm`.
+- Validation holdout, `219` rows: always with-HRRR event NLL/observed-bin probability/MAE `1.133178/0.385604/1.265688`; selected guard `1.137793/0.385989/1.250839`.
+- 2026 live backtest, `86` successful rows: always with-HRRR event NLL/observed-bin probability/MAE/top-bin accuracy `1.589559/0.408022/2.085680/0.500`; selected guard `1.554194/0.411389/2.024112/0.500`.
+- Guard artifacts live under `experiments/withhrrr/data/runtime/evaluation/dual_guard/`. Server dual inference reads `dual_guard_manifest.json` when present and prints a `guarded` recommendation alongside raw no-HRRR and with-HRRR outputs.
 
 HRRR ablation, rolling `729` validation rows:
 
@@ -88,6 +99,12 @@ Production-style one-date inference should use the server dual runner from the l
 
 ```bash
 .venv/bin/python tools/weather/run_server_dual_inference.py YYYY-MM-DD
+```
+
+The output includes raw `no_hrrr`, raw `with_hrrr`, and a `guarded` recommendation when `experiments/withhrrr/data/runtime/evaluation/dual_guard/dual_guard_manifest.json` exists. Rebuild the guard manifest after refreshing validation or 2026 backtest artifacts:
+
+```bash
+.venv/bin/python tools/weather/evaluate_dual_guard.py
 ```
 
 The server runner uses `/root/modelexp` on `root@198.199.64.163`. For the with-HRRR side to use the nearby Source-Trust model, the server needs the latest pushed with-HRRR inference/evaluation fixes and the ignored runtime artifacts under `experiments/withhrrr/data/runtime/`; a Git pull alone does not refresh those model/evaluation artifacts. As of 2026-04-30, the server has been pulled/synced with both code and runtime artifacts.
@@ -107,13 +124,15 @@ rm -rf experiments/withhrrr/data/runtime/models
 .venv/bin/python -m experiments.withhrrr.withhrrr_model.train_quantile_models
 ```
 
-Evaluate the chronological holdout:
+Evaluate the chronological holdout with the production probability stack:
 
 ```bash
 rm -rf experiments/withhrrr/data/runtime/evaluation/full_holdout_local
 .venv/bin/python -m experiments.withhrrr.withhrrr_model.evaluate \
   --output-dir experiments/withhrrr/data/runtime/evaluation/full_holdout_local
 ```
+
+By default this loads the selected quantile calibration, distribution manifest, and ladder calibration manifest. It writes calibrated/scored rows to `validation_predictions.parquet` and raw model rows to `validation_predictions_raw.parquet`. Use `--no-calibration --distribution-method interpolation_tail --no-ladder-calibration` only when intentionally debugging raw model quantiles.
 
 Run rolling-origin model selection:
 

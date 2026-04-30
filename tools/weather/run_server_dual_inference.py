@@ -10,10 +10,51 @@ import subprocess
 import sys
 from typing import Any
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.weather.dual_guard import apply_guard_to_prediction_payloads, risk_level
+
 
 DEFAULT_SERVER = "root@198.199.64.163"
 DEFAULT_REMOTE_REPO = "/root/modelexp"
 DEFAULT_REMOTE_OUTPUT_ROOT = "data/runtime/server_dual_inference"
+DEFAULT_DUAL_GUARD_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/dual_guard/dual_guard_manifest.json")
+DEFAULT_BACKTEST_EVENT_BIN_LABELS = (
+    "30F or below",
+    "31-32F",
+    "33-34F",
+    "35-36F",
+    "37-38F",
+    "39-40F",
+    "41-42F",
+    "43-44F",
+    "45-46F",
+    "47-48F",
+    "49-50F",
+    "51-52F",
+    "53-54F",
+    "55-56F",
+    "57-58F",
+    "59-60F",
+    "61-62F",
+    "63-64F",
+    "65-66F",
+    "67-68F",
+    "69-70F",
+    "71-72F",
+    "73-74F",
+    "75-76F",
+    "77-78F",
+    "79-80F",
+    "81-82F",
+    "83-84F",
+    "85-86F",
+    "87-88F",
+    "89-90F",
+    "91F or higher",
+)
 ANSI_RESET = "\033[0m"
 HIGHLIGHT_STYLES = {
     "no_hrrr": {1: "1;34", 2: "36"},
@@ -57,6 +98,11 @@ def remote_script(*, target_date: dt.date, remote_repo: str, output_root: str) -
     no_hrrr_nbm_extract_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_EXTRACT_WORKERS", os.environ.get("MODELEXP_NBM_EXTRACT_WORKERS", "4"))
     no_hrrr_nbm_lead_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_LEAD_WORKERS", os.environ.get("MODELEXP_NBM_LEAD_WORKERS", "8"))
     no_hrrr_nbm_batch_reduce_mode = os.environ.get("MODELEXP_NO_HRRR_NBM_BATCH_REDUCE_MODE", os.environ.get("MODELEXP_NBM_BATCH_REDUCE_MODE", "off"))
+    no_hrrr_lamp_source = os.environ.get("MODELEXP_NO_HRRR_LAMP_SOURCE", os.environ.get("MODELEXP_LAMP_SOURCE", "auto"))
+    event_bins_mode = os.environ.get("MODELEXP_EVENT_BINS_MODE", "polymarket")
+    if event_bins_mode not in {"polymarket", "standard"}:
+        raise SystemExit("MODELEXP_EVENT_BINS_MODE must be 'polymarket' or 'standard'")
+    standard_event_bins_json = json.dumps({"labels": list(DEFAULT_BACKTEST_EVENT_BIN_LABELS)}, sort_keys=True)
     hrrr_max_workers = os.environ.get("MODELEXP_HRRR_MAX_WORKERS", "6")
     hrrr_download_workers = os.environ.get("MODELEXP_HRRR_DOWNLOAD_WORKERS", "6")
     hrrr_reduce_workers = os.environ.get("MODELEXP_HRRR_REDUCE_WORKERS", "2")
@@ -75,11 +121,23 @@ WITH_HRRR_PRED_DIR={shlex.quote(with_hrrr_prediction_dir)}
 NO_HRRR_PRED={shlex.quote(no_hrrr_prediction)}
 WITH_HRRR_PRED={shlex.quote(with_hrrr_prediction)}
 NEARBY_PREFETCH_ROOT="$WITH_HRRR_RUNTIME/nearby_prefetch"
+EVENT_BINS_MODE={shlex.quote(event_bins_mode)}
+STANDARD_EVENT_BINS_PATH="$RUN_ROOT/event_bins_standard.json"
 NEARBY_STATIONS=(KJRB KJFK KEWR KTEB)
 
 mkdir -p "$NO_HRRR_PRED_DIR" "$WITH_HRRR_PRED_DIR"
 rm -rf "$NO_HRRR_RUNTIME" "$WITH_HRRR_RUNTIME"
 rm -f "$NO_HRRR_PRED" "$WITH_HRRR_PRED"
+
+EVENT_ARGS=()
+if [ "$EVENT_BINS_MODE" = "standard" ]; then
+  cat > "$STANDARD_EVENT_BINS_PATH" <<'JSON'
+{standard_event_bins_json}
+JSON
+  EVENT_ARGS=(--event-bins-path "$STANDARD_EVENT_BINS_PATH")
+else
+  EVENT_ARGS=(--polymarket-event-slug)
+fi
 
 NEARBY_PIDS=()
 for STATION in "${{NEARBY_STATIONS[@]}}"; do
@@ -113,7 +171,8 @@ done
     --target-date-local "$DATE" \\
     --runtime-root "$NO_HRRR_RUNTIME" \\
     --prediction-output-dir "$NO_HRRR_PRED_DIR" \\
-    --polymarket-event-slug \\
+    --lamp-source {shlex.quote(no_hrrr_lamp_source)} \\
+    "${{EVENT_ARGS[@]}}" \\
     --nbm-batch-reduce-mode {shlex.quote(no_hrrr_nbm_batch_reduce_mode)} \\
     --nbm-lead-workers {shlex.quote(no_hrrr_nbm_lead_workers)} \\
     --nbm-download-workers {shlex.quote(no_hrrr_nbm_download_workers)} \\
@@ -181,7 +240,11 @@ if [ "$NEARBY_STATUS" -ne 0 ]; then
   exit "$NEARBY_STATUS"
 fi
 
-EVENT_BINS_PATH=$(find "$NO_HRRR_RUNTIME/polymarket" -path '*/event_bins.json' -print -quit)
+if [ "$EVENT_BINS_MODE" = "standard" ]; then
+  EVENT_BINS_PATH="$STANDARD_EVENT_BINS_PATH"
+else
+  EVENT_BINS_PATH=$(find "$NO_HRRR_RUNTIME/polymarket" -path '*/event_bins.json' -print -quit)
+fi
 if [ -z "$EVENT_BINS_PATH" ]; then
   echo "[error] no-HRRR inference did not produce Polymarket event_bins.json" >&2
   tail -100 "$RUN_ROOT/no_hrrr.log" >&2 || true
@@ -228,7 +291,10 @@ rm -rf \\
 
 .venv/bin/python - <<'PY'
 import json
+import os
 from pathlib import Path
+
+from tools.weather.dual_guard import apply_guard_to_prediction_payloads
 
 date = {date!r}
 run_root = Path({run_root!r})
@@ -270,6 +336,13 @@ comparison = {{
         ],
     }},
 }}
+manifest_path = Path(os.environ.get("MODELEXP_DUAL_GUARD_MANIFEST", {str(DEFAULT_DUAL_GUARD_MANIFEST_PATH)!r}))
+if manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text())
+    candidate_id = str(manifest.get("selected_candidate_id") or "always_with_hrrr")
+    guarded = apply_guard_to_prediction_payloads(data["no_hrrr"], data["with_hrrr"], candidate_id=candidate_id)
+    guarded["manifest_path"] = str(manifest_path)
+    comparison["guarded_recommendation"] = guarded
 comparison_path = run_root / "comparison.json"
 comparison_path.write_text(json.dumps(comparison, indent=2, sort_keys=True) + "\\n")
 print("RESULT_JSON_BEGIN")
@@ -331,10 +404,30 @@ def format_probability(
     return colorize(text, HIGHLIGHT_STYLES[model_name][rank], enabled=enabled)
 
 
+def apply_selected_guard(result: dict[str, Any]) -> dict[str, Any]:
+    manifest_path = pathlib.Path(os.environ.get("MODELEXP_DUAL_GUARD_MANIFEST", DEFAULT_DUAL_GUARD_MANIFEST_PATH))
+    if not manifest_path.exists():
+        return result
+    manifest = json.loads(manifest_path.read_text())
+    candidate_id = str(manifest.get("selected_candidate_id") or "always_with_hrrr")
+    predictions = result.get("predictions")
+    if not isinstance(predictions, dict):
+        return result
+    no_hrrr = predictions.get("no_hrrr")
+    with_hrrr = predictions.get("with_hrrr")
+    if not isinstance(no_hrrr, dict) or not isinstance(with_hrrr, dict):
+        return result
+    guarded = apply_guard_to_prediction_payloads(no_hrrr, with_hrrr, candidate_id=candidate_id)
+    guarded["manifest_path"] = str(manifest_path)
+    result["guarded_recommendation"] = guarded
+    return result
+
+
 def print_summary(result: dict[str, Any]) -> None:
     predictions = result["predictions"]
     no_hrrr = predictions["no_hrrr"]
     with_hrrr = predictions["with_hrrr"]
+    guarded = result.get("guarded_recommendation")
     diff = result["diff_with_hrrr_minus_no_hrrr"]
     use_color = color_enabled()
     print(f"date: {result['target_date_local']}")
@@ -343,14 +436,24 @@ def print_summary(result: dict[str, Any]) -> None:
     print("model        expected_f  anchor_f  distribution")
     print(f"no_hrrr      {fmt(no_hrrr['expected_final_tmax_f']):>10}  {fmt(no_hrrr['anchor_tmax_f']):>8}  {no_hrrr['distribution_method']}")
     print(f"with_hrrr    {fmt(with_hrrr['expected_final_tmax_f']):>10}  {fmt(with_hrrr['anchor_tmax_f']):>8}  {with_hrrr['distribution_method']}")
+    if isinstance(guarded, dict):
+        print(f"guarded      {fmt(guarded['expected_final_tmax_f']):>10}  {fmt(guarded['anchor_tmax_f']):>8}  {guarded['candidate_id']}")
     print(f"diff         {fmt(diff['expected_final_tmax_f']):>10}  {fmt(diff['anchor_tmax_f']):>8}")
     disagreement = with_hrrr.get("source_disagreement")
     if isinstance(disagreement, dict):
         regime = disagreement.get("source_disagreement_regime", "unknown")
         spread = disagreement.get("source_spread_f")
+        risk = disagreement.get("source_disagreement_risk_level") or risk_level(str(regime), spread)
         warmest = disagreement.get("warmest_source", "unknown")
         coldest = disagreement.get("coldest_source", "unknown")
-        print(f"with_hrrr regime={regime} spread_f={fmt(spread)} warmest={warmest} coldest={coldest}")
+        print(f"with_hrrr risk={risk} regime={regime} spread_f={fmt(spread)} warmest={warmest} coldest={coldest}")
+    if isinstance(guarded, dict):
+        print(
+            "guarded "
+            f"candidate={guarded['candidate_id']} "
+            f"with_hrrr_probability_weight={fmt(guarded['with_hrrr_probability_weight'], digits=2)} "
+            f"with_hrrr_expected_weight={fmt(guarded['with_hrrr_expected_weight'], digits=2)}"
+        )
     ladder_calibration = with_hrrr.get("ladder_calibration")
     if isinstance(ladder_calibration, dict) and ladder_calibration.get("method_id"):
         print(f"with_hrrr ladder_adjustment={ladder_calibration.get('method_id')} enabled={ladder_calibration.get('enabled')}")
@@ -358,6 +461,7 @@ def print_summary(result: dict[str, Any]) -> None:
     print("event bins")
     no_bins = {row["bin"]: float(row["probability"]) for row in no_hrrr["event_bins"]}
     with_bins = {row["bin"]: float(row["probability"]) for row in with_hrrr["event_bins"]}
+    guarded_bins = {row["bin"]: float(row["probability"]) for row in guarded.get("event_bins", [])} if isinstance(guarded, dict) else {}
     no_ranks = top_bin_ranks(no_bins)
     with_ranks = top_bin_ranks(with_bins)
     print(
@@ -373,7 +477,15 @@ def print_summary(result: dict[str, Any]) -> None:
         with_prob = with_bins[label]
         no_text = format_probability("no_hrrr", no_prob, no_ranks, label, enabled=use_color)
         with_text = format_probability("with_hrrr", with_prob, with_ranks, label, enabled=use_color)
-        print(f"{label:<18} no_hrrr={no_text:<10}  with_hrrr={with_text:<10}  diff={with_prob - no_prob:+7.4f}")
+        if guarded_bins:
+            guarded_prob = guarded_bins.get(label)
+            guarded_text = "n/a" if guarded_prob is None else f"{guarded_prob:6.4f}"
+            print(
+                f"{label:<18} no_hrrr={no_text:<10}  with_hrrr={with_text:<10}  "
+                f"guarded={guarded_text:<6}  diff={with_prob - no_prob:+7.4f}"
+            )
+        else:
+            print(f"{label:<18} no_hrrr={no_text:<10}  with_hrrr={with_text:<10}  diff={with_prob - no_prob:+7.4f}")
 
 
 def main() -> int:
@@ -391,6 +503,7 @@ def main() -> int:
         print(completed.stderr, end="", file=sys.stderr)
         return completed.returncode
     result = extract_result(completed.stdout)
+    result = apply_selected_guard(result)
     print_summary(result)
     return 0
 
