@@ -7,13 +7,17 @@ import datetime as dt
 import json
 import os
 import pathlib
+import shlex
+import shutil
 import subprocess
 import sys
 from typing import Any
 
 
 DEFAULT_OUTPUT_DIR = pathlib.Path("data/runtime/server_dual_backtest")
-RUNNER_VERSION = "server_dual_backtest_v3"
+DEFAULT_SERVER = "root@198.199.64.163"
+DEFAULT_REMOTE_REPO = "/root/modelexp"
+RUNNER_VERSION = "server_dual_backtest_v4"
 
 
 def parse_date(value: str) -> dt.date:
@@ -33,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--day-workers", type=int, default=1, help="Number of target dates to run concurrently.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip dates that already completed successfully.")
+    parser.add_argument(
+        "--skip-previous-failed",
+        action="store_true",
+        help="Skip dates whose existing per-date summary is failed. Useful when rerunning only prior successful dates for new compact artifacts.",
+    )
     parser.add_argument("--keep-going", action="store_true", help="Continue after a failed date instead of stopping.")
     parser.add_argument(
         "--event-bins-mode",
@@ -74,7 +83,12 @@ def existing_summary_matches(summary: dict[str, Any], *, event_bins_mode: str) -
         summary.get("status") == "ok"
         and summary.get("event_bins_mode") == event_bins_mode
         and summary.get("runner_version") == RUNNER_VERSION
+        and summary.get("compact_artifact_sync_status") == "ok"
     )
+
+
+def existing_summary_failed(summary: dict[str, Any]) -> bool:
+    return summary.get("status") not in {None, "ok"}
 
 
 def write_summary(path: pathlib.Path, summary: dict[str, Any]) -> None:
@@ -99,6 +113,53 @@ def failed_summary(target_date: dt.date, *, output_dir: pathlib.Path, message: s
         "message": message,
         "runner_version": RUNNER_VERSION,
         "local_run_root": str(output_dir / target_date.isoformat()),
+    }
+
+
+def sync_remote_compact_artifacts(*, remote_run_root: str, target_date: dt.date, output_dir: pathlib.Path) -> dict[str, Any]:
+    server = os.environ.get("MODELEXP_SERVER", DEFAULT_SERVER)
+    remote_repo = os.environ.get("MODELEXP_REMOTE_REPO", DEFAULT_REMOTE_REPO)
+    local_root = output_dir / "remote_predictions" / target_date.isoformat()
+    if local_root.exists():
+        shutil.rmtree(local_root)
+    local_root.mkdir(parents=True, exist_ok=True)
+    script = (
+        f"cd {shlex.quote(remote_repo)} && "
+        f"tar -czf - -C {shlex.quote(remote_run_root)} comparison.json predictions feature_snapshots"
+    )
+    remote = subprocess.run(
+        ["ssh", server, "bash", "-lc", script],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if remote.returncode != 0:
+        return {
+            "compact_artifact_sync_status": "failed",
+            "compact_artifact_sync_error": remote.stderr.decode(errors="replace")[-2000:],
+            "compact_artifact_root": str(local_root),
+        }
+    local = subprocess.run(
+        ["tar", "-xzf", "-", "-C", str(local_root)],
+        input=remote.stdout,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if local.returncode != 0:
+        return {
+            "compact_artifact_sync_status": "failed",
+            "compact_artifact_sync_error": local.stderr.decode(errors="replace")[-2000:],
+            "compact_artifact_root": str(local_root),
+        }
+    return {
+        "compact_artifact_sync_status": "ok",
+        "compact_artifact_root": str(local_root),
+        "comparison_path": str(local_root / "comparison.json"),
+        "feature_snapshot_paths": {
+            "no_hrrr": str(local_root / "feature_snapshots" / "no_hrrr"),
+            "with_hrrr": str(local_root / "feature_snapshots" / "with_hrrr"),
+        },
     }
 
 
@@ -135,6 +196,14 @@ def run_one(target_date: dt.date, *, output_dir: pathlib.Path, event_bins_mode: 
     result = extract_result(completed.stdout)
     if result is not None:
         summary.update(result)
+    if summary["status"] == "ok" and summary.get("remote_run_root"):
+        summary.update(
+            sync_remote_compact_artifacts(
+                remote_run_root=str(summary["remote_run_root"]),
+                target_date=target_date,
+                output_dir=output_dir,
+            )
+        )
     write_summary(date_dir / "summary.json", summary)
     return summary
 
@@ -184,6 +253,14 @@ def main() -> int:
                 append_manifest(manifest_path, summary)
                 print(f"[{index}/{len(days)}] {day.isoformat()} skip existing status=ok event_bins_mode={args.event_bins_mode}")
                 continue
+        if args.skip_previous_failed and existing_summary.exists():
+            summary = json.loads(existing_summary.read_text())
+            if existing_summary_failed(summary):
+                summary = {**summary, "skipped_previous_failed": True}
+                run_rows_by_date[day.isoformat()] = summary
+                append_manifest(manifest_path, summary)
+                print(f"[{index}/{len(days)}] {day.isoformat()} skip previous failed")
+                continue
         pending.append((index, day))
     max_workers = max(1, int(args.day_workers))
     stopped_after_failure = False
@@ -226,6 +303,7 @@ def main() -> int:
         "event_bins_mode": args.event_bins_mode,
         "runner_version": RUNNER_VERSION,
         "stopped_after_failure": stopped_after_failure,
+        "skip_previous_failed": bool(args.skip_previous_failed),
         "runs": run_rows,
     }
     write_summary(args.output_dir / "summary.json", summary_all)

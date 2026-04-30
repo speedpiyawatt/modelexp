@@ -221,7 +221,8 @@ For download-heavy or long-running network steps:
 - the server runner assumes SSH access to `root@198.199.64.163` and repo path `/root/modelexp`; override with `MODELEXP_SERVER`, `MODELEXP_REMOTE_REPO`, or `MODELEXP_REMOTE_OUTPUT_ROOT` only when needed
 - as of 2026-04-30, `/root/modelexp` on `root@198.199.64.163` has been pulled/synced through the latest pushed with-HRRR inference/evaluation fixes plus ignored with-HRRR runtime model/evaluation artifacts under `experiments/withhrrr/data/runtime/`; later model artifact rebuilds still require explicit artifact sync because Git does not track those runtime outputs
 - the server runner runs no-HRRR, HRRR source work, and nearby Wunderground station prefetch concurrently, reuses the no-HRRR KLGA Wunderground/LAMP/NBM artifacts plus the prefetched nearby context to build the with-HRRR prediction, then returns a local text comparison
-- server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, and logs
+- server runner outputs are under `/root/modelexp/data/runtime/server_dual_inference/YYYY-MM-DD/` and retain final prediction JSONs, `comparison.json`, status manifests, logs, and compact one-row inference feature snapshots under `feature_snapshots/{no_hrrr,with_hrrr}/`
+- `tools/weather/run_server_dual_backtest.py` pulls those compact server artifacts back to local `data/runtime/.../remote_predictions/YYYY-MM-DD/` after each successful date; rerun old 2026 backtest rows with runner version `server_dual_backtest_v4` or later if feature snapshots are needed for diagnosis, and use `--skip-previous-failed` to avoid retrying dates that already failed from known source/runtime gaps
 - the server runner deletes downloaded/intermediate source artifacts after producing the predictions
 
 Manual current-day Tmax requests:

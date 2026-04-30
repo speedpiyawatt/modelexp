@@ -91,6 +91,8 @@ def remote_script(*, target_date: dt.date, remote_repo: str, output_root: str) -
     hrrr_run_root = f"{with_hrrr_runtime}/hrrr"
     no_hrrr_prediction_dir = f"{run_root}/predictions/no_hrrr"
     with_hrrr_prediction_dir = f"{run_root}/predictions/with_hrrr"
+    no_hrrr_feature_snapshot_dir = f"{run_root}/feature_snapshots/no_hrrr"
+    with_hrrr_feature_snapshot_dir = f"{run_root}/feature_snapshots/with_hrrr"
     no_hrrr_prediction = prediction_path(run_root, "no_hrrr", target_date)
     with_hrrr_prediction = prediction_path(run_root, "with_hrrr", target_date)
     no_hrrr_nbm_download_workers = os.environ.get("MODELEXP_NO_HRRR_NBM_DOWNLOAD_WORKERS", os.environ.get("MODELEXP_NBM_DOWNLOAD_WORKERS", "6"))
@@ -118,6 +120,8 @@ WITH_HRRR_RUNTIME={shlex.quote(with_hrrr_runtime)}
 HRRR_RUN_ROOT={shlex.quote(hrrr_run_root)}
 NO_HRRR_PRED_DIR={shlex.quote(no_hrrr_prediction_dir)}
 WITH_HRRR_PRED_DIR={shlex.quote(with_hrrr_prediction_dir)}
+NO_HRRR_FEATURE_SNAPSHOT_DIR={shlex.quote(no_hrrr_feature_snapshot_dir)}
+WITH_HRRR_FEATURE_SNAPSHOT_DIR={shlex.quote(with_hrrr_feature_snapshot_dir)}
 NO_HRRR_PRED={shlex.quote(no_hrrr_prediction)}
 WITH_HRRR_PRED={shlex.quote(with_hrrr_prediction)}
 NEARBY_PREFETCH_ROOT="$WITH_HRRR_RUNTIME/nearby_prefetch"
@@ -127,6 +131,7 @@ NEARBY_STATIONS=(KJRB KJFK KEWR KTEB)
 
 mkdir -p "$NO_HRRR_PRED_DIR" "$WITH_HRRR_PRED_DIR"
 rm -rf "$NO_HRRR_RUNTIME" "$WITH_HRRR_RUNTIME"
+rm -rf "$NO_HRRR_FEATURE_SNAPSHOT_DIR" "$WITH_HRRR_FEATURE_SNAPSHOT_DIR"
 rm -f "$NO_HRRR_PRED" "$WITH_HRRR_PRED"
 
 EVENT_ARGS=()
@@ -277,6 +282,18 @@ done
   "${{NEARBY_OBS_ARGS[@]}}" \\
   --overwrite
 
+mkdir -p "$NO_HRRR_FEATURE_SNAPSHOT_DIR" "$WITH_HRRR_FEATURE_SNAPSHOT_DIR"
+NO_HRRR_FEATURE_SOURCE="$NO_HRRR_RUNTIME/prediction_features/target_date_local=$DATE"
+WITH_HRRR_FEATURE_SOURCE="$WITH_HRRR_RUNTIME/prediction_features/target_date_local=$DATE"
+if [ -d "$NO_HRRR_FEATURE_SOURCE" ]; then
+  cp "$NO_HRRR_FEATURE_SOURCE"/no_hrrr.inference_features*.parquet "$NO_HRRR_FEATURE_SNAPSHOT_DIR"/
+  cp "$NO_HRRR_FEATURE_SOURCE"/no_hrrr.inference_features.manifest.json "$NO_HRRR_FEATURE_SNAPSHOT_DIR"/
+fi
+if [ -d "$WITH_HRRR_FEATURE_SOURCE" ]; then
+  cp "$WITH_HRRR_FEATURE_SOURCE"/withhrrr.inference_features*.parquet "$WITH_HRRR_FEATURE_SNAPSHOT_DIR"/
+  cp "$WITH_HRRR_FEATURE_SOURCE"/withhrrr.inference_features.manifest.json "$WITH_HRRR_FEATURE_SNAPSHOT_DIR"/
+fi
+
 rm -rf \\
   "$NO_HRRR_RUNTIME/wunderground_history" \\
   "$NO_HRRR_RUNTIME/wunderground_tables" \\
@@ -312,6 +329,10 @@ with_bins = bins(data["with_hrrr"])
 comparison = {{
     "target_date_local": date,
     "remote_run_root": str(run_root),
+    "feature_snapshots": {{
+        "no_hrrr": str(run_root / "feature_snapshots" / "no_hrrr"),
+        "with_hrrr": str(run_root / "feature_snapshots" / "with_hrrr"),
+    }},
     "predictions": {{
         name: {{
             "path": str(paths[name]),

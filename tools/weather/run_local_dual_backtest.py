@@ -21,7 +21,7 @@ from tools.weather.dual_guard import apply_guard_to_prediction_payloads
 
 DEFAULT_OUTPUT_DIR = pathlib.Path("data/runtime/local_dual_backtest")
 NEARBY_STATIONS = ("KJRB", "KJFK", "KEWR", "KTEB")
-RUNNER_VERSION = "local_dual_backtest_v2"
+RUNNER_VERSION = "local_dual_backtest_v3"
 DEFAULT_DUAL_GUARD_MANIFEST_PATH = pathlib.Path("experiments/withhrrr/data/runtime/evaluation/dual_guard/dual_guard_manifest.json")
 
 
@@ -42,6 +42,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=pathlib.Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--day-workers", type=int, default=2, help="Number of target dates to process concurrently.")
     parser.add_argument("--skip-existing", action="store_true", help="Skip dates that already completed successfully.")
+    parser.add_argument(
+        "--skip-previous-failed",
+        action="store_true",
+        help="Skip dates whose existing per-date summary is failed.",
+    )
     parser.add_argument("--keep-going", action="store_true", help="Continue after failures.")
     parser.add_argument("--keep-artifacts", action="store_true", help="Keep heavy downloaded/intermediate artifacts for debugging.")
     parser.add_argument("--lamp-source", choices=("auto", "live", "archive", "iem"), default="archive")
@@ -208,6 +213,16 @@ def preserve_event_metadata(event_bins_path: pathlib.Path, run_root: pathlib.Pat
     return destination
 
 
+def preserve_feature_snapshot(*, source_dir: pathlib.Path, destination_dir: pathlib.Path, prefix: str) -> pathlib.Path:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    for source in sorted(source_dir.glob(f"{prefix}.inference_features*.parquet")):
+        shutil.copy2(source, destination_dir / source.name)
+    manifest = source_dir / f"{prefix}.inference_features.manifest.json"
+    if manifest.exists():
+        shutil.copy2(manifest, destination_dir / manifest.name)
+    return destination_dir
+
+
 def existing_summary_matches(summary: dict[str, Any], args: argparse.Namespace) -> bool:
     return (
         summary.get("status") == "ok"
@@ -215,6 +230,10 @@ def existing_summary_matches(summary: dict[str, Any], args: argparse.Namespace) 
         and summary.get("lamp_source") == args.lamp_source
         and summary.get("runner_version") == RUNNER_VERSION
     )
+
+
+def existing_summary_failed(summary: dict[str, Any]) -> bool:
+    return summary.get("status") not in {None, "ok"}
 
 
 def load_json(path: pathlib.Path) -> dict[str, Any]:
@@ -229,6 +248,10 @@ def write_comparison(*, run_root: pathlib.Path, target_date: dt.date, no_hrrr_pr
     comparison = {
         "target_date_local": target_date.isoformat(),
         "local_run_root": str(run_root),
+        "feature_snapshots": {
+            "no_hrrr": str(run_root / "feature_snapshots" / "no_hrrr"),
+            "with_hrrr": str(run_root / "feature_snapshots" / "with_hrrr"),
+        },
         "predictions": {
             "no_hrrr": {
                 "path": str(no_hrrr_prediction),
@@ -444,6 +467,16 @@ def run_one(target_date: dt.date, args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"with-HRRR inference failed returncode={with_status}; see {logs_dir / 'with_hrrr.log'}")
     if not with_pred.exists():
         raise RuntimeError(f"missing with-HRRR prediction: {with_pred}")
+    no_feature_snapshot_dir = preserve_feature_snapshot(
+        source_dir=no_hrrr_runtime / "prediction_features" / f"target_date_local={date_text}",
+        destination_dir=run_root / "feature_snapshots" / "no_hrrr",
+        prefix="no_hrrr",
+    )
+    with_feature_snapshot_dir = preserve_feature_snapshot(
+        source_dir=with_hrrr_runtime / "prediction_features" / f"target_date_local={date_text}",
+        destination_dir=run_root / "feature_snapshots" / "with_hrrr",
+        prefix="withhrrr",
+    )
     comparison_path = write_comparison(
         run_root=run_root,
         target_date=target_date,
@@ -481,6 +514,10 @@ def run_one(target_date: dt.date, args: argparse.Namespace) -> dict[str, Any]:
         "comparison_path": str(comparison_path),
         "no_hrrr_prediction_path": str(no_pred),
         "with_hrrr_prediction_path": str(with_pred),
+        "feature_snapshot_paths": {
+            "no_hrrr": str(no_feature_snapshot_dir),
+            "with_hrrr": str(with_feature_snapshot_dir),
+        },
         "event_bins_path": str(preserved_event_bins_path),
         "deleted_artifacts": deleted,
     }
@@ -536,6 +573,15 @@ def main() -> int:
                     handle.write(json.dumps(existing, sort_keys=True) + "\n")
                 print(f"[skip] {day.isoformat()} existing ok event_bins_mode={args.event_bins_mode} lamp_source={args.lamp_source}")
                 continue
+        if args.skip_previous_failed and summary_path.exists():
+            existing = load_json(summary_path)
+            if existing_summary_failed(existing):
+                existing = {**existing, "skipped_previous_failed": True}
+                run_rows_by_date[day.isoformat()] = existing
+                with manifest_path.open("a") as handle:
+                    handle.write(json.dumps(existing, sort_keys=True) + "\n")
+                print(f"[skip] {day.isoformat()} existing failed")
+                continue
         pending_days.append((index, day))
     stopped_after_failure = False
     next_pending = 0
@@ -589,6 +635,7 @@ def main() -> int:
         "failed_count": sum(1 for row in run_rows if row.get("status") != "ok"),
         "runner_version": RUNNER_VERSION,
         "stopped_after_failure": stopped_after_failure,
+        "skip_previous_failed": bool(args.skip_previous_failed),
         "runs": run_rows,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(aggregate, indent=2, sort_keys=True) + "\n")
