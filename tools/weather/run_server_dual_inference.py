@@ -71,7 +71,7 @@ def parse_date(value: str) -> dt.date:
 
 def run_ssh(server: str, script: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["ssh", server, "bash", "-lc", script],
+        ["ssh", server, f"bash -lc {shlex.quote(script)}"],
         check=False,
         text=True,
         stdout=subprocess.PIPE,

@@ -128,7 +128,7 @@ def sync_remote_compact_artifacts(*, remote_run_root: str, target_date: dt.date,
         f"tar -czf - -C {shlex.quote(remote_run_root)} comparison.json predictions feature_snapshots"
     )
     remote = subprocess.run(
-        ["ssh", server, "bash", "-lc", script],
+        ["ssh", server, f"bash -lc {shlex.quote(script)}"],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
